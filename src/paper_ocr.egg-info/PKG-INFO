@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: paper-ocr
+Version: 0.1.0
+Summary: Born-digital-aware PDF to Markdown pipeline using olmOCR via DeepInfra
+Author: paper_ocr
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: pymupdf>=1.24.0
+Requires-Dist: Pillow>=10.0.0
+Requires-Dist: pyyaml>=6.0.1
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: openai>=1.40.0
+Requires-Dist: pytest>=8.0.0
+
+# paper-ocr
+
+Born-digital-aware PDF to Markdown pipeline using olmOCR via DeepInfra.
+
+## Quick start
+
+```bash
+paper-ocr run data/LISA out
+```
+
+Set `DEEPINFRA_API_KEY` in `.env` or your environment.
