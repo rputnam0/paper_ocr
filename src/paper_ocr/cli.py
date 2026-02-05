@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -13,13 +14,23 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 from .anchoring import build_anchored_prompt, build_unanchored_prompt, extract_anchors
-from .client import call_olmocr
+from .bibliography import (
+    bibliography_prompt,
+    citation_from_bibliography,
+    extract_json_object,
+    folder_name_from_bibliography,
+    markdown_filename_from_title,
+    normalize_bibliography,
+)
+from .client import call_olmocr, call_text_model
 from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_dir_name, output_group_name
 from .inspect import compute_text_heuristics, decide_route, is_text_only_candidate
 from .postprocess import parse_yaml_front_matter
 from .render import render_page
 from .schemas import new_manifest
 from .store import ensure_dirs, write_json, write_text
+
+METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -38,6 +49,7 @@ def _parse_args() -> argparse.Namespace:
     run.add_argument("--debug", action="store_true")
     run.add_argument("--scan-preprocess", action="store_true")
     run.add_argument("--text-only", action="store_true", help="Enable text-only extraction for high-quality text layers")
+    run.add_argument("--metadata-model", type=str, default=METADATA_MODEL_DEFAULT)
 
     return parser.parse_args()
 
@@ -55,6 +67,87 @@ def _page_out_path(pages_dir: Path, page_index: int) -> Path:
 
 def _debug_path(debug_dir: Path, page_index: int, suffix: str) -> Path:
     return debug_dir / f"page_{page_index+1:04d}.{suffix}"
+
+
+async def _extract_bibliography(
+    client: AsyncOpenAI,
+    metadata_model: str,
+    first_page_markdown: str,
+) -> dict[str, Any]:
+    if not first_page_markdown.strip():
+        return {
+            "title": "",
+            "authors": [],
+            "year": "",
+            "journal_ref": "",
+            "doi": "",
+            "citation": "",
+        }
+
+    try:
+        prompt = bibliography_prompt(first_page_markdown)
+        response = await call_text_model(
+            client=client,
+            model=metadata_model,
+            prompt=prompt,
+            max_tokens=800,
+        )
+        raw = extract_json_object(response.content)
+        parsed = normalize_bibliography(raw)
+    except Exception:
+        parsed = normalize_bibliography({})
+
+    return {
+        "title": parsed.title,
+        "authors": parsed.authors,
+        "year": parsed.year,
+        "journal_ref": parsed.journal_ref,
+        "doi": parsed.doi,
+        "citation": citation_from_bibliography(parsed),
+    }
+
+
+def _final_doc_dir(args: argparse.Namespace, pdf_path: Path, bibliography: dict[str, Any]) -> Path:
+    group_dir = args.out_dir / output_group_name(pdf_path)
+    author_year = folder_name_from_bibliography(normalize_bibliography(bibliography))
+    if author_year in {"unknown_paper", "unknown_author_unknown_year"}:
+        author_year = output_dir_name(pdf_path)
+    return group_dir / author_year
+
+
+def _move_first_page_artifacts(
+    first_page: dict[str, Any],
+    from_dirs: dict[str, Path],
+    to_dirs: dict[str, Path],
+    debug: bool,
+) -> dict[str, Any]:
+    output_files = dict(first_page.get("output_files", {}))
+    page_index = int(first_page.get("page_index", 0))
+
+    src_md = Path(output_files.get("markdown", ""))
+    if src_md.exists():
+        dst_md = _page_out_path(to_dirs["pages"], page_index)
+        dst_md.parent.mkdir(parents=True, exist_ok=True)
+        src_md.replace(dst_md)
+        output_files["markdown"] = str(dst_md)
+
+    src_meta = Path(output_files.get("metadata", ""))
+    if src_meta.exists():
+        dst_meta = _debug_path(to_dirs["debug"], page_index, "metadata.json")
+        dst_meta.parent.mkdir(parents=True, exist_ok=True)
+        src_meta.replace(dst_meta)
+        output_files["metadata"] = str(dst_meta)
+
+    if debug:
+        for suffix in ("request.json", "response.json"):
+            src = _debug_path(from_dirs["debug"], page_index, suffix)
+            if src.exists():
+                dst = _debug_path(to_dirs["debug"], page_index, suffix)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                src.replace(dst)
+
+    first_page["output_files"] = output_files
+    return first_page
 
 
 async def _process_page(
@@ -212,8 +305,9 @@ async def _process_page(
 async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> None:
     sha = file_sha256(pdf_path)
     doc_id = doc_id_from_sha(sha)
-    doc_dir = args.out_dir / output_group_name(pdf_path) / output_dir_name(pdf_path)
-    dirs = ensure_dirs(doc_dir)
+    group_dir = args.out_dir / output_group_name(pdf_path)
+    staging_dir = group_dir / f".staging_{doc_id}"
+    dirs = ensure_dirs(staging_dir)
 
     with fitz.open(pdf_path) as doc:
         manifest = new_manifest(
@@ -230,6 +324,41 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> None:
         client = AsyncOpenAI(api_key=api_key, base_url=args.base_url)
         semaphore = asyncio.Semaphore(args.workers)
 
+        pages: list[dict[str, Any]] = []
+        if doc.page_count > 0:
+            first_page = await _process_page(
+                semaphore=semaphore,
+                client=client,
+                doc=doc,
+                page_index=0,
+                mode=args.mode,
+                max_tokens=args.max_tokens,
+                model=args.model,
+                scan_preprocess=args.scan_preprocess,
+                debug=args.debug,
+                dirs=dirs,
+                force=args.force,
+                text_only_enabled=args.text_only,
+            )
+            first_page_md = Path(first_page["output_files"].get("markdown", ""))
+            first_page_text = first_page_md.read_text() if first_page_md.exists() else ""
+            bibliography = await _extract_bibliography(client, args.metadata_model, first_page_text)
+            doc_dir = _final_doc_dir(args, pdf_path, bibliography)
+            final_dirs = ensure_dirs(doc_dir)
+            first_page = _move_first_page_artifacts(first_page, dirs, final_dirs, args.debug)
+            pages.append(first_page)
+        else:
+            bibliography = {
+                "title": "",
+                "authors": [],
+                "year": "",
+                "journal_ref": "",
+                "doi": "",
+                "citation": "",
+            }
+            doc_dir = _final_doc_dir(args, pdf_path, bibliography)
+            final_dirs = ensure_dirs(doc_dir)
+
         tasks = [
             _process_page(
                 semaphore=semaphore,
@@ -241,19 +370,22 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> None:
                 model=args.model,
                 scan_preprocess=args.scan_preprocess,
                 debug=args.debug,
-                dirs=dirs,
+                dirs=final_dirs,
                 force=args.force,
                 text_only_enabled=args.text_only,
             )
-            for i in range(doc.page_count)
+            for i in range(1, doc.page_count)
         ]
 
-        pages = await asyncio.gather(*tasks)
+        if tasks:
+            pages.extend(await asyncio.gather(*tasks))
         pages_sorted = sorted(pages, key=lambda p: p["page_index"])
         for p in pages_sorted:
             manifest["pages"].append(p)
+        manifest["bibliography"] = bibliography
 
-        write_json(dirs["metadata"] / "manifest.json", manifest)
+        write_json(final_dirs["metadata"] / "manifest.json", manifest)
+        write_json(final_dirs["metadata"] / "bibliography.json", bibliography)
 
         # Assemble document outputs
         md_out = []
@@ -276,9 +408,12 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> None:
                 )
             )
 
-        consolidated_name = f"{pdf_path.stem}.md"
+        consolidated_name = markdown_filename_from_title(bibliography.get("title", ""))
         write_text(doc_dir / consolidated_name, "".join(md_out).strip() + "\n")
-        write_text(dirs["metadata"] / "document.jsonl", "\n".join(jsonl_out) + "\n")
+        write_text(final_dirs["metadata"] / "document.jsonl", "\n".join(jsonl_out) + "\n")
+
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 async def _run(args: argparse.Namespace) -> None:

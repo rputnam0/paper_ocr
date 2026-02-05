@@ -1,4 +1,5 @@
 from paper_ocr.bibliography import (
+    citation_from_bibliography,
     extract_json_object,
     folder_name_from_bibliography,
     markdown_filename_from_title,
@@ -32,3 +33,19 @@ def test_folder_name_from_bibliography_author_year():
 def test_markdown_filename_from_title_keeps_title_shape():
     title = "Rheological Equations from Molecular Network Theories."
     assert markdown_filename_from_title(title) == "Rheological Equations from Molecular Network Theories.md"
+
+
+def test_citation_from_bibliography_uses_journal_ref_and_doi():
+    info = normalize_bibliography(
+        {
+            "title": "T",
+            "authors": ["Carreau, P. J."],
+            "year": "1972",
+            "journal_ref": "Transactions of the Society of Rheology 16(1), 99-127.",
+            "doi": "10.1122/1.549276",
+        }
+    )
+    assert (
+        citation_from_bibliography(info)
+        == "Transactions of the Society of Rheology 16(1), 99-127. doi:10.1122/1.549276"
+    )

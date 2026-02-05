@@ -121,3 +121,12 @@ def markdown_filename_from_title(title: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|]+', " ", title).strip().rstrip(".")
     cleaned = re.sub(r"\s+", " ", cleaned)
     return f"{cleaned or 'document'}.md"
+
+
+def citation_from_bibliography(info: BibliographyInfo) -> str:
+    parts: list[str] = []
+    if info.journal_ref:
+        parts.append(info.journal_ref)
+    if info.doi:
+        parts.append(f"doi:{info.doi}")
+    return " ".join(parts).strip()
