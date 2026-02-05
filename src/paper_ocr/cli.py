@@ -23,6 +23,7 @@ from .bibliography import (
     normalize_bibliography,
 )
 from .client import call_olmocr, call_text_model
+from .discoverability import discoverability_prompt, normalize_discovery, render_group_readme
 from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_dir_name, output_group_name
 from .inspect import compute_text_heuristics, decide_route, is_text_only_candidate
 from .postprocess import parse_yaml_front_matter
@@ -113,6 +114,35 @@ def _final_doc_dir(args: argparse.Namespace, pdf_path: Path, bibliography: dict[
     if author_year in {"unknown_paper", "unknown_author_unknown_year"}:
         author_year = output_dir_name(pdf_path)
     return group_dir / author_year
+
+
+async def _extract_discovery(
+    client: AsyncOpenAI,
+    metadata_model: str,
+    bibliography: dict[str, Any],
+    page_count: int,
+    consolidated_markdown: str,
+) -> dict[str, Any]:
+    excerpt = consolidated_markdown[:36000]
+    if not excerpt.strip():
+        return {"paper_summary": "", "key_topics": [], "sections": []}
+    try:
+        prompt = discoverability_prompt(
+            title=str(bibliography.get("title", "")),
+            citation=str(bibliography.get("citation", "")),
+            page_count=page_count,
+            markdown_excerpt=excerpt,
+        )
+        response = await call_text_model(
+            client=client,
+            model=metadata_model,
+            prompt=prompt,
+            max_tokens=1200,
+        )
+        raw = extract_json_object(response.content)
+        return normalize_discovery(raw, page_count=page_count)
+    except Exception:
+        return {"paper_summary": "", "key_topics": [], "sections": []}
 
 
 def _move_first_page_artifacts(
@@ -302,7 +332,7 @@ async def _process_page(
     }
 
 
-async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> None:
+async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, Any]:
     sha = file_sha256(pdf_path)
     doc_id = doc_id_from_sha(sha)
     group_dir = args.out_dir / output_group_name(pdf_path)
@@ -409,11 +439,45 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> None:
             )
 
         consolidated_name = markdown_filename_from_title(bibliography.get("title", ""))
-        write_text(doc_dir / consolidated_name, "".join(md_out).strip() + "\n")
+        consolidated_text = "".join(md_out).strip() + "\n"
+        write_text(doc_dir / consolidated_name, consolidated_text)
         write_text(final_dirs["metadata"] / "document.jsonl", "\n".join(jsonl_out) + "\n")
+        discovery = await _extract_discovery(
+            client=client,
+            metadata_model=args.metadata_model,
+            bibliography=bibliography,
+            page_count=doc.page_count,
+            consolidated_markdown=consolidated_text,
+        )
+        write_json(final_dirs["metadata"] / "discovery.json", discovery)
+        write_json(final_dirs["metadata"] / "sections.json", discovery.get("sections", []))
+        manifest["discovery"] = discovery
+        write_json(final_dirs["metadata"] / "manifest.json", manifest)
 
     if staging_dir.exists():
         shutil.rmtree(staging_dir, ignore_errors=True)
+    return {
+        "group_dir": str(group_dir),
+        "doc_dir": str(doc_dir),
+        "folder_name": doc_dir.name,
+        "consolidated_markdown": consolidated_name,
+        "page_count": doc.page_count,
+        "bibliography": bibliography,
+        "discovery": discovery,
+    }
+
+
+def _write_group_readmes(records: list[dict[str, Any]]) -> None:
+    by_group: dict[str, list[dict[str, Any]]] = {}
+    for rec in records:
+        group_key = str(rec.get("group_dir", ""))
+        by_group.setdefault(group_key, []).append(rec)
+
+    for group_str, papers in by_group.items():
+        group_dir = Path(group_str)
+        group_name = group_dir.name
+        readme_text = render_group_readme(group_name, papers)
+        write_text(group_dir / "README.md", readme_text)
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -422,8 +486,10 @@ async def _run(args: argparse.Namespace) -> None:
         raise SystemExit(f"No PDFs found in {args.in_dir}")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    records: list[dict[str, Any]] = []
     for pdf in pdfs:
-        await _process_pdf(args, pdf)
+        records.append(await _process_pdf(args, pdf))
+    _write_group_readmes(records)
 
 
 def main() -> None:

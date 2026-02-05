@@ -17,6 +17,8 @@ Key options:
 ## Output layout
 For each PDF:
 ```
+out/<input_parent_folder>/
+  README.md
 out/<input_parent_folder>/<author_year>/
   <paper_title>.md
   pages/
@@ -25,6 +27,8 @@ out/<input_parent_folder>/<author_year>/
   metadata/
     manifest.json
     bibliography.json
+    discovery.json
+    sections.json
     document.jsonl
     assets/
     debug/
@@ -33,3 +37,4 @@ out/<input_parent_folder>/<author_year>/
 Notes:
 - `author_year` is metadata-derived (snake case, e.g. `Carreau_Pierre_J_1972`) using the first page.
 - The consolidated markdown filename is derived from extracted paper title.
+- Each parent output folder also gets a generated `README.md` paper index for quick LLM discovery.
