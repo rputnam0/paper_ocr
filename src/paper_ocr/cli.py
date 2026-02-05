@@ -14,7 +14,7 @@ from openai import AsyncOpenAI
 
 from .anchoring import build_anchored_prompt, build_unanchored_prompt, extract_anchors
 from .client import call_olmocr
-from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_dir_name
+from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_dir_name, output_group_name
 from .inspect import compute_text_heuristics, decide_route, is_text_only_candidate
 from .postprocess import parse_yaml_front_matter
 from .render import render_page
@@ -212,7 +212,7 @@ async def _process_page(
 async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> None:
     sha = file_sha256(pdf_path)
     doc_id = doc_id_from_sha(sha)
-    doc_dir = args.out_dir / output_dir_name(pdf_path)
+    doc_dir = args.out_dir / output_group_name(pdf_path) / output_dir_name(pdf_path)
     dirs = ensure_dirs(doc_dir)
 
     with fitz.open(pdf_path) as doc:
