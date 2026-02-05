@@ -17,6 +17,9 @@ Key behaviors:
 - Routes pages to **anchored** or **unanchored** OCR prompts based on text-layer heuristics.
 - Renders pages to images with the **longest dimension capped at 1288 px**.
 - Parses YAML front matter from model output and writes markdown + metadata per page.
+- Extracts bibliographic metadata from first-page markdown using `nvidia/Nemotron-3-Nano-30B-A3B` by default.
+- Names each output document folder from extracted author/year metadata.
+- Names each consolidated markdown file from extracted paper title.
 - Produces a full output bundle per PDF, including manifest, debug artifacts, and assembled document files.
 
 ## CLI Usage
@@ -33,6 +36,7 @@ Options:
 - `--debug` write request/response payloads per page
 - `--scan-preprocess` enable mild scan preprocessing
 - `--text-only` enable high-quality text-layer extraction (skips VLM)
+- `--metadata-model <str>` default `nvidia/Nemotron-3-Nano-30B-A3B`
 
 Example:
 - `uv run paper-ocr run data/LISA out`
@@ -44,14 +48,15 @@ Required env var:
 ## Output Layout
 For each PDF:
 ```
-out/<pdf_name>/
-  <pdf_name>.md
+out/<input_parent>/<author_year>/
+  <paper_title>.md
+  pages/
+    0001.md
+    0002.md
   metadata/
     manifest.json
+    bibliography.json
     document.jsonl
-    pages/
-      0001.md
-      0002.md
     assets/
     debug/
       page_0001.request.json
