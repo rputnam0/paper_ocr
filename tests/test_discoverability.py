@@ -1,4 +1,9 @@
-from paper_ocr.discoverability import normalize_discovery, render_group_readme
+from paper_ocr.discoverability import (
+    is_useful_discovery,
+    normalize_discovery,
+    render_group_readme,
+    split_markdown_for_discovery,
+)
 
 
 def test_normalize_discovery_clamps_pages_and_topics():
@@ -47,3 +52,17 @@ def test_render_group_readme_includes_locations_and_sections():
     assert "# Paper Index: lisa" in text
     assert "Madsen_Jesper_2007/Computational and Experimental Study.md" in text
     assert "Method (pp. 12-45)" in text
+
+
+def test_split_markdown_for_discovery_covers_all_text():
+    text = "A" * 35000 + "B" * 35000 + "C" * 1000
+    chunks = split_markdown_for_discovery(text, max_chars=32000)
+    assert len(chunks) >= 3
+    assert "".join(chunks) == text
+
+
+def test_is_useful_discovery_rejects_placeholder_values():
+    bad = {"paper_summary": "string", "key_topics": ["string"], "sections": [{"title": "string"}]}
+    good = {"paper_summary": "This paper analyzes instability in liquid sheets.", "key_topics": ["instability"], "sections": []}
+    assert is_useful_discovery(bad) is False
+    assert is_useful_discovery(good) is True

@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+import json
 from typing import Any
+
+
+def _is_placeholder_value(value: str) -> bool:
+    norm = " ".join((value or "").strip().lower().split())
+    if not norm:
+        return True
+    bad = {"string", "<summary text>", "<topic>", "<section title>", "<section summary>", "...", "…"}
+    if norm in bad:
+        return True
+    if all(ch in ".-_ " for ch in norm):
+        return True
+    return False
 
 
 def discoverability_prompt(
@@ -11,15 +24,18 @@ def discoverability_prompt(
 ) -> str:
     return (
         "You are extracting structured paper-discovery metadata from OCR markdown.\n"
+        "Respond with a SINGLE JSON object in assistant content only.\n"
+        "Do not include analysis, markdown, code fences, or extra text.\n"
         "Return ONLY valid JSON with this schema:\n"
         "{"
-        '"paper_summary": "string", '
-        '"key_topics": ["string"], '
+        '"paper_summary": "<summary text>", '
+        '"key_topics": ["<topic>"], '
         '"sections": ['
-        '{"title":"string","start_page":1,"end_page":1,"summary":"string"}'
+        '{"title":"<section title>","start_page":1,"end_page":1,"summary":"<section summary>"}'
         "]"
         "}\n"
         "Rules:\n"
+        "- Do NOT use placeholder words like 'string' or '<topic>' in output values.\n"
         "- Keep paper_summary to 1-3 sentences.\n"
         "- key_topics should be concise (3-8 entries).\n"
         "- sections should cover major content regions in reading order.\n"
@@ -33,14 +49,104 @@ def discoverability_prompt(
     )
 
 
+def discoverability_chunk_prompt(
+    title: str,
+    citation: str,
+    page_count: int,
+    chunk_index: int,
+    chunk_count: int,
+    markdown_chunk: str,
+) -> str:
+    return (
+        "You are extracting discovery metadata from one chunk of a paper markdown transcript.\n"
+        "Respond with a SINGLE JSON object in assistant content only.\n"
+        "Do not include analysis, markdown, code fences, or extra text.\n"
+        "Return ONLY valid JSON with this schema:\n"
+        "{"
+        '"chunk_summary": "<summary text>", '
+        '"key_topics": ["<topic>"], '
+        '"sections": ['
+        '{"title":"<section title>","start_page":1,"end_page":1,"summary":"<section summary>"}'
+        "]"
+        "}\n"
+        "Rules:\n"
+        "- Do NOT use placeholder words like 'string' or '<topic>' in output values.\n"
+        "- Infer absolute page numbers from `# Page N` markers in the chunk.\n"
+        "- Keep chunk_summary to 1-2 sentences.\n"
+        "- If uncertain, return best effort with empty fields as needed.\n\n"
+        f"Title: {title or '(unknown)'}\n"
+        f"Citation: {citation or '(unknown)'}\n"
+        f"Page count: {page_count}\n"
+        f"Chunk: {chunk_index}/{chunk_count}\n\n"
+        "Markdown chunk:\n"
+        f"{markdown_chunk}"
+    )
+
+
+def discoverability_aggregate_prompt(
+    title: str,
+    citation: str,
+    page_count: int,
+    chunk_outputs: list[dict[str, Any]],
+) -> str:
+    return (
+        "You are combining chunk-level paper discovery data into one final structured output.\n"
+        "Respond with a SINGLE JSON object in assistant content only.\n"
+        "Do not include analysis, markdown, code fences, or extra text.\n"
+        "Return ONLY valid JSON with this schema:\n"
+        "{"
+        '"paper_summary": "<summary text>", '
+        '"key_topics": ["<topic>"], '
+        '"sections": ['
+        '{"title":"<section title>","start_page":1,"end_page":1,"summary":"<section summary>"}'
+        "]"
+        "}\n"
+        "Rules:\n"
+        "- Do NOT use placeholder words like 'string' or '<topic>' in output values.\n"
+        "- paper_summary: 2-5 sentences high-level summary of the full paper.\n"
+        "- key_topics: 3-10 concise topics.\n"
+        "- sections: 4-12 major sections in reading order.\n"
+        "- start_page/end_page are absolute 1-based pages.\n\n"
+        f"Title: {title or '(unknown)'}\n"
+        f"Citation: {citation or '(unknown)'}\n"
+        f"Page count: {page_count}\n\n"
+        "Chunk discovery JSON list:\n"
+        f"{json.dumps(chunk_outputs, ensure_ascii=True)}"
+    )
+
+
+def split_markdown_for_discovery(markdown_text: str, max_chars: int = 32000) -> list[str]:
+    if max_chars < 1000:
+        max_chars = 1000
+    text = markdown_text or ""
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        j = min(i + max_chars, n)
+        if j < n:
+            split = text.rfind("\n\n# Page ", i, j)
+            if split > i:
+                j = split
+        if j <= i:
+            j = min(i + max_chars, n)
+        chunks.append(text[i:j])
+        i = j
+    return chunks
+
+
 def normalize_discovery(raw: dict[str, Any], page_count: int) -> dict[str, Any]:
     summary = str(raw.get("paper_summary", "")).strip()
+    if _is_placeholder_value(summary):
+        summary = ""
     topics_raw = raw.get("key_topics", [])
     topics: list[str] = []
     if isinstance(topics_raw, list):
         for t in topics_raw:
             item = str(t).strip()
-            if item:
+            if item and not _is_placeholder_value(item):
                 topics.append(item)
 
     sections_raw = raw.get("sections", [])
@@ -50,7 +156,7 @@ def normalize_discovery(raw: dict[str, Any], page_count: int) -> dict[str, Any]:
             if not isinstance(sec, dict):
                 continue
             title = str(sec.get("title", "")).strip()
-            if not title:
+            if not title or _is_placeholder_value(title):
                 continue
             try:
                 start_page = int(sec.get("start_page", 1))
@@ -64,6 +170,8 @@ def normalize_discovery(raw: dict[str, Any], page_count: int) -> dict[str, Any]:
             start_page = max(1, min(start_page, max_page))
             end_page = max(start_page, min(end_page, max_page))
             sec_summary = str(sec.get("summary", "")).strip()
+            if _is_placeholder_value(sec_summary):
+                sec_summary = ""
             sections.append(
                 {
                     "title": title,
@@ -78,6 +186,21 @@ def normalize_discovery(raw: dict[str, Any], page_count: int) -> dict[str, Any]:
         "key_topics": topics,
         "sections": sections,
     }
+
+
+def is_useful_discovery(discovery: dict[str, Any]) -> bool:
+    summary = str(discovery.get("paper_summary", "")).strip()
+    topics = [str(t).strip() for t in (discovery.get("key_topics", []) or [])]
+    sections = discovery.get("sections", []) or []
+
+    summary_ok = not _is_placeholder_value(summary) and len(summary) >= 20
+    topics_ok = any(not _is_placeholder_value(t) for t in topics)
+    sections_ok = any(
+        not _is_placeholder_value(str((s or {}).get("title", "")))
+        for s in sections
+        if isinstance(s, dict)
+    )
+    return summary_ok or (topics_ok and sections_ok)
 
 
 def render_group_readme(group_name: str, papers: list[dict[str, Any]]) -> str:

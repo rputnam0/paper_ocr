@@ -23,7 +23,14 @@ from .bibliography import (
     normalize_bibliography,
 )
 from .client import call_olmocr, call_text_model
-from .discoverability import discoverability_prompt, normalize_discovery, render_group_readme
+from .discoverability import (
+    discoverability_aggregate_prompt,
+    discoverability_chunk_prompt,
+    is_useful_discovery,
+    normalize_discovery,
+    render_group_readme,
+    split_markdown_for_discovery,
+)
 from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_dir_name, output_group_name
 from .inspect import compute_text_heuristics, decide_route, is_text_only_candidate
 from .postprocess import parse_yaml_front_matter
@@ -123,26 +130,139 @@ async def _extract_discovery(
     page_count: int,
     consolidated_markdown: str,
 ) -> dict[str, Any]:
-    excerpt = consolidated_markdown[:36000]
-    if not excerpt.strip():
+    if not consolidated_markdown.strip():
         return {"paper_summary": "", "key_topics": [], "sections": []}
-    try:
-        prompt = discoverability_prompt(
+
+    async def _json_call(
+        prompt: str,
+        max_tokens: int,
+        schema: str,
+        attempts: int = 4,
+    ) -> dict[str, Any]:
+        for _ in range(attempts):
+            try:
+                response = await call_text_model(
+                    client=client,
+                    model=metadata_model,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                )
+                candidates = [response.content or "", response.reasoning_content or ""]
+                for c in candidates:
+                    raw = extract_json_object(c)
+                    if isinstance(raw, dict) and raw:
+                        return raw
+                reasoning = (response.reasoning_content or "").strip()
+                if reasoning:
+                    repair_prompt = (
+                        "Convert these draft notes into one strict JSON object.\n"
+                        "Output JSON only, no prose.\n"
+                        f"Schema:\n{schema}\n\n"
+                        f"Notes:\n{reasoning[:7000]}"
+                    )
+                    repaired = await call_text_model(
+                        client=client,
+                        model=metadata_model,
+                        prompt=repair_prompt,
+                        max_tokens=max_tokens,
+                    )
+                    for c in [repaired.content or "", repaired.reasoning_content or ""]:
+                        raw = extract_json_object(c)
+                        if isinstance(raw, dict) and raw:
+                            return raw
+            except Exception:
+                continue
+        return {}
+
+    chunk_schema = (
+        '{'
+        '"chunk_summary":"...",'
+        '"key_topics":["..."],'
+        '"sections":[{"title":"...","start_page":1,"end_page":1,"summary":"..."}]'
+        '}'
+    )
+    chunks = split_markdown_for_discovery(consolidated_markdown, max_chars=12000)
+    chunk_outputs: list[dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        chunk_prompt = discoverability_chunk_prompt(
             title=str(bibliography.get("title", "")),
             citation=str(bibliography.get("citation", "")),
             page_count=page_count,
-            markdown_excerpt=excerpt,
+            chunk_index=idx,
+            chunk_count=len(chunks),
+            markdown_chunk=chunk,
         )
-        response = await call_text_model(
-            client=client,
-            model=metadata_model,
-            prompt=prompt,
-            max_tokens=1200,
+        chunk_raw = await _json_call(chunk_prompt, max_tokens=600, schema=chunk_schema)
+        if not chunk_raw:
+            continue
+        chunk_norm = normalize_discovery(
+            {
+                "paper_summary": str(chunk_raw.get("chunk_summary", "")),
+                "key_topics": chunk_raw.get("key_topics", []),
+                "sections": chunk_raw.get("sections", []),
+            },
+            page_count=page_count,
         )
-        raw = extract_json_object(response.content)
-        return normalize_discovery(raw, page_count=page_count)
-    except Exception:
+        if not is_useful_discovery(chunk_norm):
+            continue
+        chunk_outputs.append(
+            {
+                "chunk_summary": chunk_norm.get("paper_summary", ""),
+                "key_topics": chunk_norm.get("key_topics", []),
+                "sections": chunk_norm.get("sections", []),
+            }
+        )
+
+    if not chunk_outputs:
         return {"paper_summary": "", "key_topics": [], "sections": []}
+
+    aggregate_schema = (
+        '{'
+        '"paper_summary":"...",'
+        '"key_topics":["..."],'
+        '"sections":[{"title":"...","start_page":1,"end_page":1,"summary":"..."}]'
+        '}'
+    )
+    aggregate_prompt = discoverability_aggregate_prompt(
+        title=str(bibliography.get("title", "")),
+        citation=str(bibliography.get("citation", "")),
+        page_count=page_count,
+        chunk_outputs=chunk_outputs,
+    )
+    aggregate_raw = await _json_call(aggregate_prompt, max_tokens=900, schema=aggregate_schema)
+    if aggregate_raw:
+        aggregate_norm = normalize_discovery(aggregate_raw, page_count=page_count)
+        if is_useful_discovery(aggregate_norm):
+            return aggregate_norm
+
+    merged_topics: list[str] = []
+    merged_sections: list[dict[str, Any]] = []
+    merged_summaries: list[str] = []
+    seen_topics: set[str] = set()
+    for chunk in chunk_outputs:
+        summary = str(chunk.get("chunk_summary", "")).strip()
+        if summary:
+            merged_summaries.append(summary)
+        for topic in chunk.get("key_topics", []) or []:
+            t = str(topic).strip()
+            if t and t.lower() not in seen_topics:
+                seen_topics.add(t.lower())
+                merged_topics.append(t)
+        for sec in chunk.get("sections", []) or []:
+            if isinstance(sec, dict):
+                merged_sections.append(sec)
+
+    merged = normalize_discovery(
+        {
+            "paper_summary": " ".join(merged_summaries[:4]).strip(),
+            "key_topics": merged_topics[:10],
+            "sections": merged_sections[:12],
+        },
+        page_count=page_count,
+    )
+    if is_useful_discovery(merged):
+        return merged
+    return {"paper_summary": "", "key_topics": [], "sections": []}
 
 
 def _move_first_page_artifacts(

@@ -18,6 +18,7 @@ class OCRResponse:
 @dataclass
 class TextResponse:
     content: str
+    reasoning_content: str | None
     usage: dict[str, Any] | None
     raw: dict[str, Any]
 
@@ -102,7 +103,9 @@ async def call_text_model(
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
-            content = response.choices[0].message.content or ""
+            message = response.choices[0].message
+            content = message.content or ""
+            reasoning_content = getattr(message, "reasoning_content", None)
             usage_obj = getattr(response, "usage", None)
             if hasattr(usage_obj, "model_dump"):
                 usage = usage_obj.model_dump()
@@ -111,7 +114,7 @@ async def call_text_model(
             else:
                 usage = usage_obj
             raw = response.model_dump() if hasattr(response, "model_dump") else response.dict()
-            return TextResponse(content=content, usage=usage, raw=raw)
+            return TextResponse(content=content, reasoning_content=reasoning_content, usage=usage, raw=raw)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if not _is_retryable_error(exc) or attempt >= max_attempts:
