@@ -1,4 +1,6 @@
 from paper_ocr.discoverability import (
+    abstract_extraction_prompt,
+    first_pages_excerpt,
     is_useful_discovery,
     normalize_discovery,
     render_group_readme,
@@ -66,3 +68,18 @@ def test_is_useful_discovery_rejects_placeholder_values():
     good = {"paper_summary": "This paper analyzes instability in liquid sheets.", "key_topics": ["instability"], "sections": []}
     assert is_useful_discovery(bad) is False
     assert is_useful_discovery(good) is True
+
+
+def test_first_pages_excerpt_limits_by_page_marker():
+    md = (
+        "# Page 1\nA\n\n# Page 2\nB\n\n# Page 3\nC\n\n# Page 4\nD\n\n# Page 5\nE\n\n# Page 6\nF\n"
+    )
+    out = first_pages_excerpt(md, max_pages=3)
+    assert "# Page 1" in out
+    assert "# Page 3" in out
+    assert "# Page 4" not in out
+
+
+def test_abstract_prompt_mentions_abstract_task():
+    prompt = abstract_extraction_prompt("Title", "Citation", 10, "# Page 1\nAbstract text")
+    assert "extract the paper abstract" in prompt.lower()

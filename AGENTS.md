@@ -20,7 +20,7 @@ Key behaviors:
 - Extracts bibliographic metadata from first-page markdown using `nvidia/Nemotron-3-Nano-30B-A3B` by default.
 - Names each output document folder from extracted author/year metadata.
 - Names each consolidated markdown file from extracted paper title.
-- Extracts discovery metadata (`paper_summary`, `key_topics`, `sections`) from consolidated markdown.
+- Extracts discovery metadata (`paper_summary`, `key_topics`) from the first few pages (abstract-first).
 - Writes group-level paper index README files for fast folder-level discoverability.
 - Produces a full output bundle per PDF, including manifest, debug artifacts, and assembled document files.
 

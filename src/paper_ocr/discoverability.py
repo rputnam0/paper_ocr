@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
@@ -47,6 +48,49 @@ def discoverability_prompt(
         "OCR markdown excerpt:\n"
         f"{markdown_excerpt}"
     )
+
+
+def abstract_extraction_prompt(
+    title: str,
+    citation: str,
+    page_count: int,
+    first_pages_markdown: str,
+) -> str:
+    return (
+        "You extract the paper abstract from OCR markdown.\n"
+        "Respond with a SINGLE JSON object in assistant content only.\n"
+        "Do not include analysis, markdown, code fences, or extra text.\n"
+        "Return ONLY valid JSON with this schema:\n"
+        "{"
+        '"abstract":"<abstract text>",'
+        '"key_topics":["<topic>"]'
+        "}\n"
+        "Rules:\n"
+        "- Prefer the explicit abstract section when present.\n"
+        "- If no explicit abstract exists, provide a brief high-level summary from the opening pages.\n"
+        "- key_topics should be concise (3-8 entries).\n"
+        "- Do NOT use placeholder values like 'string' or '...'.\n\n"
+        f"Title: {title or '(unknown)'}\n"
+        f"Citation: {citation or '(unknown)'}\n"
+        f"Page count: {page_count}\n\n"
+        "First pages markdown:\n"
+        f"{first_pages_markdown}"
+    )
+
+
+def first_pages_excerpt(markdown_text: str, max_pages: int = 5) -> str:
+    if max_pages < 1:
+        max_pages = 1
+    text = markdown_text or ""
+    if not text.strip():
+        return ""
+    starts = list(re.finditer(r"(?m)^# Page (\d+)\s*$", text))
+    if not starts:
+        return text[:24000]
+    if len(starts) <= max_pages:
+        return text
+    cutoff = starts[max_pages].start()
+    return text[:cutoff]
 
 
 def discoverability_chunk_prompt(
