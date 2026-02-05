@@ -7,7 +7,7 @@ from typing import Any
 
 def ensure_dirs(doc_dir: Path) -> dict[str, Path]:
     metadata_dir = doc_dir / "metadata"
-    pages_dir = metadata_dir / "pages"
+    pages_dir = doc_dir / "pages"
     assets_dir = metadata_dir / "assets"
     debug_dir = metadata_dir / "debug"
     pages_dir.mkdir(parents=True, exist_ok=True)
