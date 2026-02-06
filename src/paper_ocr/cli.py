@@ -396,11 +396,12 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
     dirs = ensure_dirs(staging_dir)
 
     with fitz.open(pdf_path) as doc:
+        page_count = doc.page_count
         manifest = new_manifest(
             doc_id=doc_id,
             source_path=str(pdf_path),
             sha256=sha,
-            page_count=doc.page_count,
+            page_count=page_count,
             model=args.model,
             base_url=args.base_url,
             prompt_version="v1",
@@ -411,7 +412,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         semaphore = asyncio.Semaphore(args.workers)
 
         pages: list[dict[str, Any]] = []
-        if doc.page_count > 0:
+        if page_count > 0:
             first_page = await _process_page(
                 semaphore=semaphore,
                 client=client,
@@ -460,7 +461,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                 force=args.force,
                 text_only_enabled=args.text_only,
             )
-            for i in range(1, doc.page_count)
+            for i in range(1, page_count)
         ]
 
         if tasks:
@@ -502,7 +503,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             client=client,
             metadata_model=args.metadata_model,
             bibliography=bibliography,
-            page_count=doc.page_count,
+            page_count=page_count,
             consolidated_markdown=consolidated_text,
         )
         write_json(final_dirs["metadata"] / "discovery.json", discovery)
@@ -517,7 +518,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         "doc_dir": str(doc_dir),
         "folder_name": doc_dir.name,
         "consolidated_markdown": consolidated_name,
-        "page_count": doc.page_count,
+        "page_count": page_count,
         "bibliography": bibliography,
         "discovery": discovery,
     }
