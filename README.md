@@ -10,6 +10,26 @@ uv run paper-ocr run data/LISA out
 
 Set `DEEPINFRA_API_KEY` in `.env` or your environment.
 
+## Telegram DOI fetch workflow
+
+1. Fetch PDFs from your Telegram bot into an OCR input folder:
+```bash
+uv run paper-ocr fetch-telegram papers.csv data/inbox
+```
+2. Run OCR on fetched PDFs:
+```bash
+uv run paper-ocr run data/inbox out
+```
+
+Required env vars for fetch:
+- `TG_API_ID`
+- `TG_API_HASH`
+
+Optional env vars for fetch defaults:
+- `TARGET_BOT` (default `@your_bot_username`)
+- `MIN_DELAY` (default `10`)
+- `MAX_DELAY` (default `20`)
+
 Key options:
 - `--text-only` enables text-layer extraction when high-quality text is detected (skips VLM).
 - `--metadata-model` sets the post-OCR bibliographic extraction model used for naming outputs.
