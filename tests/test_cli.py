@@ -2,6 +2,8 @@ import argparse
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from paper_ocr import cli
 
 
@@ -30,6 +32,10 @@ class _FakeOpen:
 
 async def _fake_extract_discovery(*args, **kwargs):
     return {"paper_summary": "", "key_topics": [], "sections": []}
+
+
+async def _fake_fetch_from_telegram(config):
+    return []
 
 
 def test_process_pdf_uses_cached_page_count_after_close(monkeypatch, tmp_path: Path):
@@ -62,3 +68,68 @@ def test_process_pdf_uses_cached_page_count_after_close(monkeypatch, tmp_path: P
     result = asyncio.run(cli._process_pdf(args, pdf_path))
 
     assert result["page_count"] == 0
+
+
+def test_parse_fetch_telegram_args(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "fetch-telegram",
+            "papers.csv",
+            "data/in",
+            "--doi-column",
+            "DOI",
+        ],
+    )
+
+    args = cli._parse_args()
+
+    assert args.command == "fetch-telegram"
+    assert args.doi_column == "DOI"
+    assert args.doi_csv == Path("papers.csv")
+    assert args.in_dir == Path("data/in")
+
+
+def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
+    args = argparse.Namespace(
+        doi_csv=tmp_path / "papers.csv",
+        in_dir=tmp_path / "in",
+        doi_column="DOI",
+        target_bot="@your_bot_username",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        report_file=None,
+        failed_file=None,
+    )
+    args.doi_csv.write_text("DOI\n10.1000/abc\n")
+
+    monkeypatch.delenv("TG_API_ID", raising=False)
+    monkeypatch.delenv("TG_API_HASH", raising=False)
+
+    with pytest.raises(SystemExit, match="TG_API_ID"):
+        asyncio.run(cli._run_fetch_telegram(args))
+
+
+def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
+    args = argparse.Namespace(
+        doi_csv=tmp_path / "papers.csv",
+        in_dir=tmp_path / "in",
+        doi_column="DOI",
+        target_bot="@your_bot_username",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        report_file=None,
+        failed_file=None,
+    )
+    args.doi_csv.write_text("DOI\n10.1000/abc\n")
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
