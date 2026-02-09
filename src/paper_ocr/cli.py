@@ -36,8 +36,10 @@ from .postprocess import parse_yaml_front_matter
 from .render import render_page
 from .schemas import new_manifest
 from .store import ensure_dirs, write_json, write_text
+from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
 METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
+TARGET_BOT_DEFAULT = "@your_bot_username"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -58,6 +60,18 @@ def _parse_args() -> argparse.Namespace:
     run.add_argument("--text-only", action="store_true", help="Enable text-only extraction for high-quality text layers")
     run.add_argument("--metadata-model", type=str, default=METADATA_MODEL_DEFAULT)
 
+    fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")
+    fetch.add_argument("doi_csv", type=Path)
+    fetch.add_argument("in_dir", type=Path)
+    fetch.add_argument("--doi-column", type=str, default="DOI")
+    fetch.add_argument("--target-bot", type=str, default=os.getenv("TARGET_BOT", TARGET_BOT_DEFAULT))
+    fetch.add_argument("--session-name", type=str, default="nexus_session")
+    fetch.add_argument("--min-delay", type=float, default=float(os.getenv("MIN_DELAY", "10")))
+    fetch.add_argument("--max-delay", type=float, default=float(os.getenv("MAX_DELAY", "20")))
+    fetch.add_argument("--response-timeout", type=int, default=60)
+    fetch.add_argument("--report-file", type=Path, default=None)
+    fetch.add_argument("--failed-file", type=Path, default=None)
+
     return parser.parse_args()
 
 
@@ -66,6 +80,20 @@ def _require_api_key() -> str:
     if not api_key:
         raise SystemExit("Missing DEEPINFRA_API_KEY. Set it in .env or environment.")
     return api_key
+
+
+def _require_telegram_credentials() -> tuple[int, str]:
+    api_id_raw = os.getenv("TG_API_ID", "").strip()
+    api_hash = os.getenv("TG_API_HASH", "").strip()
+    if not api_id_raw:
+        raise SystemExit("Missing TG_API_ID. Set it in .env or environment.")
+    if not api_hash:
+        raise SystemExit("Missing TG_API_HASH. Set it in .env or environment.")
+    try:
+        api_id = int(api_id_raw)
+    except ValueError as exc:
+        raise SystemExit("Invalid TG_API_ID. Must be an integer.") from exc
+    return api_id, api_hash
 
 
 def _page_out_path(pages_dir: Path, page_index: int) -> Path:
@@ -549,11 +577,35 @@ async def _run(args: argparse.Namespace) -> None:
     _write_group_readmes(records)
 
 
+async def _run_fetch_telegram(args: argparse.Namespace) -> None:
+    if not args.doi_csv.exists():
+        raise SystemExit(f"DOI CSV does not exist: {args.doi_csv}")
+
+    api_id, api_hash = _require_telegram_credentials()
+    config = FetchTelegramConfig(
+        api_id=api_id,
+        api_hash=api_hash,
+        doi_csv=args.doi_csv,
+        in_dir=args.in_dir,
+        doi_column=args.doi_column,
+        target_bot=args.target_bot,
+        session_name=args.session_name,
+        min_delay=args.min_delay,
+        max_delay=args.max_delay,
+        response_timeout=args.response_timeout,
+        report_file=args.report_file,
+        failed_file=args.failed_file,
+    )
+    await fetch_from_telegram(config)
+
+
 def main() -> None:
     load_dotenv()
     args = _parse_args()
     if args.command == "run":
         asyncio.run(_run(args))
+    if args.command == "fetch-telegram":
+        asyncio.run(_run_fetch_telegram(args))
 
 
 if __name__ == "__main__":
