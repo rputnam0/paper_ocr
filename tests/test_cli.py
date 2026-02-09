@@ -112,6 +112,23 @@ def test_parse_fetch_telegram_defaults(monkeypatch):
     assert args.search_timeout == 40
 
 
+def test_run_text_only_enabled_by_default(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "run",
+            "data/in",
+            "out",
+        ],
+    )
+
+    args = cli._parse_args()
+
+    assert args.command == "run"
+    assert args.text_only is True
+
+
 def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
     args = argparse.Namespace(
         doi_csv=tmp_path / "papers.csv",

@@ -62,7 +62,12 @@ def _parse_args() -> argparse.Namespace:
     run.add_argument("--mode", choices=["auto", "anchored", "unanchored"], default="auto")
     run.add_argument("--debug", action="store_true")
     run.add_argument("--scan-preprocess", action="store_true")
-    run.add_argument("--text-only", action="store_true", help="Enable text-only extraction for high-quality text layers")
+    run.add_argument(
+        "--text-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable text-only extraction for high-quality text layers (default: enabled)",
+    )
     run.add_argument("--metadata-model", type=str, default=METADATA_MODEL_DEFAULT)
 
     fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")

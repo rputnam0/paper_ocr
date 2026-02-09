@@ -85,7 +85,7 @@ Core options:
 - `--mode auto|anchored|unanchored` default `auto`
 - `--debug`
 - `--scan-preprocess`
-- `--text-only`
+- `--text-only` / `--no-text-only` (default: `--text-only`)
 - `--metadata-model` default `nvidia/Nemotron-3-Nano-30B-A3B`
 
 ### 2) Fetch PDFs from DOI CSV via Telegram bot
@@ -216,6 +216,7 @@ Project layout:
 - `database is locked`: stop concurrent fetch processes using same session.
 - Frequent `Timeout`: increase `--search-timeout` (e.g. `30-60`).
 - `FloodWaitError`: reduce request rate by increasing `--min-delay/--max-delay`.
+- High DeepInfra usage on born-digital PDFs: ensure `--no-text-only` is not set (text-only is default) and use `--force` when re-running old outputs so pages are reprocessed under current settings.
 
 ## Security and Privacy
 

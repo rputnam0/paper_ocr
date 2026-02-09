@@ -71,7 +71,7 @@ CLI timeout default for bot response:
 - `--search-timeout` (default `40` seconds total after bot says it is searching)
 
 Key options:
-- `--text-only` enables text-layer extraction when high-quality text is detected (skips VLM).
+- `--text-only` / `--no-text-only` (default: `--text-only`) controls text-layer extraction when high-quality text is detected (skips VLM).
 - `--metadata-model` sets the post-OCR bibliographic extraction model used for naming outputs.
   - Also used for discovery metadata extraction from the first few pages (abstract + topics).
 

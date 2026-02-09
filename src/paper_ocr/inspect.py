@@ -37,14 +37,18 @@ def compute_text_heuristics(page_dict: dict[str, Any]) -> TextHeuristics:
     char_count = len(stripped)
     tokens = _tokenize(text)
 
-    printable = sum(1 for ch in text if ch.isprintable())
-    total = max(len(text), 1)
+    # Compute printable ratio on non-whitespace characters only.
+    # Newline/tab separators are expected in text extraction and should not
+    # downgrade otherwise clean born-digital pages.
+    non_whitespace = [ch for ch in text if not ch.isspace()]
+    printable = sum(1 for ch in non_whitespace if ch.isprintable())
+    total = max(len(non_whitespace), 1)
     printable_ratio = printable / total
 
     cid_hits = sum(1 for t in tokens if "cid:" in t.lower())
     cid_ratio = cid_hits / max(len(tokens), 1)
 
-    replacement_char_ratio = text.count("�") / total
+    replacement_char_ratio = text.count("�") / max(len(text), 1)
 
     avg_token_length = sum(len(t) for t in tokens) / max(len(tokens), 1)
 
