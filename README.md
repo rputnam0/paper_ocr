@@ -14,14 +14,14 @@ Set `DEEPINFRA_API_KEY` in `.env` or your environment.
 
 1. Fetch PDFs from your Telegram bot using a DOI CSV:
 ```bash
-uv run paper-ocr fetch-telegram papers.csv
+uv run paper-ocr fetch-telegram input/papers.csv
 ```
 2. Run OCR on the fetched PDFs:
 ```bash
 uv run paper-ocr run data/telegram_jobs/papers/pdfs data/telegram_jobs/papers/ocr_out
 ```
 
-Folder layout for a CSV named `papers.csv`:
+Folder layout for a CSV named `papers.csv` (job folder uses CSV stem):
 ```
 data/telegram_jobs/papers/
   input/
