@@ -74,6 +74,7 @@ def _parse_args() -> argparse.Namespace:
     fetch.add_argument("--max-delay", type=float, default=float(os.getenv("MAX_DELAY", MAX_DELAY_DEFAULT)))
     fetch.add_argument("--response-timeout", type=int, default=RESPONSE_TIMEOUT_DEFAULT)
     fetch.add_argument("--search-timeout", type=int, default=SEARCH_TIMEOUT_DEFAULT)
+    fetch.add_argument("--debug", action="store_true")
     fetch.add_argument("--report-file", type=Path, default=None)
     fetch.add_argument("--failed-file", type=Path, default=None)
 
@@ -601,6 +602,7 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         search_timeout=args.search_timeout,
         report_file=args.report_file,
         failed_file=args.failed_file,
+        debug=args.debug,
     )
     await fetch_from_telegram(config)
 

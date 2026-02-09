@@ -17,16 +17,19 @@ class _FakeButton:
 
 
 class _FakeMessage:
-    def __init__(self, text: str = "", has_file: bool = False, buttons=None):
+    def __init__(self, text: str = "", has_file: bool = False, buttons=None, on_click=None):
         self.text = text
         self.raw_text = text
         self.file = object() if has_file else None
         self.buttons = buttons
         self.clicked = []
         self.downloaded_to = None
+        self._on_click = on_click
 
     async def click(self, index: int):
         self.clicked.append(index)
+        if self._on_click is not None:
+            self._on_click(index)
 
     async def download_media(self, file: str):
         self.downloaded_to = file
@@ -34,17 +37,29 @@ class _FakeMessage:
 
 
 class _FakeConversation:
-    def __init__(self, responses):
+    def __init__(self, responses, edits=None):
         self._responses = list(responses)
+        self._edits = list(edits or [])
         self.sent = []
+        self._sent_id = 100
 
     async def send_message(self, text: str):
         self.sent.append(text)
+        self._sent_id += 1
+        return type("_SentMessage", (), {"id": self._sent_id})()
 
     async def get_response(self):
         if not self._responses:
-            raise AssertionError("no more responses")
+            raise asyncio.TimeoutError()
         next_item = self._responses.pop(0)
+        if isinstance(next_item, Exception):
+            raise next_item
+        return next_item
+
+    async def get_edit(self, message=None):
+        if not self._edits:
+            raise asyncio.TimeoutError()
+        next_item = self._edits.pop(0)
         if isinstance(next_item, Exception):
             raise next_item
         return next_item
@@ -232,6 +247,37 @@ def test_process_doi_searching_then_timeout_then_success(tmp_path: Path):
     )
 
     assert result.status == "Success"
+
+
+def test_process_doi_searching_edit_with_pdf_button_then_success(tmp_path: Path):
+    searching = _FakeMessage(text="searching...")
+    file_msg = _FakeMessage(has_file=True)
+    conv = _FakeConversation([searching], edits=[])
+
+    def _enqueue_file(_index: int) -> None:
+        conv._responses.append(file_msg)
+
+    edited_card = _FakeMessage(
+        text="Result card",
+        buttons=[[_FakeButton("⬇️ PDF | 3.76 MiB")]],
+        on_click=_enqueue_file,
+    )
+    conv._edits.append(edited_card)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+    assert edited_card.clicked == [0]
+    assert (tmp_path / "10.1000_abc.pdf").exists()
 
 
 def test_write_reports(tmp_path: Path):

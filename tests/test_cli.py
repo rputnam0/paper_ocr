@@ -125,6 +125,7 @@ def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
         search_timeout=40,
         report_file=None,
         failed_file=None,
+        debug=False,
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -148,6 +149,7 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
         search_timeout=40,
         report_file=None,
         failed_file=None,
+        debug=False,
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 

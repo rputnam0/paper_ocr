@@ -80,6 +80,7 @@ class FetchTelegramConfig:
     search_timeout: int = 40
     report_file: Path | None = None
     failed_file: Path | None = None
+    debug: bool = False
 
 
 def normalize_doi(raw: str) -> str:
@@ -161,6 +162,14 @@ def _request_button_index(message: Any) -> int | None:
     return None
 
 
+def _pdf_button_index(message: Any) -> int | None:
+    labels = _button_labels(message)
+    for idx, label in enumerate(labels):
+        if "pdf" in label.lower():
+            return idx
+    return None
+
+
 def _is_hard_failure(text: str) -> bool:
     low = text.lower()
     return any(marker in low for marker in FAILURE_MARKERS)
@@ -187,6 +196,7 @@ async def process_doi(
     in_dir: Path,
     response_timeout: int = 15,
     search_timeout: int = 40,
+    debug: bool = False,
 ) -> FetchResult:
     started = _utc_now()
     file_path = in_dir / doi_filename(doi_normalized)
@@ -211,9 +221,34 @@ async def process_doi(
     saw_searching = False
     search_deadline: float | None = None
 
-    async def _next_response(conv: Any) -> Any:
+    async def _next_response(conv: Any, *, edit_from: Any | None = None) -> Any:
         while True:
             try:
+                if edit_from is not None and hasattr(conv, "get_edit"):
+                    response_task = asyncio.create_task(_with_floodwait(conv.get_response))
+                    edit_task = asyncio.create_task(
+                        _with_floodwait(lambda: conv.get_edit(message=edit_from))
+                    )
+                    done, pending = await asyncio.wait(
+                        {response_task, edit_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    timed_out = False
+                    for task in done:
+                        exc = task.exception()
+                        if exc is None:
+                            return task.result()
+                        if isinstance(exc, asyncio.TimeoutError):
+                            timed_out = True
+                            continue
+                        raise exc
+                    if timed_out:
+                        raise asyncio.TimeoutError()
+                    raise RuntimeError("No completed task result while waiting for bot response")
+
                 return await _with_floodwait(conv.get_response)
             except asyncio.TimeoutError:
                 if saw_searching and search_deadline is not None and time.monotonic() < search_deadline:
@@ -222,12 +257,19 @@ async def process_doi(
 
     try:
         async with conversation_factory() as conv:
-            await _with_floodwait(lambda: conv.send_message(doi_normalized))
+            sent_message = await _with_floodwait(lambda: conv.send_message(doi_normalized))
             response = await _next_response(conv)
 
             while True:
                 text = _message_text(response)
                 excerpt = _excerpt(text)
+                if debug:
+                    labels = _button_labels(response)
+                    print(
+                        f"[telegram-fetch] doi={doi_normalized} "
+                        f"file={bool(getattr(response, 'file', None))} "
+                        f"text={excerpt!r} buttons={labels}"
+                    )
 
                 if getattr(response, "file", None):
                     await _with_floodwait(lambda: response.download_media(file=str(file_path)))
@@ -240,6 +282,12 @@ async def process_doi(
                     response = await _with_floodwait(conv.get_response)
                     continue
 
+                pdf_button_idx = _pdf_button_index(response)
+                if pdf_button_idx is not None:
+                    await _with_floodwait(lambda: response.click(pdf_button_idx))
+                    response = await _next_response(conv)
+                    continue
+
                 if _is_hard_failure(text):
                     status = "Failed"
                     error = text or "Not found"
@@ -249,7 +297,7 @@ async def process_doi(
                     saw_searching = True
                     if search_deadline is None:
                         search_deadline = time.monotonic() + max(search_timeout, response_timeout)
-                    response = await _next_response(conv)
+                    response = await _next_response(conv, edit_from=sent_message)
                     continue
 
                 labels = _button_labels(response)
@@ -313,6 +361,7 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
                 in_dir=config.in_dir,
                 response_timeout=config.response_timeout,
                 search_timeout=config.search_timeout,
+                debug=config.debug,
             )
             rows.append(result)
 
