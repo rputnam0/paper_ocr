@@ -40,6 +40,9 @@ from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
 METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
 TARGET_BOT_DEFAULT = "@your_bot_username"
+MIN_DELAY_DEFAULT = "4"
+MAX_DELAY_DEFAULT = "8"
+RESPONSE_TIMEOUT_DEFAULT = 25
 
 
 def _parse_args() -> argparse.Namespace:
@@ -66,9 +69,9 @@ def _parse_args() -> argparse.Namespace:
     fetch.add_argument("--doi-column", type=str, default="DOI")
     fetch.add_argument("--target-bot", type=str, default=os.getenv("TARGET_BOT", TARGET_BOT_DEFAULT))
     fetch.add_argument("--session-name", type=str, default="nexus_session")
-    fetch.add_argument("--min-delay", type=float, default=float(os.getenv("MIN_DELAY", "10")))
-    fetch.add_argument("--max-delay", type=float, default=float(os.getenv("MAX_DELAY", "20")))
-    fetch.add_argument("--response-timeout", type=int, default=60)
+    fetch.add_argument("--min-delay", type=float, default=float(os.getenv("MIN_DELAY", MIN_DELAY_DEFAULT)))
+    fetch.add_argument("--max-delay", type=float, default=float(os.getenv("MAX_DELAY", MAX_DELAY_DEFAULT)))
+    fetch.add_argument("--response-timeout", type=int, default=RESPONSE_TIMEOUT_DEFAULT)
     fetch.add_argument("--report-file", type=Path, default=None)
     fetch.add_argument("--failed-file", type=Path, default=None)
 

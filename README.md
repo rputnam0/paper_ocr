@@ -27,8 +27,11 @@ Required env vars for fetch:
 
 Optional env vars for fetch defaults:
 - `TARGET_BOT` (default `@your_bot_username`)
-- `MIN_DELAY` (default `10`)
-- `MAX_DELAY` (default `20`)
+- `MIN_DELAY` (default `4`)
+- `MAX_DELAY` (default `8`)
+
+CLI timeout default for bot response:
+- `--response-timeout` (default `25` seconds)
 
 Key options:
 - `--text-only` enables text-layer extraction when high-quality text is detected (skips VLM).

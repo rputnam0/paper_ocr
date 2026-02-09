@@ -91,6 +91,26 @@ def test_parse_fetch_telegram_args(monkeypatch):
     assert args.in_dir == Path("data/in")
 
 
+def test_parse_fetch_telegram_defaults(monkeypatch):
+    monkeypatch.delenv("MIN_DELAY", raising=False)
+    monkeypatch.delenv("MAX_DELAY", raising=False)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "fetch-telegram",
+            "papers.csv",
+            "data/in",
+        ],
+    )
+
+    args = cli._parse_args()
+
+    assert args.min_delay == 4.0
+    assert args.max_delay == 8.0
+    assert args.response_timeout == 25
+
+
 def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
     args = argparse.Namespace(
         doi_csv=tmp_path / "papers.csv",
