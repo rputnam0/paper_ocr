@@ -12,14 +12,33 @@ Set `DEEPINFRA_API_KEY` in `.env` or your environment.
 
 ## Telegram DOI fetch workflow
 
-1. Fetch PDFs from your Telegram bot into an OCR input folder:
+1. Fetch PDFs from your Telegram bot using a DOI CSV:
 ```bash
-uv run paper-ocr fetch-telegram papers.csv data/inbox
+uv run paper-ocr fetch-telegram papers.csv
 ```
-2. Run OCR on fetched PDFs:
+2. Run OCR on the fetched PDFs:
 ```bash
-uv run paper-ocr run data/inbox out
+uv run paper-ocr run data/telegram_jobs/papers/pdfs data/telegram_jobs/papers/ocr_out
 ```
+
+Folder layout for a CSV named `papers.csv`:
+```
+data/telegram_jobs/papers/
+  input/
+    papers.csv
+  pdfs/
+    <bot_paper_title>.pdf
+  reports/
+    telegram_download_report.csv
+    telegram_failed_papers.csv
+    download_index.json
+  ocr_out/
+```
+
+Notes:
+- `pdfs/` is the intermediate OCR input.
+- `ocr_out/` is reserved for final OCR outputs.
+- PDF filenames are derived from bot-provided paper titles (DOI fallback if title is missing).
 
 Required env vars for fetch:
 - `TG_API_ID`

@@ -5,7 +5,6 @@ import csv
 import random
 import re
 import time
-from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +28,7 @@ except Exception:  # pragma: no cover - exercised only when dependency missing
 
 DOI_PREFIX_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", re.IGNORECASE)
 SAFE_CHAR_RE = re.compile(r"[^A-Za-z0-9._-]+")
+LEADING_SYMBOLS_RE = re.compile(r"^[^A-Za-z0-9]+")
 
 FAILURE_MARKERS = (
     "not found",
@@ -94,6 +94,21 @@ def doi_filename(doi: str) -> str:
     return f"{safe or 'unknown_doi'}.pdf"
 
 
+def extract_bot_title(text: str) -> str:
+    if not text.strip():
+        return ""
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    cleaned = LEADING_SYMBOLS_RE.sub("", first_line).strip()
+    return cleaned
+
+
+def title_filename(title: str, doi: str) -> str:
+    if not title.strip():
+        return doi_filename(doi)
+    safe = SAFE_CHAR_RE.sub("_", title).strip("_")
+    return f"{safe or doi_filename(doi).removesuffix('.pdf')}.pdf"
+
+
 def load_unique_dois(csv_path: Path, doi_column: str) -> list[tuple[str, str]]:
     with csv_path.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -128,6 +143,31 @@ def write_reports(rows: list[FetchResult], report_file: Path, failed_file: Path)
         for row in rows:
             if row.status not in {"Success", "Exists"}:
                 writer.writerow(asdict(row))
+
+
+def load_download_index(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        import json
+
+        raw = json.loads(path.read_text())
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k] = v
+    return out
+
+
+def write_download_index(path: Path, index: dict[str, str]) -> None:
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(index, indent=2, ensure_ascii=True))
 
 
 def _utc_now() -> datetime:
@@ -196,18 +236,33 @@ async def process_doi(
     in_dir: Path,
     response_timeout: int = 15,
     search_timeout: int = 40,
+    existing_file_path: Path | None = None,
     debug: bool = False,
 ) -> FetchResult:
     started = _utc_now()
-    file_path = in_dir / doi_filename(doi_normalized)
+    fallback_path = in_dir / doi_filename(doi_normalized)
 
-    if file_path.exists():
+    if existing_file_path is not None and existing_file_path.exists():
         finished = _utc_now()
         return FetchResult(
             doi_original=doi_original,
             doi_normalized=doi_normalized,
             status="Exists",
-            file_path=str(file_path),
+            file_path=str(existing_file_path),
+            error="",
+            bot_message_excerpt="",
+            started_at=started.isoformat(),
+            finished_at=finished.isoformat(),
+            elapsed_s=(finished - started).total_seconds(),
+        )
+
+    if fallback_path.exists():
+        finished = _utc_now()
+        return FetchResult(
+            doi_original=doi_original,
+            doi_normalized=doi_normalized,
+            status="Exists",
+            file_path=str(fallback_path),
             error="",
             bot_message_excerpt="",
             started_at=started.isoformat(),
@@ -272,8 +327,13 @@ async def process_doi(
                     )
 
                 if getattr(response, "file", None):
-                    await _with_floodwait(lambda: response.download_media(file=str(file_path)))
+                    title = extract_bot_title(text)
+                    candidate = in_dir / title_filename(title, doi_normalized)
+                    if candidate.exists() and candidate != fallback_path:
+                        candidate = in_dir / f"{candidate.stem}_{doi_filename(doi_normalized).removesuffix('.pdf')}.pdf"
+                    await _with_floodwait(lambda: response.download_media(file=str(candidate)))
                     status = "Success"
+                    fallback_path = candidate
                     break
 
                 button_idx = _request_button_index(response)
@@ -320,7 +380,7 @@ async def process_doi(
         doi_original=doi_original,
         doi_normalized=doi_normalized,
         status=status,
-        file_path=str(file_path) if status in {"Success", "Exists"} else "",
+        file_path=str(fallback_path) if status in {"Success", "Exists"} else "",
         error=error,
         bot_message_excerpt=excerpt,
         started_at=started.isoformat(),
@@ -333,6 +393,7 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
     config.in_dir.mkdir(parents=True, exist_ok=True)
     report_file = config.report_file or (config.in_dir / "telegram_download_report.csv")
     failed_file = config.failed_file or (config.in_dir / "telegram_failed_papers.csv")
+    index_file = report_file.parent / "download_index.json"
 
     if config.min_delay < 0 or config.max_delay < 0 or config.min_delay > config.max_delay:
         raise ValueError("Invalid delay bounds: require 0 <= min_delay <= max_delay")
@@ -343,6 +404,7 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
         return []
 
     rows: list[FetchResult] = []
+    index = load_download_index(index_file)
 
     client = TelegramClient(config.session_name, config.api_id, config.api_hash)
     await client.start()
@@ -361,9 +423,17 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
                 in_dir=config.in_dir,
                 response_timeout=config.response_timeout,
                 search_timeout=config.search_timeout,
+                existing_file_path=(config.in_dir / index[doi_normalized]) if doi_normalized in index else None,
                 debug=config.debug,
             )
             rows.append(result)
+            if result.status in {"Success", "Exists"} and result.file_path:
+                p = Path(result.file_path)
+                try:
+                    rel = p.relative_to(config.in_dir)
+                    index[doi_normalized] = str(rel)
+                except Exception:
+                    index[doi_normalized] = p.name
 
             if result.status != "Exists":
                 await asyncio.sleep(random.uniform(config.min_delay, config.max_delay))
@@ -371,4 +441,5 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
         await client.disconnect()
 
     write_reports(rows, report_file, failed_file)
+    write_download_index(index_file, index)
     return rows

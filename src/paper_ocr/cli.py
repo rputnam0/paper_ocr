@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 from dataclasses import asdict
 from pathlib import Path
@@ -44,6 +45,7 @@ MIN_DELAY_DEFAULT = "4"
 MAX_DELAY_DEFAULT = "8"
 RESPONSE_TIMEOUT_DEFAULT = 15
 SEARCH_TIMEOUT_DEFAULT = 40
+CSV_JOB_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -66,7 +68,7 @@ def _parse_args() -> argparse.Namespace:
 
     fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")
     fetch.add_argument("doi_csv", type=Path)
-    fetch.add_argument("in_dir", type=Path)
+    fetch.add_argument("output_root", type=Path, nargs="?", default=Path("data/telegram_jobs"))
     fetch.add_argument("--doi-column", type=str, default="DOI")
     fetch.add_argument("--target-bot", type=str, default=os.getenv("TARGET_BOT", TARGET_BOT_DEFAULT))
     fetch.add_argument("--session-name", type=str, default="nexus_session")
@@ -588,11 +590,23 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         raise SystemExit(f"DOI CSV does not exist: {args.doi_csv}")
 
     api_id, api_hash = _require_telegram_credentials()
+    csv_name = CSV_JOB_SAFE_RE.sub("_", args.doi_csv.stem).strip("_") or "job"
+    job_dir = args.output_root / csv_name
+    input_dir = job_dir / "input"
+    pdf_dir = job_dir / "pdfs"
+    reports_dir = job_dir / "reports"
+    ocr_out_dir = job_dir / "ocr_out"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ocr_out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(args.doi_csv, input_dir / args.doi_csv.name)
+
     config = FetchTelegramConfig(
         api_id=api_id,
         api_hash=api_hash,
         doi_csv=args.doi_csv,
-        in_dir=args.in_dir,
+        in_dir=pdf_dir,
         doi_column=args.doi_column,
         target_bot=args.target_bot,
         session_name=args.session_name,
@@ -600,8 +614,8 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         max_delay=args.max_delay,
         response_timeout=args.response_timeout,
         search_timeout=args.search_timeout,
-        report_file=args.report_file,
-        failed_file=args.failed_file,
+        report_file=args.report_file or (reports_dir / "telegram_download_report.csv"),
+        failed_file=args.failed_file or (reports_dir / "telegram_failed_papers.csv"),
         debug=args.debug,
     )
     await fetch_from_telegram(config)

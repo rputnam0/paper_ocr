@@ -90,6 +90,12 @@ def test_doi_filename_sanitizes():
     assert telegram_fetch.doi_filename("10.1000/a:b*c") == "10.1000_a_b_c.pdf"
 
 
+def test_title_filename_uses_bot_title():
+    title = telegram_fetch.extract_bot_title("🔬 Toward Better Viscosity Models (2022)\nRita Kol")
+    assert title == "Toward Better Viscosity Models (2022)"
+    assert telegram_fetch.title_filename(title, "10.1000/abc") == "Toward_Better_Viscosity_Models_2022.pdf"
+
+
 def test_load_unique_dois_dedups(tmp_path: Path):
     csv_path = tmp_path / "papers.csv"
     csv_path.write_text("DOI\n10.1000/abc\nhttps://doi.org/10.1000/ABC\n\n")
@@ -119,7 +125,7 @@ def test_process_doi_exists_skips_network(tmp_path: Path):
 
 
 def test_process_doi_instant_file_success(tmp_path: Path):
-    msg = _FakeMessage(has_file=True)
+    msg = _FakeMessage(text="🔬 Test Bot Title (2024)\nA Author", has_file=True)
     conv = _FakeConversation([msg])
 
     result = asyncio.run(
@@ -133,7 +139,7 @@ def test_process_doi_instant_file_success(tmp_path: Path):
 
     assert result.status == "Success"
     assert conv.sent == ["10.1000/abc"]
-    assert (tmp_path / "10.1000_abc.pdf").exists()
+    assert (tmp_path / "Test_Bot_Title_2024.pdf").exists()
 
 
 def test_process_doi_cache_miss_with_request_button(tmp_path: Path):

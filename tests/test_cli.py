@@ -35,6 +35,7 @@ async def _fake_extract_discovery(*args, **kwargs):
 
 
 async def _fake_fetch_from_telegram(config):
+    _fake_fetch_from_telegram.last_config = config
     return []
 
 
@@ -77,7 +78,7 @@ def test_parse_fetch_telegram_args(monkeypatch):
             "paper-ocr",
             "fetch-telegram",
             "papers.csv",
-            "data/in",
+            "data/jobs",
             "--doi-column",
             "DOI",
         ],
@@ -88,7 +89,7 @@ def test_parse_fetch_telegram_args(monkeypatch):
     assert args.command == "fetch-telegram"
     assert args.doi_column == "DOI"
     assert args.doi_csv == Path("papers.csv")
-    assert args.in_dir == Path("data/in")
+    assert args.output_root == Path("data/jobs")
 
 
 def test_parse_fetch_telegram_defaults(monkeypatch):
@@ -100,7 +101,6 @@ def test_parse_fetch_telegram_defaults(monkeypatch):
             "paper-ocr",
             "fetch-telegram",
             "papers.csv",
-            "data/in",
         ],
     )
 
@@ -115,7 +115,7 @@ def test_parse_fetch_telegram_defaults(monkeypatch):
 def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
     args = argparse.Namespace(
         doi_csv=tmp_path / "papers.csv",
-        in_dir=tmp_path / "in",
+        output_root=tmp_path / "jobs",
         doi_column="DOI",
         target_bot="@your_bot_username",
         session_name="nexus_session",
@@ -139,7 +139,7 @@ def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
 def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
     args = argparse.Namespace(
         doi_csv=tmp_path / "papers.csv",
-        in_dir=tmp_path / "in",
+        output_root=tmp_path / "jobs",
         doi_column="DOI",
         target_bot="@your_bot_username",
         session_name="nexus_session",
@@ -158,3 +158,6 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
 
     asyncio.run(cli._run_fetch_telegram(args))
+    config = _fake_fetch_from_telegram.last_config
+    assert config.in_dir == tmp_path / "jobs" / "papers" / "pdfs"
+    assert config.report_file == tmp_path / "jobs" / "papers" / "reports" / "telegram_download_report.csv"
