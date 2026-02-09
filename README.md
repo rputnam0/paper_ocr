@@ -10,6 +10,7 @@ The pipeline is optimized for technical papers and produces per-paper Markdown, 
 
 - Routes each page through anchored or unanchored prompting based on text-layer heuristics.
 - Supports text-only extraction when high-quality text layers are available.
+- Supports structured born-digital extraction via external Marker (OCR disabled) with fallback to existing OCR/text paths.
 - Renders pages with OCR-safe sizing constraints.
 - Parses model YAML front matter and writes normalized page outputs.
 - Extracts bibliography metadata from first-page content.
@@ -22,11 +23,12 @@ The pipeline is optimized for technical papers and produces per-paper Markdown, 
 1. **Ingest**: find PDFs and compute stable identifiers/hashes.
 2. **Inspect**: determine page route (`anchored` vs `unanchored`) from text heuristics.
 3. **Render**: convert pages to model-ready images.
-4. **OCR Call**: send page + prompt to DeepInfra OpenAI-compatible endpoint.
-5. **Postprocess**: parse YAML front matter and normalize page markdown/metadata.
-6. **Document Assembly**: merge pages, produce `document.jsonl`, write consolidated markdown.
-7. **Metadata Enrichment**: extract bibliography + discovery JSON.
-8. **Store**: emit deterministic output bundle + group readmes.
+4. **Structured Born-Digital Path (optional)**: run external Marker page extraction (with `OCR_ENGINE=None`) and optionally enrich metadata/sections with GROBID TEI.
+5. **OCR Call**: send page + prompt to DeepInfra OpenAI-compatible endpoint when structured extraction is disabled or a structured page falls back.
+6. **Postprocess**: parse YAML front matter and normalize page markdown/metadata.
+7. **Document Assembly**: merge pages, produce `document.jsonl`, write consolidated markdown.
+8. **Metadata Enrichment**: extract bibliography + discovery JSON.
+9. **Store**: emit deterministic output bundle + group readmes.
 
 Telegram DOI fetch is a pre-ingest source step that fills a PDF job folder used by OCR.
 
@@ -68,6 +70,16 @@ MIN_DELAY=4
 MAX_DELAY=8
 ```
 
+Optional born-digital structured defaults:
+
+```ini
+PAPER_OCR_DIGITAL_STRUCTURED=auto
+PAPER_OCR_MARKER_COMMAND=marker_single
+PAPER_OCR_GROBID_URL=
+PAPER_OCR_MARKER_TIMEOUT=120
+PAPER_OCR_GROBID_TIMEOUT=60
+```
+
 ## CLI Overview
 
 ### 1) OCR existing PDFs
@@ -87,6 +99,14 @@ Core options:
 - `--scan-preprocess`
 - `--text-only` / `--no-text-only` (default: `--text-only`)
 - `--metadata-model` default `nvidia/Nemotron-3-Nano-30B-A3B`
+- `--digital-structured off|auto|on` default `auto`
+- `--structured-backend marker|hybrid` default `hybrid`
+- `--marker-command` default `marker_single`
+- `--marker-timeout` default `120`
+- `--grobid-url` optional URL (enables TEI enrichment)
+- `--grobid-timeout` default `60`
+- `--structured-max-workers` default `4`
+- `--structured-asset-level standard|full` default `standard`
 
 ### 2) Fetch PDFs from DOI CSV via Telegram bot
 
@@ -117,6 +137,21 @@ Fetch options:
 ```bash
 uv run paper-ocr run data/LISA out
 ```
+
+### Workflow A2: Born-digital structured extraction with optional GROBID
+
+```bash
+uv run paper-ocr run data/LISA out \
+  --digital-structured auto \
+  --structured-backend hybrid \
+  --marker-command marker_single \
+  --grobid-url http://<wsl-host>:8070
+```
+
+Notes:
+- `--digital-structured auto` applies document-level eligibility rules and falls back safely.
+- Marker is invoked as an external command and OCR is forced off via `OCR_ENGINE=None`.
+- If GROBID is unavailable, run continues without TEI enrichment.
 
 ### Workflow B: DOI CSV -> Telegram fetch -> OCR
 
@@ -182,6 +217,13 @@ out/<input_parent_folder>/<author_year>/
     sections.json
     document.jsonl
     assets/
+      structured/
+        marker/
+          page_0001.md
+          page_0001.json
+          page_0001_assets/
+        grobid/
+          fulltext.tei.xml
     debug/
 ```
 
@@ -189,6 +231,7 @@ Behavior notes:
 - Folder naming prefers extracted author/year metadata; falls back safely when missing.
 - Consolidated markdown filename is derived from extracted title.
 - Group-level readmes are generated for folder-level discoverability.
+- `manifest.json` includes a `structured_extraction` block with `enabled`, `backend`, `grobid_used`, `fallback_count`, and `structured_page_count`.
 
 ## Development
 
@@ -201,6 +244,7 @@ uv run pytest
 Project layout:
 - `src/paper_ocr/cli.py` CLI entrypoints
 - `src/paper_ocr/telegram_fetch.py` DOI/Telegram retrieval flow
+- `src/paper_ocr/structured_extract.py` Marker/GROBID integration + markdown normalization
 - `src/paper_ocr/ingest.py` PDF discovery + hashing
 - `src/paper_ocr/inspect.py` routing heuristics
 - `src/paper_ocr/render.py` page rendering
@@ -219,6 +263,9 @@ Project layout:
 - Frequent `Timeout`: increase `--search-timeout` (e.g. `30-60`).
 - `FloodWaitError`: reduce request rate by increasing `--min-delay/--max-delay`.
 - High DeepInfra usage on born-digital PDFs: ensure `--no-text-only` is not set (text-only is default) and use `--force` when re-running old outputs so pages are reprocessed under current settings.
+- `marker_single: command not found`: install Marker separately or pass a valid `--marker-command`.
+- Marker extraction fails on some pages: run continues via fallback; inspect page-level `status=structured_fallback` in `manifest.json`.
+- GROBID connection errors: verify `--grobid-url` points to reachable service endpoint from this machine.
 
 ## Security and Privacy
 

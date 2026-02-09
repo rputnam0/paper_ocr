@@ -1,0 +1,111 @@
+# Structured Born-Digital Extraction
+
+## Goal
+
+Improve markdown quality for born-digital PDFs by using a structure-aware extractor path while keeping existing OCR behavior and outputs backward-compatible.
+
+## Design
+
+### Processing Modes
+
+- `--digital-structured off`: never attempt structured extraction.
+- `--digital-structured on`: always attempt structured extraction first.
+- `--digital-structured auto` (default): attempt structured extraction when:
+  - at least 70% pages route to `anchored`,
+  - at least 60% pages satisfy `is_text_only_candidate`,
+  - first page routes to `anchored`.
+
+### Backends
+
+- `--structured-backend marker`: Marker-only structured extraction.
+- `--structured-backend hybrid`: Marker extraction + optional GROBID TEI enrichment if `--grobid-url` is set.
+
+### Marker Integration
+
+- Marker runs as an external command (`--marker-command`, default `marker_single`).
+- Marker OCR is disabled for every call via env: `OCR_ENGINE=None`.
+- Extraction runs per page from single-page temporary PDFs to preserve existing `pages/0001.md` output contract.
+- Structured markdown is normalized before write (`normalize_markdown_for_llm`) for LLM readability.
+- If Marker fails on any page, that page falls back to existing text-only/VLM processing.
+
+### GROBID Integration (Optional)
+
+- Called once per document at `${GROBID_URL}/api/processFulltextDocument`.
+- TEI is persisted to:
+  - `metadata/assets/structured/grobid/fulltext.tei.xml`
+- Parsed TEI can patch missing bibliography values (`title`, `authors`, `year`) and provide section candidates.
+- GROBID failures are non-fatal and do not stop OCR.
+
+## Output Contract
+
+Existing outputs remain unchanged:
+
+- `pages/*.md`
+- `metadata/manifest.json`
+- `metadata/bibliography.json`
+- `metadata/discovery.json`
+- `metadata/sections.json`
+
+New structured artifacts are additive:
+
+- `metadata/assets/structured/marker/page_0001.md`
+- `metadata/assets/structured/marker/page_0001.json`
+- `metadata/assets/structured/marker/page_0001_assets/*`
+- `metadata/assets/structured/grobid/fulltext.tei.xml`
+
+Manifest includes:
+
+```json
+{
+  "structured_extraction": {
+    "enabled": true,
+    "backend": "hybrid",
+    "grobid_used": true,
+    "fallback_count": 2,
+    "structured_page_count": 14
+  }
+}
+```
+
+Page entries may include:
+
+- `status: structured_ok`
+- `status: structured_fallback`
+- `structured: { backend, artifacts, fallback_reason }`
+
+## Safety and Fallback
+
+- Structured extraction never blocks run completion.
+- Any page-level failure automatically uses the existing pipeline.
+- If `--digital-structured off`, behavior is effectively unchanged from prior OCR flow.
+
+## Configuration
+
+Environment variables:
+
+- `PAPER_OCR_DIGITAL_STRUCTURED`
+- `PAPER_OCR_MARKER_COMMAND`
+- `PAPER_OCR_GROBID_URL`
+- `PAPER_OCR_MARKER_TIMEOUT`
+- `PAPER_OCR_GROBID_TIMEOUT`
+
+CLI options:
+
+- `--digital-structured off|auto|on`
+- `--structured-backend marker|hybrid`
+- `--marker-command <cmd>`
+- `--marker-timeout <sec>`
+- `--grobid-url <url>`
+- `--grobid-timeout <sec>`
+- `--structured-max-workers <n>`
+- `--structured-asset-level standard|full`
+
+## Recommended WSL GROBID Setup
+
+Run GROBID in WSL/Docker and expose port `8070`, then pass host URL from macOS:
+
+```bash
+uv run paper-ocr run data/in out --grobid-url http://<wsl-host>:8070 --structured-backend hybrid
+```
+
+Use firewall/network settings so the service is reachable from the machine running `paper-ocr`.
