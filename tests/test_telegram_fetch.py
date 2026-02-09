@@ -211,6 +211,29 @@ def test_process_doi_floodwait_then_success(tmp_path: Path, monkeypatch):
     assert sleeps == [3]
 
 
+def test_process_doi_searching_then_timeout_then_success(tmp_path: Path):
+    conv = _FakeConversation(
+        [
+            _FakeMessage(text="Searching..."),
+            asyncio.TimeoutError(),
+            _FakeMessage(has_file=True),
+        ]
+    )
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+
+
 def test_write_reports(tmp_path: Path):
     rows = [
         telegram_fetch.FetchResult(

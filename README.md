@@ -31,7 +31,8 @@ Optional env vars for fetch defaults:
 - `MAX_DELAY` (default `8`)
 
 CLI timeout default for bot response:
-- `--response-timeout` (default `25` seconds)
+- `--response-timeout` (default `15` seconds per poll)
+- `--search-timeout` (default `40` seconds total after bot says it is searching)
 
 Key options:
 - `--text-only` enables text-layer extraction when high-quality text is detected (skips VLM).

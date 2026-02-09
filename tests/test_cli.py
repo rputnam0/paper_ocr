@@ -108,7 +108,8 @@ def test_parse_fetch_telegram_defaults(monkeypatch):
 
     assert args.min_delay == 4.0
     assert args.max_delay == 8.0
-    assert args.response_timeout == 25
+    assert args.response_timeout == 15
+    assert args.search_timeout == 40
 
 
 def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
@@ -121,6 +122,7 @@ def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
         min_delay=10.0,
         max_delay=20.0,
         response_timeout=60,
+        search_timeout=40,
         report_file=None,
         failed_file=None,
     )
@@ -143,6 +145,7 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
         min_delay=10.0,
         max_delay=20.0,
         response_timeout=60,
+        search_timeout=40,
         report_file=None,
         failed_file=None,
     )

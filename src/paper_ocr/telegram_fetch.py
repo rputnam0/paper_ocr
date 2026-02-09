@@ -4,6 +4,7 @@ import asyncio
 import csv
 import random
 import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -75,7 +76,8 @@ class FetchTelegramConfig:
     session_name: str = "nexus_session"
     min_delay: float = 10.0
     max_delay: float = 20.0
-    response_timeout: int = 60
+    response_timeout: int = 15
+    search_timeout: int = 40
     report_file: Path | None = None
     failed_file: Path | None = None
 
@@ -183,6 +185,8 @@ async def process_doi(
     doi_original: str,
     doi_normalized: str,
     in_dir: Path,
+    response_timeout: int = 15,
+    search_timeout: int = 40,
 ) -> FetchResult:
     started = _utc_now()
     file_path = in_dir / doi_filename(doi_normalized)
@@ -204,11 +208,22 @@ async def process_doi(
     status = "UnknownResponse"
     error = ""
     excerpt = ""
+    saw_searching = False
+    search_deadline: float | None = None
+
+    async def _next_response(conv: Any) -> Any:
+        while True:
+            try:
+                return await _with_floodwait(conv.get_response)
+            except asyncio.TimeoutError:
+                if saw_searching and search_deadline is not None and time.monotonic() < search_deadline:
+                    continue
+                raise
 
     try:
         async with conversation_factory() as conv:
             await _with_floodwait(lambda: conv.send_message(doi_normalized))
-            response = await _with_floodwait(conv.get_response)
+            response = await _next_response(conv)
 
             while True:
                 text = _message_text(response)
@@ -231,7 +246,10 @@ async def process_doi(
                     break
 
                 if _is_searching(text):
-                    response = await _with_floodwait(conv.get_response)
+                    saw_searching = True
+                    if search_deadline is None:
+                        search_deadline = time.monotonic() + max(search_timeout, response_timeout)
+                    response = await _next_response(conv)
                     continue
 
                 labels = _button_labels(response)
@@ -293,6 +311,8 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
                 doi_original=doi_original,
                 doi_normalized=doi_normalized,
                 in_dir=config.in_dir,
+                response_timeout=config.response_timeout,
+                search_timeout=config.search_timeout,
             )
             rows.append(result)
 

@@ -42,7 +42,8 @@ METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
 TARGET_BOT_DEFAULT = "@your_bot_username"
 MIN_DELAY_DEFAULT = "4"
 MAX_DELAY_DEFAULT = "8"
-RESPONSE_TIMEOUT_DEFAULT = 25
+RESPONSE_TIMEOUT_DEFAULT = 15
+SEARCH_TIMEOUT_DEFAULT = 40
 
 
 def _parse_args() -> argparse.Namespace:
@@ -72,6 +73,7 @@ def _parse_args() -> argparse.Namespace:
     fetch.add_argument("--min-delay", type=float, default=float(os.getenv("MIN_DELAY", MIN_DELAY_DEFAULT)))
     fetch.add_argument("--max-delay", type=float, default=float(os.getenv("MAX_DELAY", MAX_DELAY_DEFAULT)))
     fetch.add_argument("--response-timeout", type=int, default=RESPONSE_TIMEOUT_DEFAULT)
+    fetch.add_argument("--search-timeout", type=int, default=SEARCH_TIMEOUT_DEFAULT)
     fetch.add_argument("--report-file", type=Path, default=None)
     fetch.add_argument("--failed-file", type=Path, default=None)
 
@@ -596,6 +598,7 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         min_delay=args.min_delay,
         max_delay=args.max_delay,
         response_timeout=args.response_timeout,
+        search_timeout=args.search_timeout,
         report_file=args.report_file,
         failed_file=args.failed_file,
     )
