@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from paper_ocr import cli
+from paper_ocr.inspect import TextHeuristics
+from paper_ocr.structured_extract import StructuredPageResult
 
 
 class _FakeDoc:
@@ -130,6 +132,32 @@ def test_run_text_only_enabled_by_default(monkeypatch):
     assert args.text_only is True
 
 
+def test_run_structured_defaults(monkeypatch):
+    monkeypatch.delenv("PAPER_OCR_DIGITAL_STRUCTURED", raising=False)
+    monkeypatch.delenv("PAPER_OCR_MARKER_COMMAND", raising=False)
+    monkeypatch.delenv("PAPER_OCR_GROBID_URL", raising=False)
+    monkeypatch.delenv("PAPER_OCR_MARKER_TIMEOUT", raising=False)
+    monkeypatch.delenv("PAPER_OCR_GROBID_TIMEOUT", raising=False)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "run",
+            "data/in",
+            "out",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.digital_structured == "auto"
+    assert args.structured_backend == "hybrid"
+    assert args.marker_command == "marker_single"
+    assert args.marker_timeout == 120
+    assert args.grobid_url == ""
+    assert args.grobid_timeout == 60
+    assert args.structured_max_workers == 4
+    assert args.structured_asset_level == "standard"
+
+
 def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
     args = argparse.Namespace(
         doi_csv=tmp_path / "papers.csv",
@@ -246,3 +274,92 @@ def test_final_doc_dir_avoids_non_manifest_existing_folder(monkeypatch, tmp_path
     out = cli._final_doc_dir(args, pdf_path, bibliography)
 
     assert out.name == "Doe_Jane_2024_abc123def456"
+
+
+def test_process_page_structured_success_skips_fallback(monkeypatch, tmp_path: Path):
+    dirs = cli.ensure_dirs(tmp_path / "doc")
+    called = {"fallback": False}
+
+    async def _fake_fallback(**kwargs):  # noqa: ANN001
+        called["fallback"] = True
+        return {}
+
+    monkeypatch.setattr(cli, "_process_page", _fake_fallback)
+    monkeypatch.setattr(
+        cli,
+        "run_marker_page",
+        lambda *args, **kwargs: StructuredPageResult(
+            success=True,
+            markdown="##Intro\n\n-  item",
+            artifacts={"markdown": "x"},
+        ),
+    )
+
+    result = asyncio.run(
+        cli._process_page_structured(
+            page_index=0,
+            pdf_path=tmp_path / "doc.pdf",
+            marker_command="marker_single",
+            marker_timeout=5,
+            structured_asset_level="standard",
+            structured_backend="hybrid",
+            structured_semaphore=asyncio.Semaphore(1),
+            route="anchored",
+            heuristics=TextHeuristics(
+                char_count=1000,
+                printable_ratio=0.99,
+                cid_ratio=0.0,
+                replacement_char_ratio=0.0,
+                avg_token_length=5.0,
+            ),
+            fallback_kwargs={"dirs": dirs, "force": False},
+        )
+    )
+
+    assert result["status"] == "structured_ok"
+    assert not called["fallback"]
+    assert Path(result["output_files"]["markdown"]).exists()
+
+
+def test_process_page_structured_failure_uses_fallback(monkeypatch, tmp_path: Path):
+    dirs = cli.ensure_dirs(tmp_path / "doc")
+
+    async def _fake_fallback(**kwargs):  # noqa: ANN001
+        return {
+            "page_index": kwargs["page_index"],
+            "route": kwargs["route_override"],
+            "heuristics": {},
+            "status": "ok",
+            "output_files": {"markdown": str(dirs["pages"] / "0001.md")},
+        }
+
+    monkeypatch.setattr(cli, "_process_page", _fake_fallback)
+    monkeypatch.setattr(
+        cli,
+        "run_marker_page",
+        lambda *args, **kwargs: StructuredPageResult(success=False, error="marker unavailable"),
+    )
+
+    result = asyncio.run(
+        cli._process_page_structured(
+            page_index=0,
+            pdf_path=tmp_path / "doc.pdf",
+            marker_command="marker_single",
+            marker_timeout=5,
+            structured_asset_level="standard",
+            structured_backend="hybrid",
+            structured_semaphore=asyncio.Semaphore(1),
+            route="anchored",
+            heuristics=TextHeuristics(
+                char_count=1000,
+                printable_ratio=0.99,
+                cid_ratio=0.0,
+                replacement_char_ratio=0.0,
+                avg_token_length=5.0,
+            ),
+            fallback_kwargs={"dirs": dirs, "force": False, "page_index": 0},
+        )
+    )
+
+    assert result["status"] == "structured_fallback"
+    assert result["structured"]["fallback_reason"] == "marker unavailable"

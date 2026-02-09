@@ -37,6 +37,12 @@ from .postprocess import parse_yaml_front_matter
 from .render import render_page
 from .schemas import new_manifest
 from .store import ensure_dirs, write_json, write_text
+from .structured_extract import (
+    is_structured_candidate_doc,
+    normalize_markdown_for_llm,
+    run_grobid_doc,
+    run_marker_page,
+)
 from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
 METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
@@ -45,6 +51,10 @@ MAX_DELAY_DEFAULT = "8"
 RESPONSE_TIMEOUT_DEFAULT = 15
 SEARCH_TIMEOUT_DEFAULT = 40
 CSV_JOB_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+DIGITAL_STRUCTURED_DEFAULT = "auto"
+MARKER_COMMAND_DEFAULT = "marker_single"
+MARKER_TIMEOUT_DEFAULT = "120"
+GROBID_TIMEOUT_DEFAULT = "60"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -69,6 +79,42 @@ def _parse_args() -> argparse.Namespace:
         help="Enable text-only extraction for high-quality text layers (default: enabled)",
     )
     run.add_argument("--metadata-model", type=str, default=METADATA_MODEL_DEFAULT)
+    run.add_argument(
+        "--digital-structured",
+        choices=["off", "auto", "on"],
+        default=os.getenv("PAPER_OCR_DIGITAL_STRUCTURED", DIGITAL_STRUCTURED_DEFAULT),
+    )
+    run.add_argument(
+        "--structured-backend",
+        choices=["marker", "hybrid"],
+        default="hybrid",
+    )
+    run.add_argument(
+        "--marker-command",
+        type=str,
+        default=os.getenv("PAPER_OCR_MARKER_COMMAND", MARKER_COMMAND_DEFAULT),
+    )
+    run.add_argument(
+        "--marker-timeout",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_MARKER_TIMEOUT", MARKER_TIMEOUT_DEFAULT)),
+    )
+    run.add_argument(
+        "--grobid-url",
+        type=str,
+        default=os.getenv("PAPER_OCR_GROBID_URL", ""),
+    )
+    run.add_argument(
+        "--grobid-timeout",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_GROBID_TIMEOUT", GROBID_TIMEOUT_DEFAULT)),
+    )
+    run.add_argument("--structured-max-workers", type=int, default=4)
+    run.add_argument(
+        "--structured-asset-level",
+        choices=["standard", "full"],
+        default="standard",
+    )
 
     fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")
     fetch.add_argument("doi_csv", type=Path)
@@ -292,8 +338,111 @@ def _move_first_page_artifacts(
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 src.replace(dst)
 
+    # Move structured page assets that may have been written to staging assets.
+    page_tag = f"page_{page_index + 1:04d}"
+    for root in ("marker", "grobid"):
+        src_root = from_dirs["assets"] / "structured" / root
+        if not src_root.exists():
+            continue
+        dst_root = to_dirs["assets"] / "structured" / root
+        for candidate in src_root.glob(f"{page_tag}*"):
+            dst = dst_root / candidate.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if candidate.is_dir():
+                if dst.exists():
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(candidate, dst)
+                shutil.rmtree(candidate, ignore_errors=True)
+            else:
+                candidate.replace(dst)
+
     first_page["output_files"] = output_files
     return first_page
+
+
+def _collect_page_signals(doc: fitz.Document, mode: str) -> list[tuple[Any, str]]:
+    signals: list[tuple[Any, str]] = []
+    for i in range(doc.page_count):
+        page_dict = doc.load_page(i).get_text("dict")
+        heuristics = compute_text_heuristics(page_dict)
+        route = decide_route(heuristics, mode=mode)
+        signals.append((heuristics, route))
+    return signals
+
+
+async def _process_page_structured(
+    *,
+    page_index: int,
+    pdf_path: Path,
+    marker_command: str,
+    marker_timeout: int,
+    structured_asset_level: str,
+    structured_backend: str,
+    structured_semaphore: asyncio.Semaphore,
+    route: str,
+    heuristics: Any,
+    fallback_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    dirs = fallback_kwargs["dirs"]
+    page_path = _page_out_path(dirs["pages"], page_index)
+    if page_path.exists() and not fallback_kwargs.get("force", False):
+        return {
+            "page_index": page_index,
+            "route": route,
+            "heuristics": asdict(heuristics),
+            "status": "skipped",
+            "output_files": {"markdown": str(page_path)},
+        }
+
+    async with structured_semaphore:
+        marker_result = await asyncio.to_thread(
+            run_marker_page,
+            pdf_path,
+            page_index,
+            marker_command,
+            marker_timeout,
+            dirs["assets"],
+            structured_asset_level,
+        )
+
+    if marker_result.success:
+        md = normalize_markdown_for_llm(marker_result.markdown)
+        write_text(page_path, md)
+        metadata_path = _debug_path(dirs["debug"], page_index, "metadata.json")
+        write_json(
+            metadata_path,
+            {
+                "mode": "structured",
+                "backend": structured_backend,
+                "artifacts": marker_result.artifacts,
+            },
+        )
+        return {
+            "page_index": page_index,
+            "route": route,
+            "heuristics": asdict(heuristics),
+            "attempts": 0,
+            "token_usage": None,
+            "status": "structured_ok",
+            "output_files": {
+                "markdown": str(page_path),
+                "metadata": str(metadata_path),
+            },
+            "structured": {
+                "backend": structured_backend,
+                "artifacts": marker_result.artifacts,
+                "fallback_reason": "",
+            },
+        }
+
+    fallback = await _process_page(**fallback_kwargs, route_override=route, heuristics_override=heuristics)
+    fallback["status"] = "structured_fallback"
+    fallback["structured"] = {
+        "backend": structured_backend,
+        "artifacts": {},
+        "fallback_reason": marker_result.error or "structured extraction failed",
+    }
+    return fallback
 
 
 async def _process_page(
@@ -309,11 +458,13 @@ async def _process_page(
     dirs: dict[str, Path],
     force: bool,
     text_only_enabled: bool,
+    route_override: str | None = None,
+    heuristics_override: Any | None = None,
 ) -> dict[str, Any]:
     page = doc.load_page(page_index)
     page_dict = page.get_text("dict")
-    heuristics = compute_text_heuristics(page_dict)
-    route = decide_route(heuristics, mode=mode)
+    heuristics = heuristics_override or compute_text_heuristics(page_dict)
+    route = route_override or decide_route(heuristics, mode=mode)
 
     page_path = _page_out_path(dirs["pages"], page_index)
     if page_path.exists() and not force:
@@ -332,7 +483,7 @@ async def _process_page(
 
     if text_only:
         text = page.get_text("text")
-        write_text(page_path, text)
+        write_text(page_path, normalize_markdown_for_llm(text))
         metadata_path = _debug_path(dirs["debug"], page_index, "metadata.json")
         write_json(metadata_path, {"mode": "text_only"})
         return {
@@ -426,7 +577,7 @@ async def _process_page(
             if is_rotation_valid:
                 break
 
-    write_text(page_path, parsed.markdown)
+    write_text(page_path, normalize_markdown_for_llm(parsed.markdown))
     metadata_path = _debug_path(dirs["debug"], page_index, "metadata.json")
     write_json(metadata_path, metadata)
 
@@ -446,6 +597,20 @@ async def _process_page(
             "metadata": str(metadata_path),
         },
     }
+
+
+def _merge_bibliography_with_patch(
+    bibliography: dict[str, Any],
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(bibliography)
+    for key in ("title", "year", "doi", "journal_ref"):
+        if not str(merged.get(key, "")).strip() and str(patch.get(key, "")).strip():
+            merged[key] = str(patch.get(key, "")).strip()
+    if not merged.get("authors") and isinstance(patch.get("authors"), list):
+        merged["authors"] = [str(a).strip() for a in patch.get("authors", []) if str(a).strip()]
+    merged["citation"] = citation_from_bibliography(normalize_bibliography(merged))
+    return merged
 
 
 async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, Any]:
@@ -470,29 +635,92 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         api_key = _require_api_key()
         client = AsyncOpenAI(api_key=api_key, base_url=args.base_url)
         semaphore = asyncio.Semaphore(args.workers)
+        structured_max_workers = max(1, int(getattr(args, "structured_max_workers", 4) or 1))
+        digital_structured = str(getattr(args, "digital_structured", "off"))
+        structured_backend = str(getattr(args, "structured_backend", "hybrid"))
+        marker_command = str(getattr(args, "marker_command", MARKER_COMMAND_DEFAULT))
+        marker_timeout = int(getattr(args, "marker_timeout", int(MARKER_TIMEOUT_DEFAULT)))
+        structured_asset_level = str(getattr(args, "structured_asset_level", "standard"))
+        grobid_url = str(getattr(args, "grobid_url", "") or "")
+        grobid_timeout = int(getattr(args, "grobid_timeout", int(GROBID_TIMEOUT_DEFAULT)))
+
+        structured_semaphore = asyncio.Semaphore(structured_max_workers)
+        page_signals = _collect_page_signals(doc, args.mode) if page_count > 0 else []
+        routes = [route for _, route in page_signals]
+        heuristics_by_page = [heuristics for heuristics, _ in page_signals]
+        structured_enabled = is_structured_candidate_doc(
+            digital_structured,
+            routes,
+            heuristics_by_page,
+        )
+        grobid_used = False
+        grobid_error = ""
+        grobid_sections: list[dict[str, Any]] = []
+
+        async def _process_one_page(page_index: int, page_dirs: dict[str, Path]) -> dict[str, Any]:
+            heuristics = heuristics_by_page[page_index] if page_signals else compute_text_heuristics(doc.load_page(page_index).get_text("dict"))
+            route = routes[page_index] if page_signals else decide_route(heuristics, mode=args.mode)
+            fallback_kwargs = {
+                "semaphore": semaphore,
+                "client": client,
+                "doc": doc,
+                "page_index": page_index,
+                "mode": args.mode,
+                "max_tokens": args.max_tokens,
+                "model": args.model,
+                "scan_preprocess": args.scan_preprocess,
+                "debug": args.debug,
+                "dirs": page_dirs,
+                "force": args.force,
+                "text_only_enabled": args.text_only,
+            }
+            if structured_enabled:
+                return await _process_page_structured(
+                    page_index=page_index,
+                    pdf_path=pdf_path,
+                    marker_command=marker_command,
+                    marker_timeout=marker_timeout,
+                    structured_asset_level=structured_asset_level,
+                    structured_backend=structured_backend,
+                    structured_semaphore=structured_semaphore,
+                    route=route,
+                    heuristics=heuristics,
+                    fallback_kwargs=fallback_kwargs,
+                )
+            return await _process_page(
+                **fallback_kwargs,
+                route_override=route,
+                heuristics_override=heuristics,
+            )
 
         pages: list[dict[str, Any]] = []
         if page_count > 0:
-            first_page = await _process_page(
-                semaphore=semaphore,
-                client=client,
-                doc=doc,
-                page_index=0,
-                mode=args.mode,
-                max_tokens=args.max_tokens,
-                model=args.model,
-                scan_preprocess=args.scan_preprocess,
-                debug=args.debug,
-                dirs=dirs,
-                force=args.force,
-                text_only_enabled=args.text_only,
-            )
+            first_page = await _process_one_page(0, dirs)
             first_page_md = Path(first_page["output_files"].get("markdown", ""))
             first_page_text = first_page_md.read_text() if first_page_md.exists() else ""
             bibliography = await _extract_bibliography(client, args.metadata_model, first_page_text)
+            if structured_enabled and structured_backend == "hybrid" and grobid_url.strip():
+                grobid_result = await asyncio.to_thread(
+                    run_grobid_doc,
+                    pdf_path,
+                    grobid_url,
+                    grobid_timeout,
+                    dirs["assets"] / "structured" / "grobid" / "fulltext.tei.xml",
+                )
+                if grobid_result.success:
+                    grobid_used = True
+                    grobid_sections = grobid_result.sections
+                    bibliography = _merge_bibliography_with_patch(bibliography, grobid_result.bibliography_patch)
+                else:
+                    grobid_error = grobid_result.error
             doc_dir = _final_doc_dir(args, pdf_path, bibliography)
             final_dirs = ensure_dirs(doc_dir)
             first_page = _move_first_page_artifacts(first_page, dirs, final_dirs, args.debug)
+            src_tei = dirs["assets"] / "structured" / "grobid" / "fulltext.tei.xml"
+            if src_tei.exists():
+                dst_tei = final_dirs["assets"] / "structured" / "grobid" / "fulltext.tei.xml"
+                dst_tei.parent.mkdir(parents=True, exist_ok=True)
+                src_tei.replace(dst_tei)
             pages.append(first_page)
         else:
             bibliography = {
@@ -506,23 +734,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             doc_dir = _final_doc_dir(args, pdf_path, bibliography)
             final_dirs = ensure_dirs(doc_dir)
 
-        tasks = [
-            _process_page(
-                semaphore=semaphore,
-                client=client,
-                doc=doc,
-                page_index=i,
-                mode=args.mode,
-                max_tokens=args.max_tokens,
-                model=args.model,
-                scan_preprocess=args.scan_preprocess,
-                debug=args.debug,
-                dirs=final_dirs,
-                force=args.force,
-                text_only_enabled=args.text_only,
-            )
-            for i in range(1, page_count)
-        ]
+        tasks = [_process_one_page(i, final_dirs) for i in range(1, page_count)]
 
         if tasks:
             pages.extend(await asyncio.gather(*tasks))
@@ -530,6 +742,18 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         for p in pages_sorted:
             manifest["pages"].append(p)
         manifest["bibliography"] = bibliography
+        structured_page_count = sum(1 for p in pages_sorted if p.get("status") == "structured_ok")
+        fallback_count = sum(1 for p in pages_sorted if p.get("status") == "structured_fallback")
+        structured_manifest: dict[str, Any] = {
+            "enabled": structured_enabled,
+            "backend": structured_backend if structured_enabled else "none",
+            "grobid_used": grobid_used,
+            "fallback_count": fallback_count,
+            "structured_page_count": structured_page_count,
+        }
+        if grobid_error:
+            structured_manifest["grobid_error"] = grobid_error
+        manifest["structured_extraction"] = structured_manifest
 
         write_json(final_dirs["metadata"] / "manifest.json", manifest)
         write_json(final_dirs["metadata"] / "bibliography.json", bibliography)
@@ -566,6 +790,18 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             page_count=page_count,
             consolidated_markdown=consolidated_text,
         )
+        if grobid_sections:
+            discovered_sections = discovery.get("sections", []) or []
+            grobid_high_conf = (
+                len(grobid_sections) >= 3
+                or any(
+                    int(sec.get("start_page", 1) or 1) > 1 or int(sec.get("end_page", 1) or 1) > 1
+                    for sec in grobid_sections
+                    if isinstance(sec, dict)
+                )
+            )
+            if grobid_high_conf or not discovered_sections:
+                discovery["sections"] = grobid_sections
         write_json(final_dirs["metadata"] / "discovery.json", discovery)
         write_json(final_dirs["metadata"] / "sections.json", discovery.get("sections", []))
         manifest["discovery"] = discovery

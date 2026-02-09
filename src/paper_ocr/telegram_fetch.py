@@ -318,16 +318,27 @@ async def process_doi(
                     for task in pending:
                         task.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
-                    timed_out = False
-                    for task in done:
-                        exc = task.exception()
+                    response_timed_out = False
+                    if response_task in done:
+                        exc = response_task.exception()
                         if exc is None:
-                            return task.result()
+                            return response_task.result()
                         if isinstance(exc, asyncio.TimeoutError):
-                            timed_out = True
-                            continue
-                        raise exc
-                    if timed_out:
+                            response_timed_out = True
+                        else:
+                            raise exc
+
+                    edit_timed_out = False
+                    if edit_task in done:
+                        exc = edit_task.exception()
+                        if exc is None:
+                            return edit_task.result()
+                        if isinstance(exc, asyncio.TimeoutError):
+                            edit_timed_out = True
+                        else:
+                            raise exc
+
+                    if response_timed_out or edit_timed_out:
                         raise asyncio.TimeoutError()
                     raise RuntimeError("No completed task result while waiting for bot response")
 

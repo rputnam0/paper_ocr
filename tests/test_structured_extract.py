@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import fitz
+
+from paper_ocr.inspect import TextHeuristics
+from paper_ocr.structured_extract import (
+    is_structured_candidate_doc,
+    normalize_markdown_for_llm,
+    run_grobid_doc,
+    run_marker_page,
+)
+
+
+def _h(char_count: int, printable: float = 0.99, cid: float = 0.0, repl: float = 0.0) -> TextHeuristics:
+    return TextHeuristics(
+        char_count=char_count,
+        printable_ratio=printable,
+        cid_ratio=cid,
+        replacement_char_ratio=repl,
+        avg_token_length=5.0,
+    )
+
+
+def _make_pdf(path: Path) -> None:
+    with fitz.open() as doc:
+        doc.new_page()
+        doc.save(path)
+
+
+def test_is_structured_candidate_doc_modes():
+    routes = ["anchored"] * 10
+    heuristics = [_h(800) for _ in range(10)]
+    assert is_structured_candidate_doc("on", routes, heuristics)
+    assert not is_structured_candidate_doc("off", routes, heuristics)
+    assert is_structured_candidate_doc("auto", routes, heuristics)
+
+
+def test_is_structured_candidate_doc_auto_thresholds():
+    routes = ["anchored"] * 7 + ["unanchored"] * 3
+    heuristics = [_h(800) for _ in range(6)] + [_h(100)] * 4
+    assert is_structured_candidate_doc("auto", routes, heuristics)
+    bad_first_page = ["unanchored"] + ["anchored"] * 9
+    assert not is_structured_candidate_doc("auto", bad_first_page, heuristics)
+
+
+def test_normalize_markdown_for_llm():
+    inp = "##Intro\n\n-  item\n\nFigure 1:test\n\n|a|b|\n|---|---|\n|1|2|"
+    out = normalize_markdown_for_llm(inp)
+    assert "## Intro" in out
+    assert "- item" in out
+    assert "Figure 1: test" in out
+    assert "| a | b |" in out
+
+
+def test_run_marker_page_sets_ocr_engine_none(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    assets_root = tmp_path / "assets"
+    seen_env = {}
+
+    def _fake_run(cmd, check, env, stdout, stderr, timeout):  # noqa: ANN001
+        seen_env.update(env)
+        out_dir = Path(cmd[cmd.index("--output_dir") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "doc.md").write_text("# Title\n")
+        (out_dir / "doc.json").write_text(json.dumps({"ok": True}))
+        return 0
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = run_marker_page(
+        pdf_path=pdf_path,
+        page_index=0,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=assets_root,
+        asset_level="standard",
+    )
+    assert result.success
+    assert seen_env.get("OCR_ENGINE") == "None"
+    assert "page_0001" in result.artifacts["markdown"]
+    assert "page_0001" in result.artifacts["json"]
+
+
+def test_run_marker_page_failure_when_no_markdown(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+
+    def _fake_run(cmd, check, env, stdout, stderr, timeout):  # noqa: ANN001,ARG001
+        if "--output_dir" in cmd:
+            out_dir = Path(cmd[cmd.index("--output_dir") + 1])
+        else:
+            out_dir = Path(cmd[-1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return 0
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    result = run_marker_page(
+        pdf_path=pdf_path,
+        page_index=0,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=tmp_path / "assets",
+        asset_level="standard",
+    )
+    assert not result.success
+    assert "markdown" in result.error.lower()
+
+
+def test_run_grobid_doc_success(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    tei = b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<TEI xmlns=\"http://www.tei-c.org/ns/1.0\">
+  <teiHeader>
+    <fileDesc>
+      <titleStmt>
+        <title>Paper Title</title>
+        <author><persName><forename>Jane</forename><surname>Doe</surname></persName></author>
+      </titleStmt>
+      <publicationStmt><date when=\"2024-01-01\"/></publicationStmt>
+    </fileDesc>
+  </teiHeader>
+  <text><body><div><head>Introduction</head></div></body></text>
+</TEI>
+"""
+
+    class _Resp:
+        def __enter__(self):  # noqa: D401
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def read(self) -> bytes:
+            return tei
+
+    def _fake_urlopen(req, timeout):  # noqa: ANN001,ARG001
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    out_tei = tmp_path / "assets" / "structured" / "grobid" / "fulltext.tei.xml"
+    result = run_grobid_doc(
+        pdf_path=pdf_path,
+        grobid_url="http://localhost:8070",
+        timeout=10,
+        tei_out_path=out_tei,
+    )
+    assert result.success
+    assert result.bibliography_patch["title"] == "Paper Title"
+    assert result.bibliography_patch["authors"] == ["Doe, Jane"]
+    assert result.bibliography_patch["year"] == "2024"
+    assert result.sections[0]["title"] == "Introduction"
+    assert out_tei.exists()
+
+
+def test_run_grobid_doc_failure(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+
+    def _fake_urlopen(req, timeout):  # noqa: ANN001,ARG001
+        raise TimeoutError("boom")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    result = run_grobid_doc(
+        pdf_path=pdf_path,
+        grobid_url="http://localhost:8070",
+        timeout=10,
+        tei_out_path=tmp_path / "x.xml",
+    )
+    assert not result.success
+    assert "boom" in result.error
