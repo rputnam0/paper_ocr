@@ -50,6 +50,7 @@ REPORT_COLUMNS = [
     "finished_at",
     "elapsed_s",
 ]
+MAX_FILENAME_STEM = 180
 
 
 @dataclass
@@ -91,7 +92,8 @@ def normalize_doi(raw: str) -> str:
 def doi_filename(doi: str) -> str:
     replaced = doi.replace("/", "_")
     safe = SAFE_CHAR_RE.sub("_", replaced).strip("_")
-    return f"{safe or 'unknown_doi'}.pdf"
+    stem = (safe or "unknown_doi")[:MAX_FILENAME_STEM].rstrip("._-")
+    return f"{stem or 'unknown_doi'}.pdf"
 
 
 def extract_bot_title(text: str) -> str:
@@ -106,7 +108,8 @@ def title_filename(title: str, doi: str) -> str:
     if not title.strip():
         return doi_filename(doi)
     safe = SAFE_CHAR_RE.sub("_", title).strip("_")
-    return f"{safe or doi_filename(doi).removesuffix('.pdf')}.pdf"
+    stem = (safe or doi_filename(doi).removesuffix(".pdf"))[:MAX_FILENAME_STEM].rstrip("._-")
+    return f"{stem or doi_filename(doi).removesuffix('.pdf')}.pdf"
 
 
 def load_unique_dois(csv_path: Path, doi_column: str) -> list[tuple[str, str]]:
@@ -168,6 +171,30 @@ def write_download_index(path: Path, index: dict[str, str]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(index, indent=2, ensure_ascii=True))
+
+
+def load_index_from_report(report_file: Path, in_dir: Path) -> dict[str, str]:
+    if not report_file.exists():
+        return {}
+    out: dict[str, str] = {}
+    try:
+        with report_file.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                status = (row.get("status", "") or "").strip()
+                doi = (row.get("doi_normalized", "") or "").strip().lower()
+                file_path = (row.get("file_path", "") or "").strip()
+                if status not in {"Success", "Exists"} or not doi or not file_path:
+                    continue
+                p = Path(file_path)
+                if not p.exists():
+                    continue
+                try:
+                    out[doi] = str(p.relative_to(in_dir))
+                except Exception:
+                    out[doi] = p.name
+    except Exception:
+        return {}
+    return out
 
 
 def _utc_now() -> datetime:
@@ -339,7 +366,7 @@ async def process_doi(
                 button_idx = _request_button_index(response)
                 if button_idx is not None:
                     await _with_floodwait(lambda: response.click(button_idx))
-                    response = await _with_floodwait(conv.get_response)
+                    response = await _next_response(conv, edit_from=sent_message)
                     continue
 
                 pdf_button_idx = _pdf_button_index(response)
@@ -405,6 +432,7 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
 
     rows: list[FetchResult] = []
     index = load_download_index(index_file)
+    index.update(load_index_from_report(report_file, config.in_dir))
 
     client = TelegramClient(config.session_name, config.api_id, config.api_hash)
     await client.start()
@@ -437,6 +465,10 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
 
             if result.status != "Exists":
                 await asyncio.sleep(random.uniform(config.min_delay, config.max_delay))
+
+            # Persist progress incrementally so interrupted runs can resume.
+            write_reports(rows, report_file, failed_file)
+            write_download_index(index_file, index)
     finally:
         await client.disconnect()
 

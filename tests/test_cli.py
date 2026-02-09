@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -178,3 +179,70 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
     config = _fake_fetch_from_telegram.last_config
     assert config.in_dir == tmp_path / "jobs" / "papers" / "pdfs"
     assert config.report_file == tmp_path / "jobs" / "papers" / "reports" / "telegram_download_report.csv"
+
+
+def test_fetch_telegram_skips_copy_when_csv_already_in_job_input(monkeypatch, tmp_path: Path):
+    output_root = tmp_path / "jobs"
+    doi_csv = output_root / "papers" / "input" / "papers.csv"
+    doi_csv.parent.mkdir(parents=True, exist_ok=True)
+    doi_csv.write_text("DOI\n10.1000/abc\n")
+    args = argparse.Namespace(
+        doi_csv=doi_csv,
+        output_root=output_root,
+        doi_column="DOI",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+    )
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+    assert _fake_fetch_from_telegram.last_config.doi_csv == doi_csv
+
+
+def test_final_doc_dir_avoids_collision_on_different_sha(monkeypatch, tmp_path: Path):
+    args = argparse.Namespace(out_dir=tmp_path / "out")
+    pdf_parent = tmp_path / "in"
+    pdf_parent.mkdir()
+    pdf_path = pdf_parent / "paper.pdf"
+    pdf_path.write_bytes(b"pdf")
+    bibliography = {"authors": ["Doe, Jane"], "year": "2024", "title": "T"}
+
+    group_dir = args.out_dir / "in"
+    candidate = group_dir / "Doe_Jane_2024"
+    (candidate / "metadata").mkdir(parents=True)
+    (candidate / "metadata" / "manifest.json").write_text(json.dumps({"sha256": "different"}))
+
+    monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
+
+    out = cli._final_doc_dir(args, pdf_path, bibliography)
+
+    assert out.name == "Doe_Jane_2024_abc123def456"
+
+
+def test_final_doc_dir_avoids_non_manifest_existing_folder(monkeypatch, tmp_path: Path):
+    args = argparse.Namespace(out_dir=tmp_path / "out")
+    pdf_parent = tmp_path / "in"
+    pdf_parent.mkdir()
+    pdf_path = pdf_parent / "paper.pdf"
+    pdf_path.write_bytes(b"pdf")
+    bibliography = {"authors": ["Doe, Jane"], "year": "2024", "title": "T"}
+
+    group_dir = args.out_dir / "in"
+    candidate = group_dir / "Doe_Jane_2024"
+    candidate.mkdir(parents=True)
+    (candidate / "orphan.txt").write_text("orphan")
+
+    monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
+
+    out = cli._final_doc_dir(args, pdf_path, bibliography)
+
+    assert out.name == "Doe_Jane_2024_abc123def456"

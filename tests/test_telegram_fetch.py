@@ -96,6 +96,13 @@ def test_title_filename_uses_bot_title():
     assert telegram_fetch.title_filename(title, "10.1000/abc") == "Toward_Better_Viscosity_Models_2022.pdf"
 
 
+def test_title_filename_is_length_capped():
+    title = "A" * 400
+    out = telegram_fetch.title_filename(title, "10.1000/abc")
+    assert out.endswith(".pdf")
+    assert len(out) <= telegram_fetch.MAX_FILENAME_STEM + 4
+
+
 def test_load_unique_dois_dedups(tmp_path: Path):
     csv_path = tmp_path / "papers.csv"
     csv_path.write_text("DOI\n10.1000/abc\nhttps://doi.org/10.1000/ABC\n\n")
@@ -161,6 +168,32 @@ def test_process_doi_cache_miss_with_request_button(tmp_path: Path):
 
     assert result.status == "Success"
     assert cache_miss.clicked == [0]
+
+
+def test_process_doi_request_then_edit_pdf_button_then_success(tmp_path: Path):
+    file_msg = _FakeMessage(has_file=True)
+    conv = _FakeConversation([], edits=[])
+
+    def _on_request_click(_index: int) -> None:
+        conv._edits.append(_FakeMessage(text="Result", buttons=[[_FakeButton("⬇️ PDF | 1 MiB")]]))
+        conv._responses.append(file_msg)
+
+    request_msg = _FakeMessage(text="DOI not found in cache", buttons=[[_FakeButton("Request (1 point)")]], on_click=_on_request_click)
+    conv._responses.append(request_msg)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+    assert request_msg.clicked == [0]
 
 
 def test_process_doi_hard_failure(tmp_path: Path):
@@ -324,3 +357,16 @@ def test_write_reports(tmp_path: Path):
     assert report_rows[0]["status"] == "Success"
     assert len(failed_rows) == 1
     assert failed_rows[0]["status"] == "Failed"
+
+
+def test_load_index_from_report_reads_existing_successes(tmp_path: Path):
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"x")
+    report = tmp_path / "report.csv"
+    report.write_text(
+        "doi_original,doi_normalized,status,file_path,error,bot_message_excerpt,started_at,finished_at,elapsed_s\n"
+        f"10.1/a,10.1/a,Success,{pdf},,,,\n"
+        "10.1/b,10.1/b,Timeout,,,,,\n"
+    )
+    idx = telegram_fetch.load_index_from_report(report, tmp_path)
+    assert idx == {"10.1/a": "paper.pdf"}

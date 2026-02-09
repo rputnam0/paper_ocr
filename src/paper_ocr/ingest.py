@@ -10,7 +10,7 @@ def _safe_name(raw: str) -> str:
 
 
 def discover_pdfs(in_dir: Path) -> list[Path]:
-    return sorted([p for p in in_dir.rglob("*.pdf") if p.is_file()])
+    return sorted([p for p in in_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf"])
 
 
 def file_sha256(path: Path) -> str:

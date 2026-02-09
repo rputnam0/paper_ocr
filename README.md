@@ -160,6 +160,8 @@ Notes:
 - `ocr_out/` is reserved for final OCR outputs from `paper-ocr run`.
 - PDF names are derived from bot-provided titles (DOI fallback if title unavailable).
 - `download_index.json` keeps DOI -> filename mapping stable across reruns.
+- Fetch progress is persisted incrementally, so rerunning the same CSV resumes safely:
+  existing papers are skipped, remaining DOIs continue.
 
 ## OCR Output Layout
 

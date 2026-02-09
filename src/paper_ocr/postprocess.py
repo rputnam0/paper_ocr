@@ -13,17 +13,24 @@ class ParsedOutput:
 
 
 def parse_yaml_front_matter(text: str) -> ParsedOutput:
-    if not text.startswith("---"):
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
         return ParsedOutput(metadata={}, markdown=text)
 
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    closing_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            closing_idx = i
+            break
+    if closing_idx is None:
         return ParsedOutput(metadata={}, markdown=text)
 
-    _, yaml_block, rest = parts
+    yaml_block = "".join(lines[1:closing_idx])
+    rest = "".join(lines[closing_idx + 1 :])
     try:
-        metadata = yaml.safe_load(yaml_block) or {}
+        loaded = yaml.safe_load(yaml_block) or {}
+        metadata = loaded if isinstance(loaded, dict) else {}
     except Exception:
         metadata = {}
-        rest = text
-    return ParsedOutput(metadata=metadata, markdown=rest.lstrip("\n"))
+        return ParsedOutput(metadata=metadata, markdown=text)
+    return ParsedOutput(metadata=metadata, markdown=rest)

@@ -159,7 +159,27 @@ def _final_doc_dir(args: argparse.Namespace, pdf_path: Path, bibliography: dict[
     author_year = folder_name_from_bibliography(normalize_bibliography(bibliography))
     if author_year in {"unknown_paper", "unknown_author_unknown_year"}:
         author_year = output_dir_name(pdf_path)
-    return group_dir / author_year
+    candidate = group_dir / author_year
+    current_sha = file_sha256(pdf_path)
+    manifest_path = candidate / "metadata" / "manifest.json"
+    if manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text())
+            existing_sha = str(existing.get("sha256", "")).strip()
+            if existing_sha and existing_sha != current_sha:
+                return group_dir / f"{author_year}_{doc_id_from_sha(current_sha)}"
+        except Exception:
+            pass
+    elif candidate.exists():
+        # If folder exists without a manifest (e.g. interrupted prior run), avoid
+        # merging unrelated PDFs into a shared author/year path.
+        try:
+            has_files = any(candidate.iterdir())
+        except Exception:
+            has_files = True
+        if has_files:
+            return group_dir / f"{author_year}_{doc_id_from_sha(current_sha)}"
+    return candidate
 
 
 async def _extract_discovery(
@@ -606,7 +626,9 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
     pdf_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
     ocr_out_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(args.doi_csv, input_dir / args.doi_csv.name)
+    copied_csv = input_dir / args.doi_csv.name
+    if args.doi_csv.resolve() != copied_csv.resolve():
+        shutil.copy2(args.doi_csv, copied_csv)
 
     config = FetchTelegramConfig(
         api_id=api_id,
