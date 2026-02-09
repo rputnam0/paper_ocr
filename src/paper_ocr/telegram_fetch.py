@@ -72,7 +72,7 @@ class FetchTelegramConfig:
     doi_csv: Path
     in_dir: Path
     doi_column: str = "DOI"
-    target_bot: str = "@your_bot_username"
+    target_bot: str = ""
     session_name: str = "nexus_session"
     min_delay: float = 10.0
     max_delay: float = 20.0

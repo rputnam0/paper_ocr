@@ -45,7 +45,7 @@ Required env vars for fetch:
 - `TG_API_HASH`
 
 Optional env vars for fetch defaults:
-- `TARGET_BOT` (default `@your_bot_username`)
+- `TARGET_BOT` (required unless passed via `--target-bot`)
 - `MIN_DELAY` (default `4`)
 - `MAX_DELAY` (default `8`)
 

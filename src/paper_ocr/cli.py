@@ -40,7 +40,6 @@ from .store import ensure_dirs, write_json, write_text
 from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
 METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
-TARGET_BOT_DEFAULT = "@your_bot_username"
 MIN_DELAY_DEFAULT = "4"
 MAX_DELAY_DEFAULT = "8"
 RESPONSE_TIMEOUT_DEFAULT = 15
@@ -70,7 +69,7 @@ def _parse_args() -> argparse.Namespace:
     fetch.add_argument("doi_csv", type=Path)
     fetch.add_argument("output_root", type=Path, nargs="?", default=Path("data/telegram_jobs"))
     fetch.add_argument("--doi-column", type=str, default="DOI")
-    fetch.add_argument("--target-bot", type=str, default=os.getenv("TARGET_BOT", TARGET_BOT_DEFAULT))
+    fetch.add_argument("--target-bot", type=str, default=os.getenv("TARGET_BOT", ""))
     fetch.add_argument("--session-name", type=str, default="nexus_session")
     fetch.add_argument("--min-delay", type=float, default=float(os.getenv("MIN_DELAY", MIN_DELAY_DEFAULT)))
     fetch.add_argument("--max-delay", type=float, default=float(os.getenv("MAX_DELAY", MAX_DELAY_DEFAULT)))
@@ -588,6 +587,8 @@ async def _run(args: argparse.Namespace) -> None:
 async def _run_fetch_telegram(args: argparse.Namespace) -> None:
     if not args.doi_csv.exists():
         raise SystemExit(f"DOI CSV does not exist: {args.doi_csv}")
+    if not str(args.target_bot).strip():
+        raise SystemExit("Missing target bot. Set TARGET_BOT in .env or pass --target-bot.")
 
     api_id, api_hash = _require_telegram_credentials()
     csv_name = CSV_JOB_SAFE_RE.sub("_", args.doi_csv.stem).strip("_") or "job"
