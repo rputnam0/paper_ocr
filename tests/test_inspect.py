@@ -1,4 +1,9 @@
-from paper_ocr.inspect import compute_text_heuristics, decide_route, is_text_only_candidate
+from paper_ocr.inspect import (
+    compute_text_heuristics,
+    decide_route,
+    is_structured_page_candidate,
+    is_text_only_candidate,
+)
 
 
 def test_decide_route_anchor():
@@ -46,3 +51,19 @@ def test_printable_ratio_ignores_newline_separators():
     h = compute_text_heuristics(page_dict)
     assert h.printable_ratio > 0.99
     assert decide_route(h, mode="auto") == "anchored"
+
+
+def test_structured_page_candidate_accepts_moderate_density_clean_text():
+    page_dict = {
+        "blocks": [
+            {
+                "type": 0,
+                "lines": [
+                    {"spans": [{"text": "123 456 789 table row"} for _ in range(25)]},
+                ],
+            }
+        ]
+    }
+    h = compute_text_heuristics(page_dict)
+    assert is_structured_page_candidate(h)
+    assert not is_text_only_candidate(h)

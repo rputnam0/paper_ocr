@@ -12,18 +12,19 @@ Also produce machine-readable table/figure artifacts for downstream analytics.
 - `--digital-structured off`: never attempt structured extraction.
 - `--digital-structured on`: always attempt structured extraction first.
 - `--digital-structured auto` (default): attempt structured extraction when:
-  - at least 70% pages route to `anchored`,
-  - at least 60% pages satisfy `is_text_only_candidate`,
+  - at least 60% pages satisfy `is_structured_page_candidate`,
   - and either:
-    - first page routes to `anchored`, or
+    - first page auto-routes to `anchored`, or
     - first page is image-heavy/unanchored but body remains strong:
-      - at least 75% body pages route to `anchored`,
-      - at least 65% body pages satisfy `is_text_only_candidate`.
+      - at least 70% body pages satisfy `is_structured_page_candidate`.
+
+`is_structured_page_candidate` is intentionally broader than `is_text_only_candidate` so table-heavy and equation-heavy born-digital pages remain eligible for Marker.
 
 ### Important: Two Independent Auto Decisions
 
 - `--mode auto` is page-level route selection (`anchored` vs `unanchored`).
 - `--digital-structured auto` is document-level structured eligibility.
+- Structured eligibility derives route signals in `auto` mode even when OCR mode is manually forced.
 - These are intentionally independent:
   - a doc can be non-eligible for structured mode but still have some `text_only` pages.
   - a structured-eligible doc can still produce page-level `structured_fallback` when Marker fails.

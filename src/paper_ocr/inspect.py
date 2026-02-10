@@ -81,3 +81,15 @@ def is_text_only_candidate(heuristics: TextHeuristics) -> bool:
         and heuristics.cid_ratio <= 0.01
         and heuristics.replacement_char_ratio <= 0.001
     )
+
+
+def is_structured_page_candidate(heuristics: TextHeuristics) -> bool:
+    # Broader born-digital gate for layout-rich pages (tables/equations) where
+    # text density may be moderate but encoding quality is still clean.
+    if heuristics.printable_ratio < 0.85:
+        return False
+    if heuristics.cid_ratio > 0.05:
+        return False
+    if heuristics.replacement_char_ratio > 0.01:
+        return False
+    return heuristics.char_count >= 80

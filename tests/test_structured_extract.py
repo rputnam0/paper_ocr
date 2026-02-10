@@ -53,8 +53,21 @@ def test_is_structured_candidate_doc_allows_image_heavy_cover_when_body_is_stron
 
 def test_is_structured_candidate_doc_rejects_weak_body_when_first_page_is_unanchored():
     routes = ["unanchored"] + ["anchored"] * 6 + ["unanchored"] * 3
-    heuristics = [_h(100)] + [_h(800) for _ in range(6)] + [_h(100) for _ in range(3)]
+    heuristics = [_h(30)] + [_h(800) for _ in range(6)] + [_h(30) for _ in range(3)]
     assert not is_structured_candidate_doc("auto", routes, heuristics)
+
+
+def test_is_structured_candidate_doc_ignores_forced_unanchored_routes_when_heuristics_are_digital():
+    routes = ["unanchored"] * 10
+    heuristics = [_h(900) for _ in range(10)]
+    assert is_structured_candidate_doc("auto", routes, heuristics)
+
+
+def test_is_structured_candidate_doc_accepts_table_math_heavy_text_layer():
+    # Many pages have moderate text density (char_count < text_only threshold) but are still born-digital.
+    routes = ["anchored"] * 8 + ["unanchored"] * 2
+    heuristics = [_h(180, printable=0.95, cid=0.01, repl=0.0) for _ in range(8)] + [_h(60, printable=0.9, cid=0.02, repl=0.0) for _ in range(2)]
+    assert is_structured_candidate_doc("auto", routes, heuristics)
 
 
 def test_normalize_markdown_for_llm():

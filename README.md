@@ -222,13 +222,12 @@ There are two independent auto decisions:
 2. Document route auto (`--digital-structured auto`):
 - decides once per document whether to attempt Marker structured extraction first.
 - eligibility requires:
-  - at least 70% pages `anchored`,
-  - at least 60% pages pass `is_text_only_candidate`,
+  - at least 60% pages pass `is_structured_page_candidate`
+    (clean digital text layer, but less strict than `text_only`, so table/math-heavy pages are included),
   - and either:
-    - first page is `anchored`, or
-    - if first page is not `anchored`, the remaining body is strong:
-      - at least 75% body pages are `anchored`,
-      - at least 65% body pages pass `is_text_only_candidate`.
+    - first page is auto-routed `anchored`, or
+    - if first page is not auto-routed `anchored`, at least 70% of body pages pass `is_structured_page_candidate`.
+- Structured eligibility always uses auto-derived route signals, even if OCR route mode is forced with `--mode anchored|unanchored`.
 
 Execution flow in plain terms:
 
