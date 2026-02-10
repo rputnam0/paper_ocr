@@ -172,8 +172,12 @@ uv run paper-ocr run data/LISA out \
 
 Notes:
 - `--digital-structured auto` applies document-level eligibility rules and falls back safely.
-- Marker is invoked as an external command and OCR is forced off via `OCR_ENGINE=None`.
+- Marker is invoked as an external command and OCR is forced off by default (`--disable_ocr` is auto-added and `OCR_ENGINE=None` is set).
 - If GROBID is unavailable, run continues without TEI enrichment.
+
+WSL GPU note:
+- Marker auto-selects CUDA when available in its runtime environment.
+- For non-interactive SSH sessions, you may need to export `PATH="$HOME/.local/bin:/usr/lib/wsl/lib:$PATH"` so both `marker_single` and `nvidia-smi` are discoverable.
 
 ### Workflow B: DOI CSV -> Telegram fetch -> OCR
 

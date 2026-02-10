@@ -96,6 +96,8 @@ def _marker_commands(marker_command: str, input_pdf: Path, output_dir: Path) -> 
     base = shlex.split(marker_command or "marker_single")
     if not base:
         base = ["marker_single"]
+    if "--disable_ocr" not in base and not any(arg.startswith("--disable_ocr=") for arg in base):
+        base = [*base, "--disable_ocr"]
     return [
         [*base, str(input_pdf), "--output_dir", str(output_dir), "--output_format", "markdown"],
         [*base, str(input_pdf), "--output_dir", str(output_dir)],

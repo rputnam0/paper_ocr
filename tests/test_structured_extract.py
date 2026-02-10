@@ -60,9 +60,11 @@ def test_run_marker_page_sets_ocr_engine_none(monkeypatch, tmp_path: Path):
     _make_pdf(pdf_path)
     assets_root = tmp_path / "assets"
     seen_env = {}
+    seen_cmd: list[str] = []
 
     def _fake_run(cmd, check, env, stdout, stderr, timeout):  # noqa: ANN001
         seen_env.update(env)
+        seen_cmd[:] = cmd
         out_dir = Path(cmd[cmd.index("--output_dir") + 1])
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "doc.md").write_text("# Title\n")
@@ -81,8 +83,34 @@ def test_run_marker_page_sets_ocr_engine_none(monkeypatch, tmp_path: Path):
     )
     assert result.success
     assert seen_env.get("OCR_ENGINE") == "None"
+    assert "--disable_ocr" in seen_cmd
     assert "page_0001" in result.artifacts["markdown"]
     assert "page_0001" in result.artifacts["json"]
+
+
+def test_run_marker_page_does_not_duplicate_disable_ocr(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    seen_cmd: list[str] = []
+
+    def _fake_run(cmd, check, env, stdout, stderr, timeout):  # noqa: ANN001
+        seen_cmd[:] = cmd
+        out_dir = Path(cmd[cmd.index("--output_dir") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "doc.md").write_text("# Title\n")
+        return 0
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    result = run_marker_page(
+        pdf_path=pdf_path,
+        page_index=0,
+        marker_command="marker_single --disable_ocr",
+        timeout=10,
+        assets_root=tmp_path / "assets",
+        asset_level="standard",
+    )
+    assert result.success
+    assert seen_cmd.count("--disable_ocr") == 1
 
 
 def test_run_marker_page_failure_when_no_markdown(monkeypatch, tmp_path: Path):

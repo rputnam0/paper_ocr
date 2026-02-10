@@ -24,7 +24,7 @@ Also produce machine-readable table/figure artifacts for downstream analytics.
 ### Marker Integration
 
 - Marker runs as an external command (`--marker-command`, default `marker_single`).
-- Marker OCR is disabled for every call via env: `OCR_ENGINE=None`.
+- Marker OCR is disabled for every call (`--disable_ocr` is auto-appended and env `OCR_ENGINE=None` is set).
 - Extraction runs per page from single-page temporary PDFs to preserve existing `pages/0001.md` output contract.
 - Structured markdown is normalized before write (`normalize_markdown_for_llm`) for LLM readability.
 - If Marker fails on any page, that page falls back to existing text-only/VLM processing.
