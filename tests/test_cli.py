@@ -136,6 +136,41 @@ def test_parse_export_structured_data_args(monkeypatch):
     assert args.deplot_timeout == 45
 
 
+def test_parse_data_audit_args(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "data-audit",
+            "data",
+            "--strict",
+            "--json",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "data-audit"
+    assert args.data_dir == Path("data")
+    assert args.strict is True
+    assert args.json is True
+
+
+def test_run_data_audit_strict_raises(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    (data_dir / "unexpected").mkdir(parents=True)
+    args = argparse.Namespace(data_dir=data_dir, strict=True, json=False)
+    with pytest.raises(SystemExit, match="Data layout contract violations"):
+        cli._run_data_audit(args)
+
+
+def test_run_data_audit_non_strict_returns_report(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    args = argparse.Namespace(data_dir=data_dir, strict=False, json=False)
+    report = cli._run_data_audit(args)
+    assert report["issue_count"] == 0
+    assert report["data_dir"] == str(data_dir.resolve())
+
+
 def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path):
     root = tmp_path / "out"
     doc_dir = root / "group" / "Doe_2024"

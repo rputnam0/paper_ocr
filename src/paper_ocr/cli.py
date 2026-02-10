@@ -24,6 +24,7 @@ from .bibliography import (
     normalize_bibliography,
 )
 from .client import call_olmocr, call_text_model
+from .data_audit import format_audit_report, run_data_audit
 from .discoverability import (
     abstract_extraction_prompt,
     first_pages_excerpt,
@@ -172,6 +173,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("PAPER_OCR_DEPLOT_TIMEOUT", DEPLOT_TIMEOUT_DEFAULT)),
     )
+
+    audit = sub.add_parser("data-audit", help="Validate data/ folder organization contract")
+    audit.add_argument("data_dir", type=Path, nargs="?", default=Path("data"))
+    audit.add_argument("--strict", action="store_true", help="Exit non-zero on contract violations.")
+    audit.add_argument("--json", action="store_true", help="Emit JSON report.")
 
     return parser.parse_args()
 
@@ -1061,15 +1067,29 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
     return totals
 
 
+def _run_data_audit(args: argparse.Namespace) -> dict[str, Any]:
+    report = run_data_audit(args.data_dir)
+    payload = report.to_dict()
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(format_audit_report(report))
+    if report.issue_count > 0 and bool(getattr(args, "strict", False)):
+        raise SystemExit(f"Data layout contract violations: {report.issue_count}")
+    return payload
+
+
 def main() -> None:
     load_dotenv()
     args = _parse_args()
     if args.command == "run":
         asyncio.run(_run(args))
-    if args.command == "fetch-telegram":
+    elif args.command == "fetch-telegram":
         asyncio.run(_run_fetch_telegram(args))
-    if args.command == "export-structured-data":
+    elif args.command == "export-structured-data":
         _run_export_structured_data(args)
+    elif args.command == "data-audit":
+        _run_data_audit(args)
 
 
 if __name__ == "__main__":
