@@ -14,7 +14,11 @@ Also produce machine-readable table/figure artifacts for downstream analytics.
 - `--digital-structured auto` (default): attempt structured extraction when:
   - at least 70% pages route to `anchored`,
   - at least 60% pages satisfy `is_text_only_candidate`,
-  - first page routes to `anchored`.
+  - and either:
+    - first page routes to `anchored`, or
+    - first page is image-heavy/unanchored but body remains strong:
+      - at least 75% body pages route to `anchored`,
+      - at least 65% body pages satisfy `is_text_only_candidate`.
 
 ### Important: Two Independent Auto Decisions
 

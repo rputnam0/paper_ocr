@@ -43,8 +43,18 @@ def test_is_structured_candidate_doc_auto_thresholds():
     routes = ["anchored"] * 7 + ["unanchored"] * 3
     heuristics = [_h(800) for _ in range(6)] + [_h(100)] * 4
     assert is_structured_candidate_doc("auto", routes, heuristics)
-    bad_first_page = ["unanchored"] + ["anchored"] * 9
-    assert not is_structured_candidate_doc("auto", bad_first_page, heuristics)
+
+
+def test_is_structured_candidate_doc_allows_image_heavy_cover_when_body_is_strong():
+    routes = ["unanchored"] + ["anchored"] * 7 + ["unanchored"] * 2
+    heuristics = [_h(100)] + [_h(800) for _ in range(6)] + [_h(100) for _ in range(3)]
+    assert is_structured_candidate_doc("auto", routes, heuristics)
+
+
+def test_is_structured_candidate_doc_rejects_weak_body_when_first_page_is_unanchored():
+    routes = ["unanchored"] + ["anchored"] * 6 + ["unanchored"] * 3
+    heuristics = [_h(100)] + [_h(800) for _ in range(6)] + [_h(100) for _ in range(3)]
+    assert not is_structured_candidate_doc("auto", routes, heuristics)
 
 
 def test_normalize_markdown_for_llm():

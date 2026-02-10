@@ -54,11 +54,24 @@ def is_structured_candidate_doc(
         return False
     if not routes or not heuristics_by_page or len(routes) != len(heuristics_by_page):
         return False
-    if routes[0] != "anchored":
-        return False
+
     anchored_ratio = sum(1 for r in routes if r == "anchored") / len(routes)
     candidate_ratio = sum(1 for h in heuristics_by_page if is_text_only_candidate(h)) / len(heuristics_by_page)
-    return anchored_ratio >= 0.7 and candidate_ratio >= 0.6
+    if anchored_ratio < 0.7 or candidate_ratio < 0.6:
+        return False
+
+    # Fast accept when title/first page is text-rich.
+    if routes[0] == "anchored":
+        return True
+
+    # Allow image-heavy cover pages when the body remains clearly born-digital.
+    if len(routes) < 3:
+        return False
+    body_routes = routes[1:]
+    body_heuristics = heuristics_by_page[1:]
+    body_anchored_ratio = sum(1 for r in body_routes if r == "anchored") / len(body_routes)
+    body_candidate_ratio = sum(1 for h in body_heuristics if is_text_only_candidate(h)) / len(body_heuristics)
+    return body_anchored_ratio >= 0.75 and body_candidate_ratio >= 0.65
 
 
 def normalize_markdown_for_llm(markdown: str) -> str:
