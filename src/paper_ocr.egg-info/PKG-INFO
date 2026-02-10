@@ -35,14 +35,12 @@ uv run paper-ocr fetch-telegram input/papers.csv
 ```
 2. Run OCR on the fetched PDFs:
 ```bash
-uv run paper-ocr run data/jobs/papers/pdfs out/jobs/papers
+uv run paper-ocr run data/jobs/papers/pdfs out/papers
 ```
 
 Folder layout for a CSV named `papers.csv` (job folder uses CSV stem):
 ```
 data/jobs/papers/
-  input/
-    papers.csv
   pdfs/
     <bot_paper_title>.pdf
   reports/
@@ -53,6 +51,7 @@ data/jobs/papers/
 
 Notes:
 - `pdfs/` is the intermediate OCR input.
+- CSV sources remain in `input/` and are not copied into `data/jobs/`.
 - Final OCR outputs should be written under `out/`, not under `data/jobs/`.
 - PDF filenames are derived from bot-provided paper titles (DOI fallback if title is missing).
 

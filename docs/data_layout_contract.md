@@ -38,7 +38,6 @@ data/jobs/<job_slug>/
 
 Required subfolders:
 
-- `input/`
 - `pdfs/`
 - `reports/`
 
@@ -51,8 +50,9 @@ Rules:
 - `<job_slug>` must be lowercase slug format: `a-z`, `0-9`, `_`, `-`.
 - Job-acquired PDFs must be written under `pdfs/`.
 - CSV manifests and fetch reports belong under `reports/`.
+- CSV input files belong under `<project_root>/input/` (not under `data/jobs/`).
 - Final processed OCR outputs must be written under `<project_root>/out/`, not under `data/jobs/`.
-- Legacy `jobs/<slug>/ocr_out/` folders are tolerated but deprecated and reported as warnings by `data-audit`.
+- Legacy `jobs/<slug>/input/` and `jobs/<slug>/ocr_out/` folders are tolerated but deprecated and reported as warnings by `data-audit`.
 
 ## Archive / Cache / Tmp
 
