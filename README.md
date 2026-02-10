@@ -83,6 +83,17 @@ PAPER_OCR_MARKER_TIMEOUT=120
 PAPER_OCR_GROBID_TIMEOUT=60
 ```
 
+## Repository Organization
+
+Keep generated artifacts out of project root.
+
+- `input/`: local CSV inputs (gitignored).
+- `data/telegram_jobs/`: DOI fetch job folders (`input/`, `pdfs/`, reports, and optional `ocr_out/`).
+- `data/local_runs/`: ad-hoc local run outputs and experiments.
+- `out/`: canonical OCR output target when you explicitly choose it in CLI examples.
+
+If older runs created root-level output folders, move them under `data/local_runs/root_outputs/` so the repository stays navigable.
+
 ## CLI Overview
 
 ### 1) OCR existing PDFs
