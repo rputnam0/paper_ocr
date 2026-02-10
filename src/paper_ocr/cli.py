@@ -842,7 +842,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         write_json(final_dirs["metadata"] / "sections.json", discovery.get("sections", []))
         structured_data_enabled = bool(getattr(args, "extract_structured_data", True))
         deplot_command = str(getattr(args, "deplot_command", "") or "")
-        deplot_timeout = int(getattr(args, "deplot_timeout", int(DEPLOT_TIMEOUT_DEFAULT)) or int(DEPLOT_TIMEOUT_DEFAULT))
+        deplot_timeout = int(getattr(args, "deplot_timeout", int(DEPLOT_TIMEOUT_DEFAULT)))
         structured_data_manifest: dict[str, Any] = {
             "enabled": structured_data_enabled,
             "table_count": 0,
@@ -991,7 +991,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
             summary = build_structured_exports(
                 doc_dir=doc_dir,
                 deplot_command=str(getattr(args, "deplot_command", "") or ""),
-                deplot_timeout=int(getattr(args, "deplot_timeout", int(DEPLOT_TIMEOUT_DEFAULT)) or int(DEPLOT_TIMEOUT_DEFAULT)),
+                deplot_timeout=int(getattr(args, "deplot_timeout", int(DEPLOT_TIMEOUT_DEFAULT))),
             )
             structured_data_manifest: dict[str, Any] = {
                 "enabled": True,

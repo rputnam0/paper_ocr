@@ -4,6 +4,7 @@ import csv
 import json
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +27,12 @@ def _split_table_row(line: str) -> list[str]:
     stripped = line.strip()
     if not stripped.startswith("|"):
         return []
-    return [cell.strip() for cell in stripped.strip("|").split("|")]
+    # Remove one leading/trailing table delimiter but keep empty edge cells.
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
 
 
 def _is_table_separator(line: str, expected_cols: int) -> bool:
@@ -138,14 +144,17 @@ def _run_deplot_command(deplot_command: str, image_path: Path, timeout: int) -> 
     if not has_placeholder:
         cmd.append(str(image_path))
 
-    proc = subprocess.run(
-        cmd,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"DePlot command timed out after {timeout}s") from exc
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
         raise RuntimeError(stderr or f"DePlot command failed with code {proc.returncode}")
@@ -173,6 +182,16 @@ def _write_table_csv(path: Path, headers: list[str], rows: list[list[str]]) -> N
             writer.writerow(row)
 
 
+def _portable_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        try:
+            return str(path.resolve().relative_to(root.resolve()))
+        except Exception:
+            return str(path)
+
+
 def build_structured_exports(
     doc_dir: Path,
     *,
@@ -188,6 +207,10 @@ def build_structured_exports(
     tables_dir = extracted_root / "tables"
     figures_dir = extracted_root / "figures"
     deplot_dir = figures_dir / "deplot"
+    if tables_dir.exists():
+        shutil.rmtree(tables_dir)
+    if figures_dir.exists():
+        shutil.rmtree(figures_dir)
     tables_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
@@ -212,7 +235,7 @@ def build_structured_exports(
                 "caption": table["caption"],
                 "headers": table["headers"],
                 "rows": table["rows"],
-                "csv_path": str(csv_path),
+                "csv_path": _portable_path(csv_path, doc_dir),
             }
             json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
             table_rows.append(payload)
@@ -227,7 +250,7 @@ def build_structured_exports(
                 "page": page_index,
                 "alt_text": figure["alt_text"],
                 "image_ref": figure["image_ref"],
-                "resolved_path": str(resolved) if resolved else "",
+                "resolved_path": _portable_path(resolved, doc_dir) if resolved else "",
                 "deplot_path": "",
                 "deplot_error": "",
             }
@@ -239,7 +262,7 @@ def build_structured_exports(
                 try:
                     result = _run_deplot_command(deplot_command, resolved, deplot_timeout)
                     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=True))
-                    entry["deplot_path"] = str(out_path)
+                    entry["deplot_path"] = _portable_path(out_path, doc_dir)
                     summary.deplot_count += 1
                 except Exception as exc:  # noqa: BLE001
                     message = f"{figure_id}: {exc}"
@@ -266,8 +289,8 @@ def build_structured_exports(
         "deplot_count": summary.deplot_count,
         "unresolved_figure_count": summary.unresolved_figure_count,
         "errors": summary.errors,
-        "tables_manifest": str(tables_jsonl),
-        "figures_manifest": str(figures_jsonl),
+        "tables_manifest": _portable_path(tables_jsonl, doc_dir),
+        "figures_manifest": _portable_path(figures_jsonl, doc_dir),
     }
     extracted_root.mkdir(parents=True, exist_ok=True)
     (extracted_root / "manifest.json").write_text(json.dumps(manifest_payload, indent=2, ensure_ascii=True))
