@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from paper_ocr.structured_data import (
     build_structured_exports,
     compare_marker_tables_with_ocr_html,
@@ -433,6 +435,46 @@ def test_compare_marker_tables_parses_html_with_colspan_and_rowspan(tmp_path: Pa
     assert "γ" in result["ocr_symbols"]
 
 
+def test_compare_marker_tables_matches_by_content_not_ordinal(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    tables_dir = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "table_id": "p0001_t01",
+            "page": 1,
+            "headers": ["Material", "δ_D (MPa)1/2"],
+            "rows": [["Acetone", "15.5"]],
+            "csv_path": "metadata/assets/structured/extracted/tables/p0001_t01.csv",
+        },
+        {
+            "table_id": "p0001_t02",
+            "page": 1,
+            "headers": ["Solution", "Measured surface tension"],
+            "rows": [["A", "25.59 ± 0.14"]],
+            "csv_path": "metadata/assets/structured/extracted/tables/p0001_t02.csv",
+        },
+    ]
+    (tables_dir / "manifest.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    # Intentionally reversed ordinal content.
+    (ocr_dir / "table_01_page_0001.md").write_text(
+        "<table><tr><th>Solution</th><th>Measured surface tension</th></tr><tr><td>A</td><td>25.59 ± 0.14</td></tr></table>"
+    )
+    (ocr_dir / "table_02_page_0001.md").write_text(
+        "<table><tr><th>Material</th><th>δ_D (MPa)1/2</th></tr><tr><td>Acetone</td><td>15.5</td></tr></table>"
+    )
+
+    report = compare_marker_tables_with_ocr_html(doc_dir=doc_dir)
+    assert report["tables_compared"] == 2
+    assert report["tables_unmatched_marker"] == 0
+    assert report["tables_unmatched_ocr"] == 0
+    by_id = {r["table_id"]: r for r in report["results"] if r.get("status") == "ok"}
+    assert by_id["p0001_t01"]["similarity"] > 0.9
+    assert by_id["p0001_t02"]["similarity"] > 0.9
+
+
 def test_build_structured_exports_merges_ocr_symbols_into_marker_tables(tmp_path: Path):
     doc_dir = tmp_path / "Doe_2024"
     (doc_dir / "pages").mkdir(parents=True)
@@ -463,6 +505,7 @@ def test_build_structured_exports_merges_ocr_symbols_into_marker_tables(tmp_path
         doc_dir=doc_dir,
         table_source="marker-first",
         table_ocr_merge=True,
+        table_ocr_merge_scope="header",
     )
     assert summary.table_count == 1
     assert summary.ocr_merge.get("tables_patched", 0) == 1
@@ -506,6 +549,7 @@ def test_build_structured_exports_merges_ocr_symbols_into_markdown_tables(tmp_pa
         doc_dir=doc_dir,
         table_source="marker-first",
         table_ocr_merge=True,
+        table_ocr_merge_scope="header",
     )
     assert summary.table_count == 1
     assert summary.ocr_merge.get("mode") == "markdown_tables"
@@ -515,3 +559,19 @@ def test_build_structured_exports_merges_ocr_symbols_into_markdown_tables(tmp_pa
     csv_text = csv_path.read_text()
     assert "δ_D (MPa)1/2" in csv_text
     assert "eta = a g^(n-1)" in csv_text
+
+
+def test_build_structured_exports_strict_mode_requires_marker_artifacts(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    (doc_dir / "pages" / "0001.md").write_text("No tables\n")
+    with pytest.raises(RuntimeError, match="Strict table artifact mode failed"):
+        build_structured_exports(
+            doc_dir=doc_dir,
+            table_source="marker-first",
+            table_artifact_mode="strict",
+        )
+    status_path = doc_dir / "metadata" / "assets" / "structured" / "qa" / "pipeline_status.json"
+    assert status_path.exists()
+    payload = json.loads(status_path.read_text())
+    assert payload["status"] == "error"
