@@ -173,6 +173,12 @@ def _parse_args() -> argparse.Namespace:
         default="marker-first",
     )
     run.add_argument(
+        "--table-ocr-merge",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Deterministically merge OCR HTML table cells into Marker tables to recover symbols/formatting.",
+    )
+    run.add_argument(
         "--table-quality-gate",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -235,6 +241,12 @@ def _parse_args() -> argparse.Namespace:
         "--table-source",
         choices=["marker-first", "markdown-only"],
         default="marker-first",
+    )
+    export.add_argument(
+        "--table-ocr-merge",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Deterministically merge OCR HTML table cells into Marker tables to recover symbols/formatting.",
     )
     export.add_argument(
         "--table-quality-gate",
@@ -1095,6 +1107,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "deplot_count": 0,
             "unresolved_figure_count": 0,
             "errors": [],
+            "ocr_merge": {},
             "ocr_html_comparison": {},
         }
         if structured_data_enabled:
@@ -1104,6 +1117,8 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                     deplot_command=deplot_command,
                     deplot_timeout=deplot_timeout,
                     table_source=str(getattr(args, "table_source", "marker-first")),
+                    table_ocr_merge=bool(getattr(args, "table_ocr_merge", True)),
+                    ocr_html_dir=getattr(args, "ocr_html_dir", None),
                     table_quality_gate=bool(getattr(args, "table_quality_gate", True)),
                     table_escalation=str(getattr(args, "table_escalation", "auto")),
                     table_escalation_max=int(getattr(args, "table_escalation_max", 20)),
@@ -1117,6 +1132,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                         "deplot_count": summary.deplot_count,
                         "unresolved_figure_count": summary.unresolved_figure_count,
                         "errors": summary.errors,
+                        "ocr_merge": summary.ocr_merge,
                     }
                 )
                 if bool(getattr(args, "compare_ocr_html", False)):
@@ -1128,6 +1144,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                     structured_data_manifest["ocr_html_comparison"] = compare_summary
             except Exception as exc:  # noqa: BLE001
                 structured_data_manifest["errors"] = [str(exc)]
+                structured_data_manifest["ocr_merge"] = {}
         manifest["structured_data_extraction"] = structured_data_manifest
         qa_flags_path = final_dirs["assets"] / "structured" / "extracted" / "qa" / "table_flags.jsonl"
         if not qa_flags_path.exists():
@@ -1289,6 +1306,8 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 deplot_command=str(getattr(args, "deplot_command", "") or ""),
                 deplot_timeout=int(getattr(args, "deplot_timeout", int(DEPLOT_TIMEOUT_DEFAULT))),
                 table_source=str(getattr(args, "table_source", "marker-first")),
+                table_ocr_merge=bool(getattr(args, "table_ocr_merge", True)),
+                ocr_html_dir=getattr(args, "ocr_html_dir", None),
                 table_quality_gate=bool(getattr(args, "table_quality_gate", True)),
                 table_escalation=str(getattr(args, "table_escalation", "auto")),
                 table_escalation_max=int(getattr(args, "table_escalation_max", 20)),
@@ -1302,6 +1321,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "deplot_count": summary.deplot_count,
                 "unresolved_figure_count": summary.unresolved_figure_count,
                 "errors": summary.errors,
+                "ocr_merge": summary.ocr_merge,
                 "ocr_html_comparison": {},
             }
             if bool(getattr(args, "compare_ocr_html", False)):
@@ -1318,6 +1338,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "deplot_count": 0,
                 "unresolved_figure_count": 0,
                 "errors": [str(exc)],
+                "ocr_merge": {},
                 "ocr_html_comparison": {},
             }
         manifest["structured_data_extraction"] = structured_data_manifest

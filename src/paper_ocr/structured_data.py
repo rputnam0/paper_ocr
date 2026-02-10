@@ -27,6 +27,7 @@ class StructuredExportSummary:
     deplot_count: int = 0
     unresolved_figure_count: int = 0
     errors: list[str] = field(default_factory=list)
+    ocr_merge: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -543,6 +544,242 @@ def _parse_ocr_html_table(path: Path) -> tuple[list[str], list[list[str]]]:
     return headers, rows
 
 
+def _alnum_signature(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def _cell_patch_decision(marker_value: str, ocr_value: str, *, allow_empty_fill: bool = True) -> tuple[str, str]:
+    marker_text = _normalize_cell_text(marker_value)
+    ocr_text = _normalize_cell_text(ocr_value)
+    if not ocr_text:
+        return marker_text, ""
+    if allow_empty_fill and not marker_text:
+        if _extract_symbols(ocr_text):
+            return ocr_text, "empty_fill"
+        return marker_text, ""
+    if marker_text == ocr_text:
+        return marker_text, ""
+
+    marker_symbols = set(_extract_symbols(marker_text))
+    ocr_symbols = set(_extract_symbols(ocr_text))
+    if ocr_symbols.difference(marker_symbols):
+        marker_sig = _alnum_signature(marker_text)
+        ocr_sig = _alnum_signature(ocr_text)
+        if marker_sig and ocr_sig:
+            ratio = SequenceMatcher(None, marker_sig, ocr_sig).ratio()
+            if ratio >= 0.50:
+                return ocr_text, "symbol_patch"
+        else:
+            return ocr_text, "symbol_patch"
+
+    if "<br" in str(marker_value or "") and "<br" not in str(ocr_value or ""):
+        marker_sig = _alnum_signature(marker_text)
+        ocr_sig = _alnum_signature(ocr_text)
+        if marker_sig and marker_sig == ocr_sig:
+            return ocr_text, "format_patch"
+
+    return marker_text, ""
+
+
+def _load_ocr_tables_by_page(ocr_root: Path) -> dict[int, list[dict[str, Any]]]:
+    tables_by_page: dict[int, list[dict[str, Any]]] = {}
+    for path in sorted(ocr_root.glob("table_*_page_*.md")):
+        match = OCR_TABLE_FILE_RE.search(path.name)
+        if not match:
+            continue
+        page = int(match.group(2))
+        ordinal = int(match.group(1))
+        headers, rows = _parse_ocr_html_table(path)
+        tables_by_page.setdefault(page, []).append(
+            {
+                "ordinal": ordinal,
+                "headers": headers,
+                "rows": rows,
+                "path": path,
+            }
+        )
+    for rows in tables_by_page.values():
+        rows.sort(key=lambda row: int(row.get("ordinal", 0)))
+    return tables_by_page
+
+
+def _patch_table_grid(
+    marker_headers: list[str],
+    marker_rows: list[list[str]],
+    ocr_headers: list[str],
+    ocr_rows: list[list[str]],
+) -> tuple[list[str], list[list[str]], int, dict[str, int]]:
+    headers = list(marker_headers)
+    rows = [list(row) for row in marker_rows]
+    patch_count = 0
+    patch_reasons: dict[str, int] = {}
+
+    max_header_cols = min(len(headers), len(ocr_headers))
+    for col in range(max_header_cols):
+        merged, reason = _cell_patch_decision(headers[col], ocr_headers[col], allow_empty_fill=True)
+        if reason:
+            headers[col] = merged
+            patch_count += 1
+            patch_reasons[reason] = patch_reasons.get(reason, 0) + 1
+
+    max_rows = min(len(rows), len(ocr_rows))
+    for row_idx in range(max_rows):
+        marker_row_sig = _alnum_signature(" ".join(str(cell) for cell in rows[row_idx]))
+        ocr_row_sig = _alnum_signature(" ".join(str(cell) for cell in ocr_rows[row_idx]))
+        row_similarity = SequenceMatcher(None, marker_row_sig, ocr_row_sig).ratio() if (marker_row_sig or ocr_row_sig) else 1.0
+        allow_empty_fill = row_similarity >= 0.90
+        max_cols = min(len(rows[row_idx]), len(ocr_rows[row_idx]))
+        for col_idx in range(max_cols):
+            merged, reason = _cell_patch_decision(
+                rows[row_idx][col_idx],
+                ocr_rows[row_idx][col_idx],
+                allow_empty_fill=allow_empty_fill,
+            )
+            if reason:
+                rows[row_idx][col_idx] = merged
+                patch_count += 1
+                patch_reasons[reason] = patch_reasons.get(reason, 0) + 1
+    return headers, rows, patch_count, patch_reasons
+
+
+def _merge_marker_tables_with_ocr_html(
+    *,
+    canonical_tables: list[dict[str, Any]],
+    doc_dir: Path,
+    ocr_html_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa"
+    qa_root.mkdir(parents=True, exist_ok=True)
+    report_path = qa_root / "table_ocr_merge.json"
+
+    if not canonical_tables:
+        payload = {
+            "enabled": True,
+            "tables_considered": 0,
+            "tables_matched": 0,
+            "tables_patched": 0,
+            "cells_patched": 0,
+            "report_path": _portable_path(report_path, doc_dir),
+            "results": [],
+        }
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        return canonical_tables, payload
+
+    ocr_root = ocr_html_dir or (qa_root / "bbox_ocr_outputs")
+    if not ocr_root.exists():
+        payload = {
+            "enabled": True,
+            "tables_considered": len(canonical_tables),
+            "tables_matched": 0,
+            "tables_patched": 0,
+            "cells_patched": 0,
+            "report_path": _portable_path(report_path, doc_dir),
+            "results": [],
+            "warning": f"ocr_html_dir_missing:{ocr_root}",
+        }
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        return canonical_tables, payload
+
+    ocr_by_page = _load_ocr_tables_by_page(ocr_root)
+    marker_by_page: dict[int, list[int]] = {}
+    for idx, table in enumerate(canonical_tables):
+        pages = [int(p) for p in table.get("pages", []) if int(p) > 0]
+        primary_page = min(pages) if pages else 1
+        marker_by_page.setdefault(primary_page, []).append(idx)
+    for page in marker_by_page:
+        marker_by_page[page].sort(key=lambda i: str(canonical_tables[i].get("table_id", "")))
+
+    merged_tables: list[dict[str, Any]] = [dict(table) for table in canonical_tables]
+    results: list[dict[str, Any]] = []
+    tables_matched = 0
+    tables_patched = 0
+    cells_patched = 0
+
+    for page in sorted(marker_by_page):
+        marker_indices = marker_by_page.get(page, [])
+        ocr_tables = ocr_by_page.get(page, [])
+        for local_idx, marker_table_index in enumerate(marker_indices):
+            table = merged_tables[marker_table_index]
+            ocr_table = ocr_tables[local_idx] if local_idx < len(ocr_tables) else None
+            table_id = str(table.get("table_id", ""))
+            header_rows = table.get("header_rows", [])
+            marker_headers = list(header_rows[0]) if isinstance(header_rows, list) and header_rows else []
+            marker_rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
+            marker_symbols_before = _extract_symbols(_flatten_table_text(marker_headers, marker_rows))
+            table_cell_patches = 0
+            patch_reasons: dict[str, int] = {}
+
+            if ocr_table is None:
+                results.append(
+                    {
+                        "table_id": table_id,
+                        "page": page,
+                        "status": "missing_ocr_html",
+                        "cells_patched": 0,
+                        "ocr_html_path": "",
+                    }
+                )
+                continue
+
+            tables_matched += 1
+            ocr_headers = [str(x) for x in ocr_table.get("headers", [])]
+            ocr_rows = [[str(x) for x in row] for row in ocr_table.get("rows", []) if isinstance(row, list)]
+            marker_headers, marker_rows, table_cell_patches, patch_reasons = _patch_table_grid(
+                marker_headers=marker_headers,
+                marker_rows=marker_rows,
+                ocr_headers=ocr_headers,
+                ocr_rows=ocr_rows,
+            )
+
+            table["header_rows"] = [marker_headers] if marker_headers else []
+            table["data_rows"] = marker_rows
+            if table_cell_patches:
+                table["source_format"] = "hybrid"
+                table["ocr_merge"] = {
+                    "enabled": True,
+                    "ocr_html_path": _portable_path(Path(ocr_table["path"]), doc_dir),
+                    "cells_patched": table_cell_patches,
+                    "patch_reasons": patch_reasons,
+                }
+                tables_patched += 1
+                cells_patched += table_cell_patches
+                status = "patched"
+            else:
+                table["ocr_merge"] = {
+                    "enabled": True,
+                    "ocr_html_path": _portable_path(Path(ocr_table["path"]), doc_dir),
+                    "cells_patched": 0,
+                    "patch_reasons": {},
+                }
+                status = "unchanged"
+
+            results.append(
+                {
+                    "table_id": table_id,
+                    "page": page,
+                    "status": status,
+                    "cells_patched": table_cell_patches,
+                    "patch_reasons": patch_reasons,
+                    "ocr_html_path": _portable_path(Path(ocr_table["path"]), doc_dir),
+                    "marker_symbols_before": marker_symbols_before,
+                    "marker_symbols_after": _extract_symbols(_flatten_table_text(marker_headers, marker_rows)),
+                    "ocr_symbols": _extract_symbols(_flatten_table_text(ocr_headers, ocr_rows)),
+                }
+            )
+
+    payload = {
+        "enabled": True,
+        "tables_considered": len(canonical_tables),
+        "tables_matched": tables_matched,
+        "tables_patched": tables_patched,
+        "cells_patched": cells_patched,
+        "report_path": _portable_path(report_path, doc_dir),
+        "results": results,
+    }
+    report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+    return merged_tables, payload
+
+
 def compare_marker_tables_with_ocr_html(
     *,
     doc_dir: Path,
@@ -717,6 +954,8 @@ def build_structured_exports(
     deplot_command: str = "",
     deplot_timeout: int = 90,
     table_source: str = "marker-first",
+    table_ocr_merge: bool = True,
+    ocr_html_dir: Path | None = None,
     table_quality_gate: bool = True,
     table_escalation: str = "auto",
     table_escalation_max: int = 20,
@@ -744,6 +983,14 @@ def build_structured_exports(
     fragments: list[TableFragment] = []
     canonical_tables: list[dict[str, Any]] = []
     qa_flags: list[QAFlag] = []
+    markdown_merge_results: list[dict[str, Any]] = []
+    markdown_tables_matched = 0
+    markdown_tables_patched = 0
+    markdown_cells_patched = 0
+    ocr_tables_by_page: dict[int, list[dict[str, Any]]] = {}
+    ocr_root = (ocr_html_dir or (doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"))
+    if table_ocr_merge and ocr_root.exists():
+        ocr_tables_by_page = _load_ocr_tables_by_page(ocr_root)
 
     marker_tables_raw = doc_dir / "metadata" / "assets" / "structured" / "marker" / "tables_raw.jsonl"
     if table_source == "marker-first" and marker_tables_raw.exists():
@@ -751,6 +998,13 @@ def build_structured_exports(
         for idx, row in enumerate(marker_rows, start=1):
             fragments.append(_normalize_fragment_from_marker(row, idx))
         canonical_tables = _merge_table_fragments(fragments)
+        if table_ocr_merge:
+            canonical_tables, merge_summary = _merge_marker_tables_with_ocr_html(
+                canonical_tables=canonical_tables,
+                doc_dir=doc_dir,
+                ocr_html_dir=ocr_html_dir,
+            )
+            summary.ocr_merge = merge_summary
 
     for page_path in sorted(pages_dir.glob("*.md")):
         if not page_path.stem.isdigit():
@@ -760,16 +1014,61 @@ def build_structured_exports(
 
         tables = [] if canonical_tables else extract_markdown_tables(markdown)
         for t_index, table in enumerate(tables, start=1):
+            headers = list(table["headers"])
+            rows = [list(r) for r in table["rows"]]
+            if table_ocr_merge:
+                ocr_tables = ocr_tables_by_page.get(page_index, [])
+                ocr_table = ocr_tables[t_index - 1] if t_index - 1 < len(ocr_tables) else None
+                if ocr_table is not None:
+                    markdown_tables_matched += 1
+                    marker_symbols_before = _extract_symbols(_flatten_table_text(headers, rows))
+                    ocr_headers = [str(x) for x in ocr_table.get("headers", [])]
+                    ocr_rows = [[str(x) for x in row] for row in ocr_table.get("rows", []) if isinstance(row, list)]
+                    headers, rows, patched_cells, patch_reasons = _patch_table_grid(
+                        marker_headers=headers,
+                        marker_rows=rows,
+                        ocr_headers=ocr_headers,
+                        ocr_rows=ocr_rows,
+                    )
+                    if patched_cells:
+                        markdown_tables_patched += 1
+                        markdown_cells_patched += patched_cells
+                        merge_status = "patched"
+                    else:
+                        merge_status = "unchanged"
+                    markdown_merge_results.append(
+                        {
+                            "table_id": f"p{page_index:04d}_t{t_index:02d}",
+                            "page": page_index,
+                            "status": merge_status,
+                            "cells_patched": patched_cells,
+                            "patch_reasons": patch_reasons,
+                            "ocr_html_path": _portable_path(Path(ocr_table["path"]), doc_dir),
+                            "marker_symbols_before": marker_symbols_before,
+                            "marker_symbols_after": _extract_symbols(_flatten_table_text(headers, rows)),
+                            "ocr_symbols": _extract_symbols(_flatten_table_text(ocr_headers, ocr_rows)),
+                        }
+                    )
+                else:
+                    markdown_merge_results.append(
+                        {
+                            "table_id": f"p{page_index:04d}_t{t_index:02d}",
+                            "page": page_index,
+                            "status": "missing_ocr_html",
+                            "cells_patched": 0,
+                            "ocr_html_path": "",
+                        }
+                    )
             table_id = f"p{page_index:04d}_t{t_index:02d}"
             csv_path = tables_dir / f"{table_id}.csv"
             json_path = tables_dir / f"{table_id}.json"
-            _write_table_csv(csv_path, table["headers"], table["rows"])
+            _write_table_csv(csv_path, headers, rows)
             payload = {
                 "table_id": table_id,
                 "page": page_index,
                 "caption": table["caption"],
-                "headers": table["headers"],
-                "rows": table["rows"],
+                "headers": headers,
+                "rows": rows,
                 "csv_path": _portable_path(csv_path, doc_dir),
             }
             json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
@@ -907,6 +1206,21 @@ def build_structured_exports(
         )
         if table_qa_mode == "strict" and any(flag.severity in {"warn", "error"} for flag in qa_flags):
             raise RuntimeError("Table QA strict mode failed due to disagreements.")
+    elif table_ocr_merge:
+        qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa"
+        qa_root.mkdir(parents=True, exist_ok=True)
+        merge_payload = {
+            "enabled": True,
+            "tables_considered": len(table_rows),
+            "tables_matched": markdown_tables_matched,
+            "tables_patched": markdown_tables_patched,
+            "cells_patched": markdown_cells_patched,
+            "report_path": _portable_path(qa_root / "table_ocr_merge.json", doc_dir),
+            "results": markdown_merge_results,
+            "mode": "markdown_tables",
+        }
+        (qa_root / "table_ocr_merge.json").write_text(json.dumps(merge_payload, indent=2, ensure_ascii=True))
+        summary.ocr_merge = merge_payload
 
     tables_jsonl = tables_dir / "manifest.jsonl"
     if table_rows:

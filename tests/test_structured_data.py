@@ -345,3 +345,85 @@ def test_compare_marker_tables_with_ocr_html_reports_symbol_differences(tmp_path
         doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_ocr_html_compare.json"
     )
     assert report_path.exists()
+
+
+def test_build_structured_exports_merges_ocr_symbols_into_marker_tables(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["Model", "Equation"]],
+        "data_rows": [["Power law", "eta = a g^(n-1)"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "table_01_page_0001.md").write_text(
+        (
+            "<table><tr><th>Model</th><th>Equation</th></tr>"
+            "<tr><td>Power law</td><td>\u03b7 = a\u03b3^(n-1)</td></tr></table>"
+        )
+    )
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=True,
+    )
+    assert summary.table_count == 1
+    assert summary.ocr_merge.get("tables_patched", 0) == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first_row = json.loads(table_manifest.read_text().splitlines()[0])
+    csv_path = doc_dir / first_row["csv_path"]
+    csv_text = csv_path.read_text()
+    assert "\u03b7 = a\u03b3^(n-1)" in csv_text
+
+    merge_report = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_ocr_merge.json"
+    assert merge_report.exists()
+
+
+def test_build_structured_exports_merges_ocr_symbols_into_markdown_tables(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text(
+        "\n".join(
+            [
+                "Table 1: Model",
+                "| Model | Equation |",
+                "| --- | --- |",
+                "| Power law | eta = a g^(n-1) |",
+            ]
+        )
+    )
+
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "table_01_page_0001.md").write_text(
+        (
+            "<table><tr><th>Model</th><th>Equation</th></tr>"
+            "<tr><td>Power law</td><td>\u03b7 = a\u03b3^(n-1)</td></tr></table>"
+        )
+    )
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=True,
+    )
+    assert summary.table_count == 1
+    assert summary.ocr_merge.get("mode") == "markdown_tables"
+    assert summary.ocr_merge.get("tables_patched", 0) == 1
+
+    csv_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.csv"
+    csv_text = csv_path.read_text()
+    assert "\u03b7 = a\u03b3^(n-1)" in csv_text
