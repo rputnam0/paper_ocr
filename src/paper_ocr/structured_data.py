@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+from difflib import SequenceMatcher
 from html import unescape
 from html.parser import HTMLParser
 import json
@@ -15,6 +16,8 @@ from typing import Any
 
 
 FIGURE_MD_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+OCR_TABLE_FILE_RE = re.compile(r"table_(\d+)_page_(\d+)\.md$", re.IGNORECASE)
+SYMBOL_CHAR_RE = re.compile(r"[^\x00-\x7F]|[±≤≥≈×÷°µμδΔητσγβαΩω]")
 
 
 @dataclass
@@ -498,6 +501,167 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
         path.write_text("\n".join(json.dumps(row, ensure_ascii=True) for row in rows) + "\n")
     else:
         path.write_text("")
+
+
+def _normalize_cell_text(value: str) -> str:
+    text = str(value or "")
+    text = text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
+    return " ".join(text.split())
+
+
+def _flatten_table_text(headers: list[str], rows: list[list[str]]) -> str:
+    parts: list[str] = []
+    if headers:
+        parts.append(" | ".join(_normalize_cell_text(c) for c in headers))
+    for row in rows:
+        parts.append(" | ".join(_normalize_cell_text(c) for c in row))
+    return "\n".join(parts)
+
+
+def _extract_symbols(text: str) -> str:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for ch in SYMBOL_CHAR_RE.findall(str(text or "")):
+        if ch in seen:
+            continue
+        seen.add(ch)
+        ordered.append(ch)
+    return "".join(ordered)
+
+
+def _parse_ocr_html_table(path: Path) -> tuple[list[str], list[list[str]]]:
+    raw = path.read_text()
+    header_rows, data_rows = _parse_html_table_rows(raw)
+    if not header_rows and not data_rows:
+        markdown_tables = extract_markdown_tables(raw)
+        if markdown_tables:
+            first = markdown_tables[0]
+            return list(first.get("headers", [])), [list(r) for r in first.get("rows", [])]
+        return [], []
+    headers = list(header_rows[0]) if header_rows else []
+    rows = [list(r) for r in data_rows]
+    return headers, rows
+
+
+def compare_marker_tables_with_ocr_html(
+    *,
+    doc_dir: Path,
+    ocr_html_dir: Path | None = None,
+) -> dict[str, Any]:
+    qa_dir = doc_dir / "metadata" / "assets" / "structured" / "qa"
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    report_path = qa_dir / "table_ocr_html_compare.json"
+    tables_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    if not tables_manifest.exists():
+        payload = {
+            "doc_dir": str(doc_dir),
+            "tables_compared": 0,
+            "avg_similarity": 0.0,
+            "results": [],
+            "error": "missing tables manifest",
+            "report_path": _portable_path(report_path, doc_dir),
+        }
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        return payload
+
+    html_root = ocr_html_dir or (qa_dir / "bbox_ocr_outputs")
+    if not html_root.exists():
+        payload = {
+            "doc_dir": str(doc_dir),
+            "ocr_html_dir": str(html_root),
+            "tables_compared": 0,
+            "avg_similarity": 0.0,
+            "results": [],
+            "error": "ocr html directory missing",
+            "report_path": _portable_path(report_path, doc_dir),
+        }
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        return payload
+
+    table_rows = _load_jsonl(tables_manifest)
+    tables_by_page: dict[int, list[dict[str, Any]]] = {}
+    for row in table_rows:
+        page = int(row.get("page") or 0)
+        if page <= 0:
+            continue
+        tables_by_page.setdefault(page, []).append(row)
+    for rows in tables_by_page.values():
+        rows.sort(key=lambda r: str(r.get("table_id", "")))
+
+    ocr_files_by_page: dict[int, list[Path]] = {}
+    for path in sorted(html_root.glob("table_*_page_*.md")):
+        match = OCR_TABLE_FILE_RE.search(path.name)
+        if not match:
+            continue
+        page = int(match.group(2))
+        ocr_files_by_page.setdefault(page, []).append(path)
+
+    results: list[dict[str, Any]] = []
+    similarities: list[float] = []
+    for page in sorted(tables_by_page):
+        marker_tables = tables_by_page.get(page, [])
+        ocr_tables = ocr_files_by_page.get(page, [])
+        for idx, marker_row in enumerate(marker_tables):
+            ocr_path = ocr_tables[idx] if idx < len(ocr_tables) else None
+            marker_headers = [str(x) for x in marker_row.get("headers", [])]
+            marker_data_rows = [[str(x) for x in row] for row in marker_row.get("rows", []) if isinstance(row, list)]
+            marker_text = _flatten_table_text(marker_headers, marker_data_rows)
+
+            if ocr_path is None:
+                results.append(
+                    {
+                        "table_id": str(marker_row.get("table_id", "")),
+                        "page": page,
+                        "ocr_html_path": "",
+                        "similarity": 0.0,
+                        "marker_symbols": _extract_symbols(marker_text),
+                        "ocr_symbols": "",
+                        "missing_in_marker_vs_ocr": "",
+                        "missing_in_ocr_vs_marker": _extract_symbols(marker_text),
+                        "status": "missing_ocr_html",
+                    }
+                )
+                continue
+
+            ocr_headers, ocr_rows = _parse_ocr_html_table(ocr_path)
+            ocr_text = _flatten_table_text(ocr_headers, ocr_rows)
+            similarity = SequenceMatcher(None, marker_text, ocr_text).ratio() if (marker_text or ocr_text) else 1.0
+            similarities.append(float(similarity))
+
+            marker_symbols = _extract_symbols(marker_text)
+            ocr_symbols = _extract_symbols(ocr_text)
+            missing_in_marker = "".join(ch for ch in ocr_symbols if ch not in marker_symbols)
+            missing_in_ocr = "".join(ch for ch in marker_symbols if ch not in ocr_symbols)
+
+            results.append(
+                {
+                    "table_id": str(marker_row.get("table_id", "")),
+                    "page": page,
+                    "ocr_html_path": _portable_path(ocr_path, doc_dir),
+                    "marker_rows": len(marker_data_rows),
+                    "marker_cols": len(marker_headers),
+                    "ocr_rows": len(ocr_rows),
+                    "ocr_cols": len(ocr_headers),
+                    "similarity": round(float(similarity), 4),
+                    "marker_symbols": marker_symbols,
+                    "ocr_symbols": ocr_symbols,
+                    "missing_in_marker_vs_ocr": missing_in_marker,
+                    "missing_in_ocr_vs_marker": missing_in_ocr,
+                    "status": "ok",
+                }
+            )
+
+    avg_similarity = round(sum(similarities) / len(similarities), 4) if similarities else 0.0
+    payload = {
+        "doc_dir": str(doc_dir),
+        "ocr_html_dir": str(html_root),
+        "tables_compared": len(similarities),
+        "avg_similarity": avg_similarity,
+        "results": results,
+        "report_path": _portable_path(report_path, doc_dir),
+    }
+    report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+    return payload
 
 
 def _reconcile_with_grobid(

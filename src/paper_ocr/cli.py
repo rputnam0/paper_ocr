@@ -39,7 +39,7 @@ from .postprocess import parse_yaml_front_matter
 from .render import render_page
 from .schemas import new_manifest
 from .store import ensure_dirs, write_json, write_text
-from .structured_data import build_structured_exports
+from .structured_data import build_structured_exports, compare_marker_tables_with_ocr_html
 from .structured_extract import (
     build_render_contract,
     grobid_coords_to_px,
@@ -188,6 +188,18 @@ def _parse_args() -> argparse.Namespace:
         choices=["off", "warn", "strict"],
         default="warn",
     )
+    run.add_argument(
+        "--compare-ocr-html",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compare Marker-extracted tables against OCR HTML table outputs in structured QA artifacts.",
+    )
+    run.add_argument(
+        "--ocr-html-dir",
+        type=Path,
+        default=None,
+        help="Optional directory containing OCR HTML tables (default: metadata/assets/structured/qa/bbox_ocr_outputs).",
+    )
 
     fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")
     fetch.add_argument("doi_csv", type=Path)
@@ -239,6 +251,18 @@ def _parse_args() -> argparse.Namespace:
         "--table-qa-mode",
         choices=["off", "warn", "strict"],
         default="warn",
+    )
+    export.add_argument(
+        "--compare-ocr-html",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compare Marker-extracted tables against OCR HTML table outputs in structured QA artifacts.",
+    )
+    export.add_argument(
+        "--ocr-html-dir",
+        type=Path,
+        default=None,
+        help="Optional directory containing OCR HTML tables (default: metadata/assets/structured/qa/bbox_ocr_outputs).",
     )
 
     eval_tables = sub.add_parser(
@@ -1071,6 +1095,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "deplot_count": 0,
             "unresolved_figure_count": 0,
             "errors": [],
+            "ocr_html_comparison": {},
         }
         if structured_data_enabled:
             try:
@@ -1094,6 +1119,13 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                         "errors": summary.errors,
                     }
                 )
+                if bool(getattr(args, "compare_ocr_html", False)):
+                    ocr_html_dir = getattr(args, "ocr_html_dir", None)
+                    compare_summary = compare_marker_tables_with_ocr_html(
+                        doc_dir=doc_dir,
+                        ocr_html_dir=ocr_html_dir,
+                    )
+                    structured_data_manifest["ocr_html_comparison"] = compare_summary
             except Exception as exc:  # noqa: BLE001
                 structured_data_manifest["errors"] = [str(exc)]
         manifest["structured_data_extraction"] = structured_data_manifest
@@ -1169,15 +1201,10 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
     api_id, api_hash = _require_telegram_credentials()
     csv_name = _job_slug_from_csv_stem(args.doi_csv.stem)
     job_dir = _resolve_fetch_job_dir(args.output_root, csv_name)
-    input_dir = job_dir / "input"
     pdf_dir = job_dir / "pdfs"
     reports_dir = job_dir / "reports"
-    input_dir.mkdir(parents=True, exist_ok=True)
     pdf_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    copied_csv = input_dir / args.doi_csv.name
-    if args.doi_csv.resolve() != copied_csv.resolve():
-        shutil.copy2(args.doi_csv, copied_csv)
 
     config = FetchTelegramConfig(
         api_id=api_id,
@@ -1275,7 +1302,14 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "deplot_count": summary.deplot_count,
                 "unresolved_figure_count": summary.unresolved_figure_count,
                 "errors": summary.errors,
+                "ocr_html_comparison": {},
             }
+            if bool(getattr(args, "compare_ocr_html", False)):
+                compare_summary = compare_marker_tables_with_ocr_html(
+                    doc_dir=doc_dir,
+                    ocr_html_dir=getattr(args, "ocr_html_dir", None),
+                )
+                structured_data_manifest["ocr_html_comparison"] = compare_summary
         except Exception as exc:  # noqa: BLE001
             structured_data_manifest = {
                 "enabled": True,
@@ -1284,6 +1318,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "deplot_count": 0,
                 "unresolved_figure_count": 0,
                 "errors": [str(exc)],
+                "ocr_html_comparison": {},
             }
         manifest["structured_data_extraction"] = structured_data_manifest
         write_json(manifest_path, manifest)

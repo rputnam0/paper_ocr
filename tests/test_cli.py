@@ -156,6 +156,8 @@ def test_parse_run_table_pipeline_defaults(monkeypatch):
     assert args.table_escalation == "auto"
     assert args.table_escalation_max == 20
     assert args.table_qa_mode == "warn"
+    assert args.compare_ocr_html is False
+    assert args.ocr_html_dir is None
 
 
 def test_parse_export_table_pipeline_options(monkeypatch):
@@ -180,6 +182,25 @@ def test_parse_export_table_pipeline_options(monkeypatch):
     assert args.table_qa_mode == "strict"
     assert args.table_escalation == "always"
     assert args.table_escalation_max == 3
+    assert args.compare_ocr_html is False
+    assert args.ocr_html_dir is None
+
+
+def test_parse_export_table_comparison_options(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "export-structured-data",
+            "out",
+            "--compare-ocr-html",
+            "--ocr-html-dir",
+            "custom/ocr_html",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.compare_ocr_html is True
+    assert args.ocr_html_dir == Path("custom/ocr_html")
 
 
 def test_parse_eval_table_pipeline_args(monkeypatch):
@@ -254,6 +275,15 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
         )
 
     monkeypatch.setattr(cli, "build_structured_exports", _fake_build)
+    monkeypatch.setattr(
+        cli,
+        "compare_marker_tables_with_ocr_html",
+        lambda **kwargs: {
+            "tables_compared": 2,
+            "avg_similarity": 0.95,
+            "report_path": "metadata/assets/structured/qa/table_ocr_html_compare.json",
+        },
+    )
 
     args = argparse.Namespace(
         ocr_out_dir=root,
@@ -264,12 +294,15 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
         table_escalation="auto",
         table_escalation_max=20,
         table_qa_mode="warn",
+        compare_ocr_html=True,
+        ocr_html_dir=None,
     )
     result = cli._run_export_structured_data(args)
     assert result["docs_processed"] == 1
     payload = json.loads(manifest_path.read_text())
     assert payload["structured_data_extraction"]["table_count"] == 2
     assert payload["structured_data_extraction"]["figure_count"] == 3
+    assert payload["structured_data_extraction"]["ocr_html_comparison"]["tables_compared"] == 2
     assert seen_kwargs["grobid_status"] == "unknown"
 
 
@@ -505,10 +538,9 @@ def test_fetch_telegram_migrates_legacy_default_job_dir(monkeypatch, tmp_path: P
     assert (tmp_path / "data" / "jobs" / "papers" / "reports" / "download_index.json").exists()
 
 
-def test_fetch_telegram_skips_copy_when_csv_already_in_job_input(monkeypatch, tmp_path: Path):
+def test_fetch_telegram_keeps_input_csv_outside_job_folder(monkeypatch, tmp_path: Path):
     output_root = tmp_path / "jobs"
-    doi_csv = output_root / "papers" / "input" / "papers.csv"
-    doi_csv.parent.mkdir(parents=True, exist_ok=True)
+    doi_csv = tmp_path / "papers.csv"
     doi_csv.write_text("DOI\n10.1000/abc\n")
     args = argparse.Namespace(
         doi_csv=doi_csv,
@@ -530,6 +562,7 @@ def test_fetch_telegram_skips_copy_when_csv_already_in_job_input(monkeypatch, tm
 
     asyncio.run(cli._run_fetch_telegram(args))
     assert _fake_fetch_from_telegram.last_config.doi_csv == doi_csv
+    assert not (output_root / "papers" / "input").exists()
 
 
 def test_fetch_telegram_does_not_create_ocr_out_subdir(monkeypatch, tmp_path: Path):
@@ -554,6 +587,7 @@ def test_fetch_telegram_does_not_create_ocr_out_subdir(monkeypatch, tmp_path: Pa
 
     asyncio.run(cli._run_fetch_telegram(args))
     assert not (tmp_path / "jobs" / "papers" / "ocr_out").exists()
+    assert not (tmp_path / "jobs" / "papers" / "input").exists()
 
 
 def test_run_rejects_output_under_jobs_folder(tmp_path: Path):

@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from paper_ocr.structured_data import build_structured_exports, extract_markdown_tables
+from paper_ocr.structured_data import (
+    build_structured_exports,
+    compare_marker_tables_with_ocr_html,
+    extract_markdown_tables,
+)
 
 
 def test_extract_markdown_tables_parses_header_and_rows():
@@ -305,3 +309,39 @@ def test_build_structured_exports_merges_adjacent_continued_tables(tmp_path: Pat
     payloads = [json.loads(line) for line in canonical.read_text().splitlines() if line.strip()]
     assert len(payloads) == 1
     assert payloads[0]["pages"] == [2, 3]
+
+
+def test_compare_marker_tables_with_ocr_html_reports_symbol_differences(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    tables_dir = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    manifest_row = {
+        "table_id": "p0001_t01",
+        "page": 1,
+        "headers": ["Metric", "Value"],
+        "rows": [["surface tension", "25.59 0.14"]],
+        "csv_path": "metadata/assets/structured/extracted/tables/p0001_t01.csv",
+    }
+    (tables_dir / "manifest.jsonl").write_text(json.dumps(manifest_row) + "\n")
+
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "table_01_page_0001.md").write_text(
+        (
+            "<table><tr><th>Metric</th><th>Value</th></tr>"
+            "<tr><td>surface tension</td><td>25.59 \u00b1 0.14</td></tr></table>"
+        )
+    )
+
+    report = compare_marker_tables_with_ocr_html(doc_dir=doc_dir)
+    assert report["tables_compared"] == 1
+    assert report["avg_similarity"] > 0.9
+    result = report["results"][0]
+    assert "\u00b1" in result["ocr_symbols"]
+    assert "\u00b1" in result["missing_in_marker_vs_ocr"]
+    assert result["ocr_html_path"].endswith("table_01_page_0001.md")
+
+    report_path = (
+        doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_ocr_html_compare.json"
+    )
+    assert report_path.exists()
