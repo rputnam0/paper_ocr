@@ -137,6 +137,67 @@ def test_parse_export_structured_data_args(monkeypatch):
     assert args.deplot_timeout == 45
 
 
+def test_parse_run_table_pipeline_defaults(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "run",
+            "data/in",
+            "out",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.marker_localize is True
+    assert args.marker_localize_profile == "full_json"
+    assert args.layout_fallback == "surya"
+    assert args.table_source == "marker-first"
+    assert args.table_quality_gate is True
+    assert args.table_escalation == "auto"
+    assert args.table_escalation_max == 20
+    assert args.table_qa_mode == "warn"
+
+
+def test_parse_export_table_pipeline_options(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "export-structured-data",
+            "out",
+            "--table-source",
+            "markdown-only",
+            "--table-qa-mode",
+            "strict",
+            "--table-escalation",
+            "always",
+            "--table-escalation-max",
+            "3",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.table_source == "markdown-only"
+    assert args.table_qa_mode == "strict"
+    assert args.table_escalation == "always"
+    assert args.table_escalation_max == 3
+
+
+def test_parse_eval_table_pipeline_args(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "eval-table-pipeline",
+            "gold",
+            "pred",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "eval-table-pipeline"
+    assert args.gold_dir == Path("gold")
+    assert args.pred_dir == Path("pred")
+
+
 def test_parse_data_audit_args(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -196,6 +257,11 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
         ocr_out_dir=root,
         deplot_command="deplot-cli --image {image}",
         deplot_timeout=30,
+        table_source="marker-first",
+        table_quality_gate=True,
+        table_escalation="auto",
+        table_escalation_max=20,
+        table_qa_mode="warn",
     )
     result = cli._run_export_structured_data(args)
     assert result["docs_processed"] == 1

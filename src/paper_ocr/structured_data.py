@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
 import shlex
@@ -21,6 +22,34 @@ class StructuredExportSummary:
     deplot_count: int = 0
     unresolved_figure_count: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TableFragment:
+    fragment_id: str
+    table_group_id: str
+    table_block_ids: list[str]
+    caption_block_id: str
+    note_block_ids: list[str]
+    page: int
+    polygons: list[list[list[float]]]
+    bbox: list[float]
+    header_rows: list[list[str]]
+    data_rows: list[list[str]]
+    caption_text: str
+    caption_confidence: float
+    source_format: str
+    quality_metrics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class QAFlag:
+    flag_id: str
+    severity: str
+    type: str
+    page: int
+    table_ref: str
+    details: str
 
 
 def _split_table_row(line: str) -> list[str]:
@@ -192,11 +221,221 @@ def _portable_path(path: Path, root: Path) -> str:
             return str(path)
 
 
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    for line in path.read_text().splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def _stable_id(*parts: str) -> str:
+    src = "|".join(parts)
+    return hashlib.sha1(src.encode("utf-8")).hexdigest()[:16]
+
+
+def _bbox_from_polygons(polygons: list[list[list[float]]]) -> list[float]:
+    xs: list[float] = []
+    ys: list[float] = []
+    for poly in polygons:
+        for point in poly:
+            if len(point) < 2:
+                continue
+            try:
+                xs.append(float(point[0]))
+                ys.append(float(point[1]))
+            except Exception:
+                continue
+    if not xs or not ys:
+        return [0.0, 0.0, 0.0, 0.0]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+TABLE_NUM_RE = re.compile(r"\b(?:table|tab\.?)\s*([0-9ivxlcdm]+)\b", re.IGNORECASE)
+
+
+def _extract_table_number(caption: str) -> str:
+    match = TABLE_NUM_RE.search(caption or "")
+    if not match:
+        return ""
+    return match.group(1).strip().lower()
+
+
+def _normalize_fragment_from_marker(row: dict[str, Any], index: int) -> TableFragment:
+    page = int(row.get("page") or 1)
+    polygons = row.get("polygons")
+    if not isinstance(polygons, list):
+        polygons = []
+    header_rows = row.get("header_rows")
+    if not isinstance(header_rows, list):
+        header_rows = []
+    data_rows = row.get("data_rows")
+    if not isinstance(data_rows, list):
+        data_rows = []
+    caption_text = str(row.get("caption_text", "") or "")
+    table_group_id = str(row.get("table_group_id", "") or f"group_{page}_{index}")
+    block_ids = row.get("table_block_ids")
+    if not isinstance(block_ids, list):
+        block_ids = []
+    caption_block_id = str(row.get("caption_block_id", "") or "")
+    quality = row.get("quality_metrics") if isinstance(row.get("quality_metrics"), dict) else {}
+    frag_id = _stable_id(
+        table_group_id,
+        str(page),
+        caption_text[:64],
+        json.dumps(polygons, ensure_ascii=True, sort_keys=True),
+    )
+    return TableFragment(
+        fragment_id=frag_id,
+        table_group_id=table_group_id,
+        table_block_ids=[str(x) for x in block_ids],
+        caption_block_id=caption_block_id,
+        note_block_ids=[str(x) for x in row.get("note_block_ids", []) if str(x)],
+        page=page,
+        polygons=polygons,
+        bbox=_bbox_from_polygons(polygons),
+        header_rows=[list(map(str, hr)) for hr in header_rows if isinstance(hr, list)],
+        data_rows=[list(map(str, dr)) for dr in data_rows if isinstance(dr, list)],
+        caption_text=caption_text,
+        caption_confidence=float(row.get("caption_confidence", 0.9) or 0.9),
+        source_format=str(row.get("source_format", "html") or "html"),
+        quality_metrics=quality,
+    )
+
+
+def _merge_table_fragments(fragments: list[TableFragment]) -> list[dict[str, Any]]:
+    groups: dict[str, list[TableFragment]] = {}
+    for frag in fragments:
+        table_number = _extract_table_number(frag.caption_text)
+        key = table_number or frag.table_group_id or frag.fragment_id
+        groups.setdefault(key, []).append(frag)
+
+    out: list[dict[str, Any]] = []
+    for key, frags in groups.items():
+        frags_sorted = sorted(frags, key=lambda f: (f.page, f.fragment_id))
+        header_rows = frags_sorted[0].header_rows
+        merged_rows: list[list[str]] = []
+        for frag in frags_sorted:
+            for row in frag.data_rows:
+                if merged_rows and row == merged_rows[-1]:
+                    continue
+                merged_rows.append(row)
+        out.append(
+            {
+                "table_id": _stable_id(key, ",".join(f.fragment_id for f in frags_sorted)),
+                "table_group_id": key,
+                "fragment_ids": [f.fragment_id for f in frags_sorted],
+                "pages": sorted({f.page for f in frags_sorted}),
+                "caption_text": next((f.caption_text for f in frags_sorted if f.caption_text), ""),
+                "header_rows": header_rows,
+                "data_rows": merged_rows,
+                "source_format": frags_sorted[0].source_format,
+                "merge_confidence": 0.9 if len(frags_sorted) > 1 else 1.0,
+            }
+        )
+    return out
+
+
+def _quality_metrics(headers: list[str], rows: list[list[str]]) -> dict[str, Any]:
+    total_cells = max(len(headers), 1) * max(len(rows), 1)
+    flattened = [cell for row in rows for cell in row]
+    empty_cells = sum(1 for cell in flattened if not str(cell).strip())
+    repeated = 0
+    if flattened:
+        common = max((flattened.count(v) for v in set(flattened)))
+        repeated = common
+    row_lengths = [len(r) for r in rows] if rows else [len(headers)]
+    unstable = sum(1 for n in row_lengths if n != len(headers))
+    return {
+        "empty_cell_ratio": empty_cells / max(total_cells, 1),
+        "repeated_text_ratio": repeated / max(len(flattened), 1),
+        "column_instability_ratio": unstable / max(len(row_lengths), 1),
+    }
+
+
+def _fails_quality(metrics: dict[str, Any]) -> bool:
+    return (
+        float(metrics.get("empty_cell_ratio", 0.0)) > 0.35
+        or float(metrics.get("repeated_text_ratio", 0.0)) > 0.45
+        or float(metrics.get("column_instability_ratio", 0.0)) > 0.20
+    )
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if rows:
+        path.write_text("\n".join(json.dumps(row, ensure_ascii=True) for row in rows) + "\n")
+    else:
+        path.write_text("")
+
+
+def _reconcile_with_grobid(
+    *,
+    canonical_tables: list[dict[str, Any]],
+    grobid_tables: list[dict[str, Any]],
+) -> list[QAFlag]:
+    flags: list[QAFlag] = []
+    marker_pages = sorted({int(p) for t in canonical_tables for p in t.get("pages", [])})
+    grobid_pages = sorted({int(t.get("page") or 0) for t in grobid_tables if int(t.get("page") or 0) > 0})
+
+    if len(canonical_tables) != len(grobid_tables):
+        flags.append(
+            QAFlag(
+                flag_id=_stable_id("qa", "count", str(len(canonical_tables)), str(len(grobid_tables))),
+                severity="warn",
+                type="count_mismatch",
+                page=0,
+                table_ref="*",
+                details=f"marker={len(canonical_tables)} grobid={len(grobid_tables)}",
+            )
+        )
+    if marker_pages != grobid_pages:
+        flags.append(
+            QAFlag(
+                flag_id=_stable_id("qa", "pages", ",".join(map(str, marker_pages)), ",".join(map(str, grobid_pages))),
+                severity="warn",
+                type="page_mismatch",
+                page=0,
+                table_ref="*",
+                details=f"marker_pages={marker_pages} grobid_pages={grobid_pages}",
+            )
+        )
+    marker_nums = sorted({_extract_table_number(str(t.get("caption_text", ""))) for t in canonical_tables if _extract_table_number(str(t.get("caption_text", "")))})
+    grobid_nums = sorted({_extract_table_number(str(t.get("label", "")) + " " + str(t.get("caption_text", ""))) for t in grobid_tables if _extract_table_number(str(t.get("label", "")) + " " + str(t.get("caption_text", "")))})
+    if marker_nums and grobid_nums and marker_nums != grobid_nums:
+        flags.append(
+            QAFlag(
+                flag_id=_stable_id("qa", "caption-num", ",".join(marker_nums), ",".join(grobid_nums)),
+                severity="warn",
+                type="caption_number_mismatch",
+                page=0,
+                table_ref="*",
+                details=f"marker_numbers={marker_nums} grobid_numbers={grobid_nums}",
+            )
+        )
+    return flags
+
+
 def build_structured_exports(
     doc_dir: Path,
     *,
     deplot_command: str = "",
     deplot_timeout: int = 90,
+    table_source: str = "marker-first",
+    table_quality_gate: bool = True,
+    table_escalation: str = "auto",
+    table_escalation_max: int = 20,
+    table_qa_mode: str = "warn",
+    grobid_status: str = "ok",
 ) -> StructuredExportSummary:
     summary = StructuredExportSummary()
     pages_dir = doc_dir / "pages"
@@ -216,6 +455,16 @@ def build_structured_exports(
 
     table_rows: list[dict[str, Any]] = []
     figure_rows: list[dict[str, Any]] = []
+    fragments: list[TableFragment] = []
+    canonical_tables: list[dict[str, Any]] = []
+    qa_flags: list[QAFlag] = []
+
+    marker_tables_raw = doc_dir / "metadata" / "assets" / "structured" / "marker" / "tables_raw.jsonl"
+    if table_source == "marker-first" and marker_tables_raw.exists():
+        marker_rows = _load_jsonl(marker_tables_raw)
+        for idx, row in enumerate(marker_rows, start=1):
+            fragments.append(_normalize_fragment_from_marker(row, idx))
+        canonical_tables = _merge_table_fragments(fragments)
 
     for page_path in sorted(pages_dir.glob("*.md")):
         if not page_path.stem.isdigit():
@@ -223,7 +472,7 @@ def build_structured_exports(
         page_index = int(page_path.stem)
         markdown = page_path.read_text()
 
-        tables = extract_markdown_tables(markdown)
+        tables = [] if canonical_tables else extract_markdown_tables(markdown)
         for t_index, table in enumerate(tables, start=1):
             table_id = f"p{page_index:04d}_t{t_index:02d}"
             csv_path = tables_dir / f"{table_id}.csv"
@@ -270,6 +519,108 @@ def build_structured_exports(
                     summary.errors.append(message)
             figure_rows.append(entry)
             summary.figure_count += 1
+
+    if canonical_tables:
+        fragment_rows = []
+        for frag in fragments:
+            fragment_rows.append(
+                {
+                    "fragment_id": frag.fragment_id,
+                    "table_group_id": frag.table_group_id,
+                    "table_block_ids": frag.table_block_ids,
+                    "caption_block_id": frag.caption_block_id,
+                    "note_block_ids": frag.note_block_ids,
+                    "page": frag.page,
+                    "polygons": frag.polygons,
+                    "bbox": frag.bbox,
+                    "header_rows": frag.header_rows,
+                    "data_rows": frag.data_rows,
+                    "caption_text": frag.caption_text,
+                    "caption_confidence": frag.caption_confidence,
+                    "source_format": frag.source_format,
+                    "quality_metrics": frag.quality_metrics,
+                }
+            )
+        _write_jsonl(extracted_root / "table_fragments.jsonl", fragment_rows)
+        canonical_rows: list[dict[str, Any]] = []
+        for table in canonical_tables:
+            header = table.get("header_rows", [])
+            headers = list(header[0]) if header else []
+            rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
+            metrics = _quality_metrics(headers, rows)
+            if table_quality_gate and _fails_quality(metrics):
+                msg = f"{table.get('table_id')}: quality gate failed"
+                summary.errors.append(msg)
+                if table_escalation in {"auto", "always"} and table_escalation_max > 0:
+                    table_escalation_max -= 1
+            table["quality_metrics"] = metrics
+            canonical_rows.append(table)
+            csv_path = tables_dir / f"{table['table_id']}.csv"
+            _write_table_csv(csv_path, headers, rows)
+            json_path = tables_dir / f"{table['table_id']}.json"
+            json_payload = dict(table)
+            json_payload["csv_path"] = _portable_path(csv_path, doc_dir)
+            json_path.write_text(json.dumps(json_payload, indent=2, ensure_ascii=True))
+            table_rows.append(
+                {
+                    "table_id": table["table_id"],
+                    "page": min(table.get("pages", [1])),
+                    "caption": table.get("caption_text", ""),
+                    "headers": headers,
+                    "rows": rows,
+                    "csv_path": _portable_path(csv_path, doc_dir),
+                }
+            )
+            summary.table_count += 1
+        _write_jsonl(tables_dir / "canonical.jsonl", canonical_rows)
+
+        if table_qa_mode != "off":
+            grobid_tables_path = doc_dir / "metadata" / "assets" / "structured" / "grobid" / "figures_tables.jsonl"
+            grobid_tables = [row for row in _load_jsonl(grobid_tables_path) if str(row.get("type", "")).lower() == "table"]
+            if grobid_status != "ok":
+                qa_flags.append(
+                    QAFlag(
+                        flag_id=_stable_id("qa-skip", grobid_status),
+                        severity="info",
+                        type="qa_skipped",
+                        page=0,
+                        table_ref="*",
+                        details=f"grobid_status={grobid_status}",
+                    )
+                )
+            else:
+                qa_flags.extend(
+                    _reconcile_with_grobid(
+                        canonical_tables=canonical_tables,
+                        grobid_tables=grobid_tables,
+                    )
+                )
+        qa_rows = [
+            {
+                "flag_id": flag.flag_id,
+                "severity": flag.severity,
+                "type": flag.type,
+                "page": flag.page,
+                "table_ref": flag.table_ref,
+                "details": flag.details,
+            }
+            for flag in qa_flags
+        ]
+        qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa"
+        _write_jsonl(qa_root / "table_flags.jsonl", qa_rows)
+        (qa_root / "table_reconciliation.json").write_text(
+            json.dumps(
+                {
+                    "qa_mode": table_qa_mode,
+                    "marker_table_count": len(canonical_tables),
+                    "flag_count": len(qa_rows),
+                },
+                indent=2,
+                ensure_ascii=True,
+            )
+        )
+        if table_qa_mode == "strict" and any(flag.severity in {"warn", "error"} for flag in qa_flags):
+            raise RuntimeError("Table QA strict mode failed due to disagreements.")
 
     tables_jsonl = tables_dir / "manifest.jsonl"
     if table_rows:

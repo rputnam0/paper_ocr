@@ -8,9 +8,12 @@ import fitz
 
 from paper_ocr.inspect import TextHeuristics
 from paper_ocr.structured_extract import (
+    build_render_contract,
+    grobid_coords_to_px,
     is_structured_candidate_doc,
     normalize_markdown_for_llm,
     run_grobid_doc,
+    run_marker_doc,
     run_marker_page,
 )
 
@@ -347,3 +350,81 @@ def test_run_grobid_doc_extracts_figures_tables(monkeypatch, tmp_path: Path):
     assert figures_tables_path.exists()
     lines = [ln for ln in figures_tables_path.read_text().splitlines() if ln.strip()]
     assert len(lines) == 2
+
+
+def test_run_marker_doc_collects_artifacts(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    assets_root = tmp_path / "assets"
+
+    def _fake_run(cmd, check, env, stdout, stderr, timeout):  # noqa: ANN001
+        out_dir = Path(cmd[cmd.index("--output_dir") + 1]) if "--output_dir" in cmd else Path(cmd[-1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "doc.md").write_text("# Full doc\n")
+        (out_dir / "chunks.jsonl").write_text(json.dumps({"type": "Table", "page": 1, "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]]}) + "\n")
+        (out_dir / "doc.json").write_text(json.dumps({"pages": [{"page": 1, "width": 1000, "height": 1400}]}))
+        return 0
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    result = run_marker_doc(
+        pdf_path=pdf_path,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=assets_root,
+        profile="full_json",
+    )
+    assert result.success
+    assert Path(result.artifacts["full_document_markdown"]).exists()
+    assert Path(result.artifacts["chunks"]).exists()
+    assert Path(result.artifacts["raw_json"]).exists()
+    assert result.localization_page_status[1]["has_geometry"]
+
+
+def test_build_render_contract_and_grobid_coord_conversion():
+    contract = build_render_contract(
+        pdf_page_w_pt=612.0,
+        pdf_page_h_pt=792.0,
+        render_page_w_px=1700,
+        render_page_h_px=2200,
+        rotation_degrees=0,
+    )
+    assert contract["px_per_pt_x"] > 0
+    assert contract["px_per_pt_y"] > 0
+    coords = [{"page": 1, "x": 72.0, "y": 72.0, "w": 72.0, "h": 72.0}]
+    page_contracts = {1: contract}
+    px = grobid_coords_to_px(coords, page_contracts=page_contracts)
+    assert px[0]["x0"] >= 0
+    assert px[0]["y0"] >= 0
+    assert px[0]["x1"] > px[0]["x0"]
+    assert px[0]["y1"] > px[0]["y0"]
+
+
+def test_run_grobid_doc_includes_tei_coordinates_param(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    seen = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def read(self) -> bytes:
+            return b"<TEI xmlns='http://www.tei-c.org/ns/1.0'><text><body/></text></TEI>"
+
+    def _fake_urlopen(req, timeout):  # noqa: ANN001
+        seen["data"] = req.data.decode("utf-8", errors="replace")
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    out_tei = tmp_path / "assets" / "structured" / "grobid" / "fulltext.tei.xml"
+    run_grobid_doc(
+        pdf_path=pdf_path,
+        grobid_url="http://localhost:8070",
+        timeout=10,
+        tei_out_path=out_tei,
+    )
+    assert "teiCoordinates" in seen["data"]
+    assert "figure" in seen["data"]

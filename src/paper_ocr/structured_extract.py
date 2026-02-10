@@ -40,6 +40,15 @@ class GrobidResult:
     error: str = ""
 
 
+@dataclass
+class MarkerDocResult:
+    success: bool
+    markdown: str = ""
+    artifacts: dict[str, str] = field(default_factory=dict)
+    localization_page_status: dict[int, dict[str, Any]] = field(default_factory=dict)
+    error: str = ""
+
+
 def is_structured_candidate_doc(
     digital_structured: str,
     routes: list[str],
@@ -414,7 +423,278 @@ def _multipart_request(url: str, pdf_path: Path) -> request.Request:
         file_field="input",
         file_path=pdf_path,
         content_type="application/pdf",
+        form_fields={"teiCoordinates": "figure"},
     )
+
+
+def build_render_contract(
+    *,
+    pdf_page_w_pt: float,
+    pdf_page_h_pt: float,
+    render_page_w_px: int,
+    render_page_h_px: int,
+    rotation_degrees: int,
+) -> dict[str, Any]:
+    w_pt = max(float(pdf_page_w_pt), 1.0)
+    h_pt = max(float(pdf_page_h_pt), 1.0)
+    w_px = max(int(render_page_w_px), 1)
+    h_px = max(int(render_page_h_px), 1)
+    px_per_pt_x = w_px / w_pt
+    px_per_pt_y = h_px / h_pt
+    # Affine 2x3: x_px = a*x_pt + c*y_pt + e, y_px = b*x_pt + d*y_pt + f
+    # Default no-rotation mapping in top-left y-down render space.
+    pdf_to_px = [px_per_pt_x, 0.0, 0.0, px_per_pt_y, 0.0, 0.0]
+    px_to_pdf = [1.0 / px_per_pt_x, 0.0, 0.0, 1.0 / px_per_pt_y, 0.0, 0.0]
+    return {
+        "pdf_page_w_pt": w_pt,
+        "pdf_page_h_pt": h_pt,
+        "render_page_w_px": w_px,
+        "render_page_h_px": h_px,
+        "dpi": round(px_per_pt_x * 72, 4),
+        "px_per_pt_x": px_per_pt_x,
+        "px_per_pt_y": px_per_pt_y,
+        "origin_convention": "top_left",
+        "y_axis_direction": "down",
+        "rotation_degrees": int(rotation_degrees) % 360,
+        "pdf_to_px_transform": pdf_to_px,
+        "px_to_pdf_transform": px_to_pdf,
+    }
+
+
+def _apply_affine(x: float, y: float, matrix: list[float]) -> tuple[float, float]:
+    a, b, c, d, e, f = matrix
+    return (a * x + c * y + e, b * x + d * y + f)
+
+
+def grobid_coords_to_px(
+    coords: list[dict[str, Any]],
+    *,
+    page_contracts: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in coords:
+        page = int(item.get("page") or 0)
+        contract = page_contracts.get(page)
+        if contract is None:
+            continue
+        matrix = contract.get("pdf_to_px_transform")
+        if not isinstance(matrix, list) or len(matrix) != 6:
+            continue
+        try:
+            x = float(item.get("x", 0.0))
+            y = float(item.get("y", 0.0))
+            w = float(item.get("w", 0.0))
+            h = float(item.get("h", 0.0))
+        except Exception:
+            continue
+        x0, y0 = _apply_affine(x, y, matrix)
+        x1, y1 = _apply_affine(x + w, y + h, matrix)
+        out.append(
+            {
+                "page": page,
+                "x0": min(x0, x1),
+                "y0": min(y0, y1),
+                "x1": max(x0, x1),
+                "y1": max(y0, y1),
+            }
+        )
+    return out
+
+
+def _marker_doc_commands(
+    marker_command: str,
+    input_pdf: Path,
+    output_dir: Path,
+    profile: str,
+) -> list[list[str]]:
+    base = shlex.split(marker_command or "marker_single")
+    if not base:
+        base = ["marker_single"]
+    if "--disable_ocr" not in base and not any(arg.startswith("--disable_ocr=") for arg in base):
+        base = [*base, "--disable_ocr"]
+    output_format = "json" if profile == "full_json" else "markdown"
+    return [
+        [*base, str(input_pdf), "--output_dir", str(output_dir), "--output_format", output_format],
+        [*base, str(input_pdf), "--output_dir", str(output_dir)],
+        [*base, str(input_pdf), str(output_dir)],
+    ]
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    for line in path.read_text().splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def _has_geometry(block: dict[str, Any]) -> bool:
+    poly = block.get("polygon")
+    if isinstance(poly, list) and poly:
+        return True
+    bbox = block.get("bbox")
+    return isinstance(bbox, list) and len(bbox) >= 4
+
+
+def _collect_localization_status(block_rows: list[dict[str, Any]], page_count: int) -> dict[int, dict[str, Any]]:
+    status: dict[int, dict[str, Any]] = {}
+    for page in range(1, page_count + 1):
+        status[page] = {
+            "has_candidate": False,
+            "has_geometry": False,
+            "layout_fallback_required": False,
+        }
+    for row in block_rows:
+        page = int(row.get("page") or 0)
+        if page < 1 or page > page_count:
+            continue
+        typ = str(row.get("type", "")).lower()
+        if typ in {"table", "figure", "caption"}:
+            status[page]["has_candidate"] = True
+            if _has_geometry(row):
+                status[page]["has_geometry"] = True
+    for page in range(1, page_count + 1):
+        if status[page]["has_candidate"] and not status[page]["has_geometry"]:
+            status[page]["layout_fallback_required"] = True
+    return status
+
+
+def run_marker_doc(
+    pdf_path: Path,
+    marker_command: str,
+    timeout: int,
+    assets_root: Path,
+    profile: str = "full_json",
+    marker_url: str = "",
+) -> MarkerDocResult:
+    marker_root = assets_root / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["OCR_ENGINE"] = "None"
+    last_error = ""
+
+    with fitz.open(pdf_path) as doc:
+        page_count = int(doc.page_count)
+
+    with tempfile.TemporaryDirectory(prefix="paper_ocr_marker_doc_") as tmp:
+        tmp_dir = Path(tmp)
+        out_dir = tmp_dir / "out"
+
+        if str(marker_url).strip():
+            endpoint = marker_url.rstrip("/") + "/marker/upload"
+            req = _multipart_upload_request(
+                url=endpoint,
+                file_field="file",
+                file_path=pdf_path,
+                content_type="application/pdf",
+                form_fields={
+                    "output_format": "json" if profile == "full_json" else "markdown",
+                    "force_ocr": "false",
+                    "paginate_output": "true",
+                },
+            )
+            try:
+                with request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    payload = {}
+                md = _extract_marker_output(payload)
+                if md:
+                    (marker_root / "full_document.md").write_text(md)
+                (marker_root / "raw_service_payload.json").write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+                blocks = payload.get("chunks") or payload.get("blocks") or []
+                block_rows = [b for b in blocks if isinstance(b, dict)]
+                if block_rows:
+                    (marker_root / "blocks.jsonl").write_text(
+                        "\n".join(json.dumps(r, ensure_ascii=True) for r in block_rows) + "\n"
+                    )
+                status = _collect_localization_status(block_rows, page_count=page_count)
+                artifacts = {
+                    "full_document_markdown": str(marker_root / "full_document.md"),
+                    "raw_json": str(marker_root / "raw_service_payload.json"),
+                }
+                if (marker_root / "blocks.jsonl").exists():
+                    artifacts["blocks"] = str(marker_root / "blocks.jsonl")
+                return MarkerDocResult(success=True, markdown=md, artifacts=artifacts, localization_page_status=status)
+            except Exception as exc:  # noqa: BLE001
+                return MarkerDocResult(success=False, error=str(exc))
+
+        for cmd in _marker_doc_commands(marker_command, pdf_path, out_dir, profile):
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                continue
+
+            md_candidates = sorted(out_dir.rglob("*.md"))
+            markdown = md_candidates[0].read_text() if md_candidates else ""
+            if markdown:
+                shutil.copy2(md_candidates[0], marker_root / "full_document.md")
+
+            json_candidates = sorted(out_dir.rglob("*.json"))
+            raw_json_path = marker_root / "raw_doc.json"
+            if json_candidates:
+                shutil.copy2(json_candidates[0], raw_json_path)
+
+            chunk_candidates = sorted(out_dir.rglob("*chunks*.jsonl"))
+            block_rows: list[dict[str, Any]] = []
+            if chunk_candidates:
+                dst_chunks = marker_root / "chunks.jsonl"
+                shutil.copy2(chunk_candidates[0], dst_chunks)
+                block_rows = _read_jsonl(dst_chunks)
+            if not block_rows and json_candidates:
+                try:
+                    loaded = json.loads(json_candidates[0].read_text())
+                except Exception:
+                    loaded = {}
+                if isinstance(loaded, dict):
+                    possible = loaded.get("chunks") or loaded.get("blocks") or loaded.get("items") or []
+                    block_rows = [p for p in possible if isinstance(p, dict)]
+                    if block_rows:
+                        (marker_root / "blocks.jsonl").write_text(
+                            "\n".join(json.dumps(r, ensure_ascii=True) for r in block_rows) + "\n"
+                        )
+            if not (marker_root / "blocks.jsonl").exists() and block_rows:
+                (marker_root / "blocks.jsonl").write_text(
+                    "\n".join(json.dumps(r, ensure_ascii=True) for r in block_rows) + "\n"
+                )
+
+            artifacts: dict[str, str] = {}
+            if (marker_root / "full_document.md").exists():
+                artifacts["full_document_markdown"] = str(marker_root / "full_document.md")
+            if raw_json_path.exists():
+                artifacts["raw_json"] = str(raw_json_path)
+            if (marker_root / "chunks.jsonl").exists():
+                artifacts["chunks"] = str(marker_root / "chunks.jsonl")
+            if (marker_root / "blocks.jsonl").exists():
+                artifacts["blocks"] = str(marker_root / "blocks.jsonl")
+
+            status = _collect_localization_status(block_rows, page_count=page_count)
+            return MarkerDocResult(
+                success=True,
+                markdown=markdown,
+                artifacts=artifacts,
+                localization_page_status=status,
+            )
+
+    return MarkerDocResult(success=False, error=last_error or "Marker document extraction failed.")
 
 
 def _tei_text(el: ET.Element | None) -> str:

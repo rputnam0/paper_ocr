@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -40,11 +41,15 @@ from .schemas import new_manifest
 from .store import ensure_dirs, write_json, write_text
 from .structured_data import build_structured_exports
 from .structured_extract import (
+    build_render_contract,
+    grobid_coords_to_px,
     is_structured_candidate_doc,
     normalize_markdown_for_llm,
     run_grobid_doc,
+    run_marker_doc,
     run_marker_page,
 )
+from .table_eval import evaluate_table_pipeline
 from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
 METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
@@ -142,6 +147,44 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("PAPER_OCR_DEPLOT_TIMEOUT", DEPLOT_TIMEOUT_DEFAULT)),
     )
+    run.add_argument(
+        "--marker-localize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run Marker document-level localization artifacts for all PDFs (default: enabled).",
+    )
+    run.add_argument(
+        "--marker-localize-profile",
+        choices=["localize_only", "full_json"],
+        default="full_json",
+    )
+    run.add_argument(
+        "--layout-fallback",
+        choices=["none", "surya"],
+        default="surya",
+        help="Fallback layout detector for pages where Marker localization lacks geometry.",
+    )
+    run.add_argument(
+        "--table-source",
+        choices=["marker-first", "markdown-only"],
+        default="marker-first",
+    )
+    run.add_argument(
+        "--table-quality-gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    run.add_argument(
+        "--table-escalation",
+        choices=["off", "auto", "always"],
+        default="auto",
+    )
+    run.add_argument("--table-escalation-max", type=int, default=20)
+    run.add_argument(
+        "--table-qa-mode",
+        choices=["off", "warn", "strict"],
+        default="warn",
+    )
 
     fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")
     fetch.add_argument("doi_csv", type=Path)
@@ -173,6 +216,34 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("PAPER_OCR_DEPLOT_TIMEOUT", DEPLOT_TIMEOUT_DEFAULT)),
     )
+    export.add_argument(
+        "--table-source",
+        choices=["marker-first", "markdown-only"],
+        default="marker-first",
+    )
+    export.add_argument(
+        "--table-quality-gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    export.add_argument(
+        "--table-escalation",
+        choices=["off", "auto", "always"],
+        default="auto",
+    )
+    export.add_argument("--table-escalation-max", type=int, default=20)
+    export.add_argument(
+        "--table-qa-mode",
+        choices=["off", "warn", "strict"],
+        default="warn",
+    )
+
+    eval_tables = sub.add_parser(
+        "eval-table-pipeline",
+        help="Evaluate table extraction quality against a gold set.",
+    )
+    eval_tables.add_argument("gold_dir", type=Path)
+    eval_tables.add_argument("pred_dir", type=Path)
 
     audit = sub.add_parser("data-audit", help="Validate data/ folder organization contract")
     audit.add_argument("data_dir", type=Path, nargs="?", default=Path("data"))
@@ -417,6 +488,18 @@ def _collect_page_signals(doc: fitz.Document, mode: str) -> list[tuple[Any, str]
         route = decide_route(heuristics, mode=mode)
         signals.append((heuristics, route))
     return signals
+
+
+def _render_dims_for_route(page_width_pt: float, page_height_pt: float, route: str, max_dim: int = 1288) -> tuple[int, int]:
+    dpi = 200 if route == "anchored" else 300
+    w = max(int(round(page_width_pt * dpi / 72.0)), 1)
+    h = max(int(round(page_height_pt * dpi / 72.0)), 1)
+    longest = max(w, h)
+    if longest > max_dim:
+        scale = max_dim / float(longest)
+        w = max(int(round(w * scale)), 1)
+        h = max(int(round(h * scale)), 1)
+    return w, h
 
 
 async def _process_page_structured(
@@ -700,6 +783,18 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         page_signals = _collect_page_signals(doc, args.mode) if page_count > 0 else []
         routes = [route for _, route in page_signals]
         heuristics_by_page = [heuristics for heuristics, _ in page_signals]
+        page_contracts: dict[int, dict[str, Any]] = {}
+        for page_index in range(page_count):
+            page = doc.load_page(page_index)
+            route = routes[page_index] if routes else "unanchored"
+            render_w, render_h = _render_dims_for_route(float(page.rect.width), float(page.rect.height), route)
+            page_contracts[page_index + 1] = build_render_contract(
+                pdf_page_w_pt=float(page.rect.width),
+                pdf_page_h_pt=float(page.rect.height),
+                render_page_w_px=render_w,
+                render_page_h_px=render_h,
+                rotation_degrees=0,
+            )
         structured_enabled = is_structured_candidate_doc(
             digital_structured,
             routes,
@@ -766,11 +861,34 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                     grobid_used = True
                     grobid_sections = grobid_result.sections
                     grobid_figures_tables_count = len(grobid_result.figures_tables)
+                    for row in grobid_result.figures_tables:
+                        coords = row.get("coords")
+                        if isinstance(coords, list):
+                            row["coords_px"] = grobid_coords_to_px(coords, page_contracts=page_contracts)
                     bibliography = _merge_bibliography_with_patch(bibliography, grobid_result.bibliography_patch)
                 else:
                     grobid_error = grobid_result.error
             doc_dir = _final_doc_dir(args, pdf_path, bibliography)
             final_dirs = ensure_dirs(doc_dir)
+            marker_localization = {"enabled": bool(getattr(args, "marker_localize", True))}
+            if bool(getattr(args, "marker_localize", True)):
+                marker_doc = await asyncio.to_thread(
+                    run_marker_doc,
+                    pdf_path,
+                    marker_command,
+                    marker_timeout,
+                    final_dirs["assets"],
+                    str(getattr(args, "marker_localize_profile", "full_json")),
+                    marker_url,
+                )
+                marker_localization.update(
+                    {
+                        "success": marker_doc.success,
+                        "error": marker_doc.error,
+                        "artifacts": marker_doc.artifacts,
+                        "localization_page_status": marker_doc.localization_page_status,
+                    }
+                )
             first_page = _move_first_page_artifacts(first_page, dirs, final_dirs, args.debug)
             src_tei = dirs["assets"] / "structured" / "grobid" / "fulltext.tei.xml"
             if src_tei.exists():
@@ -789,6 +907,25 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             }
             doc_dir = _final_doc_dir(args, pdf_path, bibliography)
             final_dirs = ensure_dirs(doc_dir)
+            marker_localization = {"enabled": bool(getattr(args, "marker_localize", True))}
+            if bool(getattr(args, "marker_localize", True)):
+                marker_doc = await asyncio.to_thread(
+                    run_marker_doc,
+                    pdf_path,
+                    marker_command,
+                    marker_timeout,
+                    final_dirs["assets"],
+                    str(getattr(args, "marker_localize_profile", "full_json")),
+                    marker_url,
+                )
+                marker_localization.update(
+                    {
+                        "success": marker_doc.success,
+                        "error": marker_doc.error,
+                        "artifacts": marker_doc.artifacts,
+                        "localization_page_status": marker_doc.localization_page_status,
+                    }
+                )
 
         tasks = [_process_one_page(i, final_dirs) for i in range(1, page_count)]
 
@@ -807,10 +944,25 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "grobid_figures_tables_count": grobid_figures_tables_count,
             "fallback_count": fallback_count,
             "structured_page_count": structured_page_count,
+            "marker_localization": marker_localization,
         }
         if grobid_error:
             structured_manifest["grobid_error"] = grobid_error
         manifest["structured_extraction"] = structured_manifest
+        manifest["render_contract"] = {str(k): v for k, v in page_contracts.items()}
+        marker_cfg_hash = hashlib.sha1(
+            f"{marker_command}|{marker_url}|{getattr(args, 'marker_localize_profile', 'full_json')}".encode("utf-8")
+        ).hexdigest()
+        runtime = manifest.get("runtime", {}) if isinstance(manifest.get("runtime", {}), dict) else {}
+        runtime.update(
+            {
+                "pipeline_version": "v2-table-pipeline",
+                "marker_version": str(marker_localization.get("artifacts", {}).get("raw_json", "")),
+                "marker_config_hash": marker_cfg_hash,
+                "grobid_version": "unknown",
+            }
+        )
+        manifest["runtime"] = runtime
 
         write_json(final_dirs["metadata"] / "manifest.json", manifest)
         write_json(final_dirs["metadata"] / "bibliography.json", bibliography)
@@ -878,6 +1030,12 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                     doc_dir=doc_dir,
                     deplot_command=deplot_command,
                     deplot_timeout=deplot_timeout,
+                    table_source=str(getattr(args, "table_source", "marker-first")),
+                    table_quality_gate=bool(getattr(args, "table_quality_gate", True)),
+                    table_escalation=str(getattr(args, "table_escalation", "auto")),
+                    table_escalation_max=int(getattr(args, "table_escalation_max", 20)),
+                    table_qa_mode=str(getattr(args, "table_qa_mode", "warn")),
+                    grobid_status="ok" if grobid_used else ("error" if grobid_error else "missing"),
                 )
                 structured_data_manifest.update(
                     {
@@ -891,6 +1049,23 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             except Exception as exc:  # noqa: BLE001
                 structured_data_manifest["errors"] = [str(exc)]
         manifest["structured_data_extraction"] = structured_data_manifest
+        qa_flags_path = final_dirs["assets"] / "structured" / "extracted" / "qa" / "table_flags.jsonl"
+        if not qa_flags_path.exists():
+            qa_flags_path = final_dirs["assets"] / "structured" / "qa" / "table_flags.jsonl"
+        qa_flag_count = 0
+        if qa_flags_path.exists():
+            qa_flag_count = len([ln for ln in qa_flags_path.read_text().splitlines() if ln.strip()])
+        manifest["table_pipeline"] = {
+            "enabled": structured_data_enabled,
+            "marker_localized": bool(marker_localization.get("success")),
+            "qa_mode": str(getattr(args, "table_qa_mode", "warn")),
+            "qa_flags": qa_flag_count,
+        }
+        manifest["table_qa"] = {
+            "mode": str(getattr(args, "table_qa_mode", "warn")),
+            "status": "ok" if qa_flag_count == 0 else "flags",
+            "qa_skipped_reason": "" if grobid_used else ("grobid_error" if grobid_error else "grobid_not_run"),
+        }
         manifest["discovery"] = discovery
         write_json(final_dirs["metadata"] / "manifest.json", manifest)
 
@@ -1013,6 +1188,11 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 doc_dir=doc_dir,
                 deplot_command=str(getattr(args, "deplot_command", "") or ""),
                 deplot_timeout=int(getattr(args, "deplot_timeout", int(DEPLOT_TIMEOUT_DEFAULT))),
+                table_source=str(getattr(args, "table_source", "marker-first")),
+                table_quality_gate=bool(getattr(args, "table_quality_gate", True)),
+                table_escalation=str(getattr(args, "table_escalation", "auto")),
+                table_escalation_max=int(getattr(args, "table_escalation_max", 20)),
+                table_qa_mode=str(getattr(args, "table_qa_mode", "warn")),
             )
             structured_data_manifest: dict[str, Any] = {
                 "enabled": True,
@@ -1067,6 +1247,12 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
     return totals
 
 
+def _run_eval_table_pipeline(args: argparse.Namespace) -> dict[str, Any]:
+    metrics = evaluate_table_pipeline(args.gold_dir, args.pred_dir)
+    print(json.dumps(metrics, indent=2))
+    return metrics
+
+
 def _run_data_audit(args: argparse.Namespace) -> dict[str, Any]:
     report = run_data_audit(args.data_dir)
     payload = report.to_dict()
@@ -1090,6 +1276,8 @@ def main() -> None:
         _run_export_structured_data(args)
     elif args.command == "data-audit":
         _run_data_audit(args)
+    elif args.command == "eval-table-pipeline":
+        _run_eval_table_pipeline(args)
 
 
 if __name__ == "__main__":

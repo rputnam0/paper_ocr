@@ -146,3 +146,72 @@ def test_build_structured_exports_cleans_stale_artifacts_on_rerun(tmp_path: Path
     assert not stale_path.exists()
     table_dir = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables"
     assert not (table_dir / "p0001_t01.csv").exists()
+
+
+def test_build_structured_exports_prefers_marker_tables_raw(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text(
+        "\n".join(
+            [
+                "| Wrong | Table |",
+                "| --- | --- |",
+                "| X | 1 |",
+            ]
+        )
+    )
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1", "b2"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["Polymer", "Value"]],
+        "data_rows": [["A", "10"], ["B", "12"]],
+        "caption_text": "Table 1: Marker data",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 1
+    canonical = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "canonical.jsonl"
+    rows = [json.loads(line) for line in canonical.read_text().splitlines() if line.strip()]
+    assert rows[0]["caption_text"] == "Table 1: Marker data"
+    assert rows[0]["source_format"] == "html"
+
+
+def test_build_structured_exports_writes_qa_flags_for_grobid_disagreement(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text("No markdown tables\n")
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["Polymer", "Value"]],
+        "data_rows": [["A", "10"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+    grobid_root = doc_dir / "metadata" / "assets" / "structured" / "grobid"
+    grobid_root.mkdir(parents=True, exist_ok=True)
+    grobid_rec = {"doc_id": "doc", "type": "table", "label": "Table 2", "page": 3, "coords": []}
+    (grobid_root / "figures_tables.jsonl").write_text(json.dumps(grobid_rec) + "\n")
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_qa_mode="warn",
+    )
+    assert summary.table_count == 1
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] in {"count_mismatch", "page_mismatch", "caption_number_mismatch"} for flag in flags)
