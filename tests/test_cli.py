@@ -156,6 +156,30 @@ def test_run_structured_defaults(monkeypatch):
     assert args.grobid_timeout == 60
     assert args.structured_max_workers == 4
     assert args.structured_asset_level == "standard"
+    assert args.extract_structured_data is True
+    assert args.deplot_command == ""
+    assert args.deplot_timeout == 90
+
+
+def test_run_structured_export_overrides(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "run",
+            "data/in",
+            "out",
+            "--no-extract-structured-data",
+            "--deplot-command",
+            "deplot-cli --image {image}",
+            "--deplot-timeout",
+            "30",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.extract_structured_data is False
+    assert args.deplot_command == "deplot-cli --image {image}"
+    assert args.deplot_timeout == 30
 
 
 def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
