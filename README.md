@@ -83,6 +83,27 @@ PAPER_OCR_MARKER_TIMEOUT=120
 PAPER_OCR_GROBID_TIMEOUT=60
 ```
 
+## Repository Organization
+
+Keep generated artifacts out of project root and use explicit contracts:
+
+- `data/corpora/<slug>/source_pdfs/`: curated source PDFs grouped by corpus/topic.
+- `data/jobs/<job_slug>/`: ingestion job folders with `input/`, `pdfs/`, `reports/`, optional `ocr_out/`, optional `logs/`.
+- `data/archive/`: old runs and legacy layouts kept for traceability.
+- `data/cache/`: disposable caches.
+- `data/tmp/`: ephemeral scratch.
+- `input/`: local CSV inputs (gitignored).
+- `out/`: canonical OCR output target when chosen by CLI invocation.
+- `docs/`: design/architecture/operation docs (tracked).
+
+Audit layout any time with:
+
+```bash
+uv run paper-ocr data-audit data --strict
+```
+
+Detailed contract reference: `docs/data_layout_contract.md`.
+
 ## CLI Overview
 
 ### 1) OCR existing PDFs
@@ -114,6 +135,14 @@ Core options:
 - `--extract-structured-data` / `--no-extract-structured-data` (default: enabled)
 - `--deplot-command` optional external command with `{image}` placeholder
 - `--deplot-timeout` default `90`
+- `--marker-localize` / `--no-marker-localize` default enabled
+- `--marker-localize-profile localize_only|full_json` default `full_json`
+- `--layout-fallback none|surya` default `surya`
+- `--table-source marker-first|markdown-only` default `marker-first`
+- `--table-quality-gate` / `--no-table-quality-gate` default enabled
+- `--table-escalation off|auto|always` default `auto`
+- `--table-escalation-max` default `20`
+- `--table-qa-mode off|warn|strict` default `warn`
 
 ### 2) Fetch PDFs from DOI CSV via Telegram bot
 
@@ -123,7 +152,7 @@ uv run paper-ocr fetch-telegram <doi_csv> [output_root] [options]
 
 Arguments:
 - `doi_csv`: CSV with DOI column
-- `output_root`: default `data/telegram_jobs`
+- `output_root`: default `data/jobs`
 
 Fetch options:
 - `--doi-column` default `DOI`
@@ -137,6 +166,9 @@ Fetch options:
 - `--report-file` override report path
 - `--failed-file` override failed-report path
 
+Compatibility note:
+- Legacy jobs under `data/telegram_jobs/<job_slug>/` are auto-migrated to `data/jobs/<job_slug>/` when using the default `output_root`.
+
 ### 3) Export structured data from existing OCR outputs
 
 ```bash
@@ -146,6 +178,11 @@ uv run paper-ocr export-structured-data <ocr_out_dir> [options]
 Options:
 - `--deplot-command` optional external command with `{image}` placeholder
 - `--deplot-timeout` default `90`
+- `--table-source marker-first|markdown-only` default `marker-first`
+- `--table-quality-gate` / `--no-table-quality-gate` default enabled
+- `--table-escalation off|auto|always` default `auto`
+- `--table-escalation-max` default `20`
+- `--table-qa-mode off|warn|strict` default `warn`
 
 This command scans existing OCR document folders, regenerates:
 - `metadata/assets/structured/extracted/tables/*`
@@ -153,18 +190,38 @@ This command scans existing OCR document folders, regenerates:
 
 and updates each document manifest with `structured_data_extraction`.
 
+### 4) Audit data layout contract
+
+```bash
+uv run paper-ocr data-audit [data_dir] [--strict] [--json]
+```
+
+Behavior:
+- validates top-level `data/` contract (`corpora/jobs/cache/archive/tmp`)
+- validates job and corpus folder conventions
+- flags misplaced PDFs
+- `--strict` returns non-zero on errors
+
+### 5) Evaluate table pipeline against gold set
+
+```bash
+uv run paper-ocr eval-table-pipeline <gold_dir> <pred_dir>
+```
+
+This command reports baseline table detection metrics (precision/recall) using page-level matching.
+
 ## Recommended Workflows
 
 ### Workflow A: Local PDF folder -> OCR
 
 ```bash
-uv run paper-ocr run data/LISA out
+uv run paper-ocr run data/corpora/lisa/source_pdfs out
 ```
 
 ### Workflow A2: Born-digital structured extraction with optional GROBID
 
 ```bash
-uv run paper-ocr run data/LISA out \
+uv run paper-ocr run data/corpora/lisa/source_pdfs out \
   --digital-structured auto \
   --structured-backend hybrid \
   --marker-url http://<marker-host>:8008 \
@@ -177,6 +234,66 @@ Notes:
 - Marker supports both command mode (`--marker-command`) and service mode (`--marker-url`).
 - Marker OCR is forced off by default in command mode (`--disable_ocr` is auto-added and `OCR_ENGINE=None` is set).
 - If GROBID is unavailable, run continues without TEI enrichment.
+
+## Routing Semantics (Two "Auto" Modes)
+
+There are two independent auto decisions:
+
+1. Page route auto (`--mode auto`):
+- decides per page: `anchored` or `unanchored`.
+- this is prompt routing for OCR/text pipeline internals.
+
+2. Document route auto (`--digital-structured auto`):
+- decides once per document whether to attempt Marker structured extraction first.
+- eligibility requires:
+  - at least 60% pages pass `is_structured_page_candidate`
+    (clean digital text layer, but less strict than `text_only`, so table/math-heavy pages are included),
+  - and either:
+    - first page is auto-routed `anchored`, or
+    - if first page is not auto-routed `anchored`, at least 70% of body pages pass `is_structured_page_candidate`.
+- Structured eligibility always uses auto-derived route signals, even if OCR route mode is forced with `--mode anchored|unanchored`.
+
+Execution flow in plain terms:
+
+- If document is structured-eligible:
+  - attempt Marker per page (`structured_ok` on success).
+  - if Marker fails for a page: fallback for that page (`structured_fallback`), then continue through normal page pipeline.
+- If document is not structured-eligible:
+  - use normal page pipeline directly.
+
+Normal page pipeline outcomes:
+- `text_only`: born-digital page with strong text layer; no DeepInfra OCR call.
+- `ok`: OCR call path succeeded.
+- `skipped`: existing output reused (unless `--force`).
+
+Structured page outcomes:
+- `structured_ok`: Marker output written for that page.
+- `structured_fallback`: Marker failed, page handled by normal pipeline.
+
+## Marker-First Table Pipeline
+
+The table pipeline now runs Marker localization artifacts for all PDFs by default and uses Marker outputs as the first extraction source.
+
+Order of operations:
+1. Extract page/document markdown via existing OCR/text flow.
+2. Run Marker document localization (`full_document.md`, chunks/blocks/json artifacts).
+3. Parse table fragments from Marker artifacts first.
+4. Fallback to markdown table parsing only when Marker table fragments are unavailable.
+5. Run quality gates and selective escalation for low-quality table fragments.
+6. Compare against GROBID table index and emit QA flags (`warn` by default).
+
+Coordinate normalization:
+- Canonical internal space is render pixel coordinates (`top_left`, `y-down`).
+- Manifest stores per-page transforms:
+  - `pdf_page_w_pt`, `pdf_page_h_pt`
+  - `render_page_w_px`, `render_page_h_px`
+  - `px_per_pt_x`, `px_per_pt_y`
+  - `pdf_to_px_transform`, `px_to_pdf_transform`
+- GROBID coordinates are transformed into pixel-space before QA matching.
+
+See:
+- `docs/table_extraction_pipeline.md`
+- `docs/table_qa_metrics.md`
 
 ### Service Mode (General)
 
@@ -209,7 +326,7 @@ uv run paper-ocr fetch-telegram input/papers.csv
 3. OCR fetched PDFs:
 
 ```bash
-uv run paper-ocr run data/telegram_jobs/papers/pdfs data/telegram_jobs/papers/ocr_out
+uv run paper-ocr run data/jobs/papers/pdfs data/jobs/papers/ocr_out
 ```
 
 ## Telegram Job Layout
@@ -217,7 +334,7 @@ uv run paper-ocr run data/telegram_jobs/papers/pdfs data/telegram_jobs/papers/oc
 For `input/papers.csv` (CSV stem = `papers`):
 
 ```text
-data/telegram_jobs/papers/
+data/jobs/papers/
   input/
     papers.csv
   pdfs/
@@ -284,6 +401,9 @@ Behavior notes:
 - `manifest.json` includes a `structured_extraction` block with `enabled`, `backend`, `grobid_used`, `fallback_count`, and `structured_page_count`.
 - `metadata/assets/structured/grobid/figures_tables.jsonl` provides a GROBID-derived figure/table index with labels, captions, page, and coords for QA/fallback targeting.
 - `manifest.json` includes `structured_data_extraction` with table/figure/deplot counts and extraction errors.
+- `metadata/assets/structured/marker/full_document.md`, `chunks.jsonl`, and `blocks.jsonl` provide Marker localization artifacts.
+- `metadata/assets/structured/extracted/table_fragments.jsonl` and `tables/canonical.jsonl` capture table fragment lineage and merged canonical tables.
+- `metadata/assets/structured/qa/table_flags.jsonl` captures Marker-vs-GROBID QA disagreements and low-confidence joins.
 - Figure records are resolved against Marker page asset folders, making embedded figure files addressable for downstream ML extraction.
 
 ## Development

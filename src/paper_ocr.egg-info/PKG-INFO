@@ -35,12 +35,12 @@ uv run paper-ocr fetch-telegram input/papers.csv
 ```
 2. Run OCR on the fetched PDFs:
 ```bash
-uv run paper-ocr run data/telegram_jobs/papers/pdfs data/telegram_jobs/papers/ocr_out
+uv run paper-ocr run data/jobs/papers/pdfs data/jobs/papers/ocr_out
 ```
 
 Folder layout for a CSV named `papers.csv` (job folder uses CSV stem):
 ```
-data/telegram_jobs/papers/
+data/jobs/papers/
   input/
     papers.csv
   pdfs/

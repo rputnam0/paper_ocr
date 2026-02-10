@@ -27,4 +27,27 @@ def new_manifest(
         "prompt_version": prompt_version,
         "created_at": utc_now_iso(),
         "pages": [],
+        "render_contract": {},
+        "runtime": {
+            "pipeline_version": "v2-table-pipeline",
+            "marker_version": "",
+            "marker_config_hash": "",
+            "grobid_version": "",
+        },
+        "table_pipeline": {
+            "enabled": False,
+            "marker_localized": False,
+            "qa_mode": "warn",
+            "qa_flags": 0,
+        },
+        "table_quality": {
+            "empty_cell_ratio_threshold": 0.35,
+            "repeated_text_ratio_threshold": 0.45,
+            "column_instability_ratio_threshold": 0.20,
+        },
+        "table_qa": {
+            "mode": "warn",
+            "status": "not_run",
+            "qa_skipped_reason": "",
+        },
     }

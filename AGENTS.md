@@ -93,6 +93,22 @@ out/<input_parent>/<author_year>/
 - When changing routing heuristics or rendering settings, update tests accordingly.
 - If adding new dependencies, update `pyproject.toml` and ensure `uv sync` remains clean.
 - Avoid committing secrets or API keys; rely on `.env` and `.gitignore`.
+- Keep generated datasets and run artifacts under `data/`, not in repository root.
+
+## Repository Folder Contracts
+- `data/corpora/<slug>/source_pdfs/`: canonical source PDFs by topic/corpus.
+- `data/jobs/<job_slug>/`: pipeline jobs with required `input/`, `pdfs/`, `reports/`; optional `ocr_out/`, `logs/`.
+- `data/archive/`: legacy outputs and historical runs.
+- `data/cache/`: disposable cache-only artifacts.
+- `data/tmp/`: transient scratch.
+- `input/`: local CSV intake only.
+- `out/`: generated OCR outputs only.
+- `docs/`: tracked documentation/specs only.
+- `src/`: production code only.
+- `tests/`: automated tests only.
+
+Validation command:
+- `uv run paper-ocr data-audit data --strict`
 
 ## Remote Service Guidance (Marker/GROBID)
 - Prefer service URLs for heavy structured extraction when running from low-resource clients.
@@ -108,3 +124,10 @@ out/<input_parent>/<author_year>/
   - GROBID: `GET <grobid_url>/api/isalive`
 - If services are remote, agents may use SSH local forwarding to bind remote service ports to localhost, then pass localhost URLs to CLI options/env vars.
 - Marker OCR must remain disabled by default; do not remove no-OCR safeguards in structured extraction path.
+
+## Table Pipeline Guardrails
+- Keep table extraction `marker-first`; markdown table parsing is fallback only.
+- Preserve canonical coordinate normalization (PDF-space to render-pixel transforms) before QA matching.
+- Do not compare raw GROBID coordinates directly against marker/crop pixel coordinates.
+- GROBID is a QA comparator, not a hard dependency; gate disagreement flags when GROBID parse quality is invalid.
+- Preserve fragment lineage (`fragment_id`, block IDs, page, polygons) and merged canonical table outputs.
