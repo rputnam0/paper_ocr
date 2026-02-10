@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import hashlib
+from html import unescape
+from html.parser import HTMLParser
 import json
 import re
 import shlex
@@ -272,6 +274,63 @@ def _extract_table_number(caption: str) -> str:
     return match.group(1).strip().lower()
 
 
+class _HTMLTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_tr = False
+        self.in_cell = False
+        self.cell_tag = ""
+        self.cell_buf: list[str] = []
+        self.row_cells: list[tuple[str, str]] = []
+        self.header_rows: list[list[str]] = []
+        self.data_rows: list[list[str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        if t == "tr":
+            self.in_tr = True
+            self.row_cells = []
+            return
+        if t in {"th", "td"} and self.in_tr:
+            self.in_cell = True
+            self.cell_tag = t
+            self.cell_buf = []
+            return
+        if t == "br" and self.in_cell:
+            self.cell_buf.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in {"th", "td"} and self.in_cell:
+            text = unescape("".join(self.cell_buf)).strip()
+            self.row_cells.append((self.cell_tag, text))
+            self.in_cell = False
+            self.cell_tag = ""
+            self.cell_buf = []
+            return
+        if t == "tr" and self.in_tr:
+            if self.row_cells:
+                tags = [k for k, _ in self.row_cells]
+                vals = [v for _, v in self.row_cells]
+                if all(k == "th" for k in tags):
+                    self.header_rows.append(vals)
+                else:
+                    self.data_rows.append(vals)
+            self.in_tr = False
+            self.row_cells = []
+
+    def handle_data(self, data: str) -> None:
+        if self.in_cell:
+            self.cell_buf.append(data)
+
+
+def _parse_html_table_rows(table_html: str) -> tuple[list[list[str]], list[list[str]]]:
+    parser = _HTMLTableParser()
+    parser.feed(str(table_html or ""))
+    parser.close()
+    return parser.header_rows, parser.data_rows
+
+
 def _normalize_fragment_from_marker(row: dict[str, Any], index: int) -> TableFragment:
     page = int(row.get("page") or 1)
     polygons = row.get("polygons")
@@ -283,6 +342,12 @@ def _normalize_fragment_from_marker(row: dict[str, Any], index: int) -> TableFra
     data_rows = row.get("data_rows")
     if not isinstance(data_rows, list):
         data_rows = []
+    if not header_rows and not data_rows:
+        html_table = str(row.get("html_table", "") or row.get("html", "") or "")
+        if "<table" in html_table.lower():
+            parsed_headers, parsed_rows = _parse_html_table_rows(html_table)
+            header_rows = parsed_headers
+            data_rows = parsed_rows
     caption_text = str(row.get("caption_text", "") or "")
     raw_group_id = str(row.get("table_group_id", "") or "").strip()
     table_group_id = raw_group_id or f"group_{page}_{index}"

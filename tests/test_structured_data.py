@@ -183,6 +183,35 @@ def test_build_structured_exports_prefers_marker_tables_raw(tmp_path: Path):
     assert rows[0]["source_format"] == "html"
 
 
+def test_build_structured_exports_parses_html_when_marker_row_has_no_grid(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "caption_text": "Table 1: HTML-only",
+        "html_table": (
+            "<table><thead><tr><th>Condition</th><th>\u03c4 (Pa)</th></tr></thead>"
+            "<tbody><tr><td>A</td><td>12.0 \u00b1 0.2</td></tr></tbody></table>"
+        ),
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 1
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first_row = json.loads(table_manifest.read_text().splitlines()[0])
+    csv_path = doc_dir / first_row["csv_path"]
+    csv_text = csv_path.read_text()
+    assert "Condition,\u03c4 (Pa)" in csv_text
+    assert "A,12.0 \u00b1 0.2" in csv_text
+
+
 def test_build_structured_exports_writes_qa_flags_for_grobid_disagreement(tmp_path: Path):
     doc_dir = tmp_path / "Doe_2024"
     pages_dir = doc_dir / "pages"
