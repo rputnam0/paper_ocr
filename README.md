@@ -135,6 +135,14 @@ Core options:
 - `--extract-structured-data` / `--no-extract-structured-data` (default: enabled)
 - `--deplot-command` optional external command with `{image}` placeholder
 - `--deplot-timeout` default `90`
+- `--marker-localize` / `--no-marker-localize` default enabled
+- `--marker-localize-profile localize_only|full_json` default `full_json`
+- `--layout-fallback none|surya` default `surya`
+- `--table-source marker-first|markdown-only` default `marker-first`
+- `--table-quality-gate` / `--no-table-quality-gate` default enabled
+- `--table-escalation off|auto|always` default `auto`
+- `--table-escalation-max` default `20`
+- `--table-qa-mode off|warn|strict` default `warn`
 
 ### 2) Fetch PDFs from DOI CSV via Telegram bot
 
@@ -167,6 +175,11 @@ uv run paper-ocr export-structured-data <ocr_out_dir> [options]
 Options:
 - `--deplot-command` optional external command with `{image}` placeholder
 - `--deplot-timeout` default `90`
+- `--table-source marker-first|markdown-only` default `marker-first`
+- `--table-quality-gate` / `--no-table-quality-gate` default enabled
+- `--table-escalation off|auto|always` default `auto`
+- `--table-escalation-max` default `20`
+- `--table-qa-mode off|warn|strict` default `warn`
 
 This command scans existing OCR document folders, regenerates:
 - `metadata/assets/structured/extracted/tables/*`
@@ -185,6 +198,14 @@ Behavior:
 - validates job and corpus folder conventions
 - flags misplaced PDFs
 - `--strict` returns non-zero on errors
+
+### 5) Evaluate table pipeline against gold set
+
+```bash
+uv run paper-ocr eval-table-pipeline <gold_dir> <pred_dir>
+```
+
+This command reports baseline table detection metrics (precision/recall) using page-level matching.
 
 ## Recommended Workflows
 
@@ -245,6 +266,31 @@ Normal page pipeline outcomes:
 Structured page outcomes:
 - `structured_ok`: Marker output written for that page.
 - `structured_fallback`: Marker failed, page handled by normal pipeline.
+
+## Marker-First Table Pipeline
+
+The table pipeline now runs Marker localization artifacts for all PDFs by default and uses Marker outputs as the first extraction source.
+
+Order of operations:
+1. Extract page/document markdown via existing OCR/text flow.
+2. Run Marker document localization (`full_document.md`, chunks/blocks/json artifacts).
+3. Parse table fragments from Marker artifacts first.
+4. Fallback to markdown table parsing only when Marker table fragments are unavailable.
+5. Run quality gates and selective escalation for low-quality table fragments.
+6. Compare against GROBID table index and emit QA flags (`warn` by default).
+
+Coordinate normalization:
+- Canonical internal space is render pixel coordinates (`top_left`, `y-down`).
+- Manifest stores per-page transforms:
+  - `pdf_page_w_pt`, `pdf_page_h_pt`
+  - `render_page_w_px`, `render_page_h_px`
+  - `px_per_pt_x`, `px_per_pt_y`
+  - `pdf_to_px_transform`, `px_to_pdf_transform`
+- GROBID coordinates are transformed into pixel-space before QA matching.
+
+See:
+- `docs/table_extraction_pipeline.md`
+- `docs/table_qa_metrics.md`
 
 ### Service Mode (General)
 
@@ -352,6 +398,9 @@ Behavior notes:
 - `manifest.json` includes a `structured_extraction` block with `enabled`, `backend`, `grobid_used`, `fallback_count`, and `structured_page_count`.
 - `metadata/assets/structured/grobid/figures_tables.jsonl` provides a GROBID-derived figure/table index with labels, captions, page, and coords for QA/fallback targeting.
 - `manifest.json` includes `structured_data_extraction` with table/figure/deplot counts and extraction errors.
+- `metadata/assets/structured/marker/full_document.md`, `chunks.jsonl`, and `blocks.jsonl` provide Marker localization artifacts.
+- `metadata/assets/structured/extracted/table_fragments.jsonl` and `tables/canonical.jsonl` capture table fragment lineage and merged canonical tables.
+- `metadata/assets/structured/qa/table_flags.jsonl` captures Marker-vs-GROBID QA disagreements and low-confidence joins.
 - Figure records are resolved against Marker page asset folders, making embedded figure files addressable for downstream ML extraction.
 
 ## Development

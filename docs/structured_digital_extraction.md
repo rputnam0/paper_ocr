@@ -20,6 +20,16 @@ Also produce machine-readable table/figure artifacts for downstream analytics.
 
 `is_structured_page_candidate` is intentionally broader than `is_text_only_candidate` so table-heavy and equation-heavy born-digital pages remain eligible for Marker.
 
+### Marker Localization for All PDFs
+
+- Marker localization is now a document-level step that can run for all PDFs (`--marker-localize` default enabled), including scanned PDFs.
+- This localization pass writes full-document artifacts used by downstream table parsing:
+  - `metadata/assets/structured/marker/full_document.md`
+  - `metadata/assets/structured/marker/chunks.jsonl`
+  - `metadata/assets/structured/marker/blocks.jsonl`
+  - `metadata/assets/structured/marker/raw_doc.json`
+- Marker OCR remains disabled by default. If localization lacks geometry on candidate pages and `--layout-fallback surya` is set, layout fallback is triggered.
+
 ### Important: Two Independent Auto Decisions
 
 - `--mode auto` is page-level route selection (`anchored` vs `unanchored`).
@@ -58,6 +68,7 @@ Also produce machine-readable table/figure artifacts for downstream analytics.
   - `page`
   - `coords[]` entries parsed from TEI coordinate strings (`page,x,y,w,h`)
 - GROBID failures are non-fatal and do not stop OCR.
+- When geometry QA is enabled, GROBID is requested with `teiCoordinates=figure` and transformed into canonical pixel space before comparison.
 
 ## Output Contract
 
@@ -77,11 +88,15 @@ New structured artifacts are additive:
 - `metadata/assets/structured/grobid/fulltext.tei.xml`
 - `metadata/assets/structured/grobid/figures_tables.jsonl`
 - `metadata/assets/structured/extracted/manifest.json`
+- `metadata/assets/structured/extracted/table_fragments.jsonl`
+- `metadata/assets/structured/extracted/tables/canonical.jsonl`
 - `metadata/assets/structured/extracted/tables/manifest.jsonl`
 - `metadata/assets/structured/extracted/tables/p0001_t01.csv`
 - `metadata/assets/structured/extracted/tables/p0001_t01.json`
 - `metadata/assets/structured/extracted/figures/manifest.jsonl`
 - `metadata/assets/structured/extracted/figures/deplot/p0001_f01.json` (optional)
+- `metadata/assets/structured/qa/table_reconciliation.json`
+- `metadata/assets/structured/qa/table_flags.jsonl`
 
 Manifest includes:
 
@@ -126,6 +141,10 @@ Page entries may include:
 - Structured extraction never blocks run completion.
 - Any page-level failure automatically uses the existing pipeline.
 - If `--digital-structured off`, behavior is effectively unchanged from prior OCR flow.
+- GROBID disagreement handling is mode-driven:
+  - `off`: skip QA flags
+  - `warn`: write flags and continue
+  - `strict`: fail the document after writing diagnostics
 
 ## Configuration
 
