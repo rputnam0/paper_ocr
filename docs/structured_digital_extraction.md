@@ -3,6 +3,7 @@
 ## Goal
 
 Improve markdown quality for born-digital PDFs by using a structure-aware extractor path while keeping existing OCR behavior and outputs backward-compatible.
+Also produce machine-readable table/figure artifacts for downstream analytics.
 
 ## Design
 
@@ -52,6 +53,12 @@ New structured artifacts are additive:
 - `metadata/assets/structured/marker/page_0001.json`
 - `metadata/assets/structured/marker/page_0001_assets/*`
 - `metadata/assets/structured/grobid/fulltext.tei.xml`
+- `metadata/assets/structured/extracted/manifest.json`
+- `metadata/assets/structured/extracted/tables/manifest.jsonl`
+- `metadata/assets/structured/extracted/tables/p0001_t01.csv`
+- `metadata/assets/structured/extracted/tables/p0001_t01.json`
+- `metadata/assets/structured/extracted/figures/manifest.jsonl`
+- `metadata/assets/structured/extracted/figures/deplot/p0001_f01.json` (optional)
 
 Manifest includes:
 
@@ -63,6 +70,21 @@ Manifest includes:
     "grobid_used": true,
     "fallback_count": 2,
     "structured_page_count": 14
+  }
+}
+```
+
+And:
+
+```json
+{
+  "structured_data_extraction": {
+    "enabled": true,
+    "table_count": 6,
+    "figure_count": 12,
+    "deplot_count": 4,
+    "unresolved_figure_count": 1,
+    "errors": []
   }
 }
 ```
@@ -99,6 +121,9 @@ CLI options:
 - `--grobid-timeout <sec>`
 - `--structured-max-workers <n>`
 - `--structured-asset-level standard|full`
+- `--extract-structured-data/--no-extract-structured-data`
+- `--deplot-command "<cmd with {image}>"`
+- `--deplot-timeout <sec>`
 
 ## Recommended WSL GROBID Setup
 

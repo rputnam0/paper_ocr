@@ -7,6 +7,7 @@ import pytest
 
 from paper_ocr import cli
 from paper_ocr.inspect import TextHeuristics
+from paper_ocr.structured_data import StructuredExportSummary
 from paper_ocr.structured_extract import StructuredPageResult
 
 
@@ -115,6 +116,69 @@ def test_parse_fetch_telegram_defaults(monkeypatch):
     assert args.search_timeout == 40
 
 
+def test_parse_export_structured_data_args(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "export-structured-data",
+            "out",
+            "--deplot-command",
+            "deplot-cli --image {image}",
+            "--deplot-timeout",
+            "45",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "export-structured-data"
+    assert args.ocr_out_dir == Path("out")
+    assert args.deplot_command == "deplot-cli --image {image}"
+    assert args.deplot_timeout == 45
+
+
+def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path):
+    root = tmp_path / "out"
+    doc_dir = root / "group" / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    (doc_dir / "metadata").mkdir(parents=True)
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    manifest_path.write_text(json.dumps({"doc_id": "abc"}))
+
+    monkeypatch.setattr(
+        cli,
+        "build_structured_exports",
+        lambda **kwargs: StructuredExportSummary(
+            table_count=2,
+            figure_count=3,
+            deplot_count=1,
+            unresolved_figure_count=0,
+            errors=[],
+        ),
+    )
+
+    args = argparse.Namespace(
+        ocr_out_dir=root,
+        deplot_command="deplot-cli --image {image}",
+        deplot_timeout=30,
+    )
+    result = cli._run_export_structured_data(args)
+    assert result["docs_processed"] == 1
+    payload = json.loads(manifest_path.read_text())
+    assert payload["structured_data_extraction"]["table_count"] == 2
+    assert payload["structured_data_extraction"]["figure_count"] == 3
+
+
+def test_run_export_structured_data_requires_docs(tmp_path: Path):
+    args = argparse.Namespace(
+        ocr_out_dir=tmp_path / "empty_out",
+        deplot_command="",
+        deplot_timeout=90,
+    )
+    args.ocr_out_dir.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(SystemExit, match="No OCR document folders found"):
+        cli._run_export_structured_data(args)
+
+
 def test_run_text_only_enabled_by_default(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -156,6 +220,30 @@ def test_run_structured_defaults(monkeypatch):
     assert args.grobid_timeout == 60
     assert args.structured_max_workers == 4
     assert args.structured_asset_level == "standard"
+    assert args.extract_structured_data is True
+    assert args.deplot_command == ""
+    assert args.deplot_timeout == 90
+
+
+def test_run_structured_export_overrides(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "run",
+            "data/in",
+            "out",
+            "--no-extract-structured-data",
+            "--deplot-command",
+            "deplot-cli --image {image}",
+            "--deplot-timeout",
+            "30",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.extract_structured_data is False
+    assert args.deplot_command == "deplot-cli --image {image}"
+    assert args.deplot_timeout == 30
 
 
 def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):

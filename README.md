@@ -11,6 +11,7 @@ The pipeline is optimized for technical papers and produces per-paper Markdown, 
 - Routes each page through anchored or unanchored prompting based on text-layer heuristics.
 - Supports text-only extraction when high-quality text layers are available.
 - Supports structured born-digital extraction via external Marker (OCR disabled) with fallback to existing OCR/text paths.
+- Exports machine-readable table/figure artifacts from markdown and Marker assets for downstream data pipelines.
 - Renders pages with OCR-safe sizing constraints.
 - Parses model YAML front matter and writes normalized page outputs.
 - Extracts bibliography metadata from first-page content.
@@ -29,6 +30,7 @@ The pipeline is optimized for technical papers and produces per-paper Markdown, 
 7. **Document Assembly**: merge pages, produce `document.jsonl`, write consolidated markdown.
 8. **Metadata Enrichment**: extract bibliography + discovery JSON.
 9. **Store**: emit deterministic output bundle + group readmes.
+10. **Structured Data Export**: parse markdown tables/figures into JSON/CSV and optionally run a DePlot-compatible command on figure images.
 
 Telegram DOI fetch is a pre-ingest source step that fills a PDF job folder used by OCR.
 
@@ -107,6 +109,9 @@ Core options:
 - `--grobid-timeout` default `60`
 - `--structured-max-workers` default `4`
 - `--structured-asset-level standard|full` default `standard`
+- `--extract-structured-data` / `--no-extract-structured-data` (default: enabled)
+- `--deplot-command` optional external command with `{image}` placeholder
+- `--deplot-timeout` default `90`
 
 ### 2) Fetch PDFs from DOI CSV via Telegram bot
 
@@ -130,6 +135,22 @@ Fetch options:
 - `--report-file` override report path
 - `--failed-file` override failed-report path
 
+### 3) Export structured data from existing OCR outputs
+
+```bash
+uv run paper-ocr export-structured-data <ocr_out_dir> [options]
+```
+
+Options:
+- `--deplot-command` optional external command with `{image}` placeholder
+- `--deplot-timeout` default `90`
+
+This command scans existing OCR document folders, regenerates:
+- `metadata/assets/structured/extracted/tables/*`
+- `metadata/assets/structured/extracted/figures/*`
+
+and updates each document manifest with `structured_data_extraction`.
+
 ## Recommended Workflows
 
 ### Workflow A: Local PDF folder -> OCR
@@ -145,7 +166,8 @@ uv run paper-ocr run data/LISA out \
   --digital-structured auto \
   --structured-backend hybrid \
   --marker-command marker_single \
-  --grobid-url http://<wsl-host>:8070
+  --grobid-url http://<wsl-host>:8070 \
+  --deplot-command "deplot-cli --image {image}"
 ```
 
 Notes:
@@ -224,6 +246,16 @@ out/<input_parent_folder>/<author_year>/
           page_0001_assets/
         grobid/
           fulltext.tei.xml
+        extracted/
+          manifest.json
+          tables/
+            manifest.jsonl
+            p0001_t01.csv
+            p0001_t01.json
+          figures/
+            manifest.jsonl
+            deplot/
+              p0001_f01.json
     debug/
 ```
 
@@ -232,6 +264,8 @@ Behavior notes:
 - Consolidated markdown filename is derived from extracted title.
 - Group-level readmes are generated for folder-level discoverability.
 - `manifest.json` includes a `structured_extraction` block with `enabled`, `backend`, `grobid_used`, `fallback_count`, and `structured_page_count`.
+- `manifest.json` includes `structured_data_extraction` with table/figure/deplot counts and extraction errors.
+- Figure records are resolved against Marker page asset folders, making embedded figure files addressable for downstream ML extraction.
 
 ## Development
 
