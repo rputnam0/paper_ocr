@@ -145,7 +145,7 @@ def _parse_args() -> argparse.Namespace:
 
     fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")
     fetch.add_argument("doi_csv", type=Path)
-    fetch.add_argument("output_root", type=Path, nargs="?", default=Path("data/telegram_jobs"))
+    fetch.add_argument("output_root", type=Path, nargs="?", default=Path("data/jobs"))
     fetch.add_argument("--doi-column", type=str, default="DOI")
     fetch.add_argument("--target-bot", type=str, default=os.getenv("TARGET_BOT", ""))
     fetch.add_argument("--session-name", type=str, default="nexus_session")

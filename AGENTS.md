@@ -93,7 +93,22 @@ out/<input_parent>/<author_year>/
 - When changing routing heuristics or rendering settings, update tests accordingly.
 - If adding new dependencies, update `pyproject.toml` and ensure `uv sync` remains clean.
 - Avoid committing secrets or API keys; rely on `.env` and `.gitignore`.
-- Keep generated datasets and run artifacts under `data/` (for example `data/telegram_jobs/` or `data/local_runs/`), not in repository root.
+- Keep generated datasets and run artifacts under `data/`, not in repository root.
+
+## Repository Folder Contracts
+- `data/corpora/<slug>/source_pdfs/`: canonical source PDFs by topic/corpus.
+- `data/jobs/<job_slug>/`: pipeline jobs with required `input/`, `pdfs/`, `reports/`; optional `ocr_out/`, `logs/`.
+- `data/archive/`: legacy outputs and historical runs.
+- `data/cache/`: disposable cache-only artifacts.
+- `data/tmp/`: transient scratch.
+- `input/`: local CSV intake only.
+- `out/`: generated OCR outputs only.
+- `docs/`: tracked documentation/specs only.
+- `src/`: production code only.
+- `tests/`: automated tests only.
+
+Validation command:
+- `uv run paper-ocr data-audit data --strict`
 
 ## Remote Service Guidance (Marker/GROBID)
 - Prefer service URLs for heavy structured extraction when running from low-resource clients.

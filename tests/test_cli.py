@@ -110,6 +110,7 @@ def test_parse_fetch_telegram_defaults(monkeypatch):
 
     args = cli._parse_args()
 
+    assert args.output_root == Path("data/jobs")
     assert args.min_delay == 4.0
     assert args.max_delay == 8.0
     assert args.response_timeout == 15

@@ -85,14 +85,24 @@ PAPER_OCR_GROBID_TIMEOUT=60
 
 ## Repository Organization
 
-Keep generated artifacts out of project root.
+Keep generated artifacts out of project root and use explicit contracts:
 
+- `data/corpora/<slug>/source_pdfs/`: curated source PDFs grouped by corpus/topic.
+- `data/jobs/<job_slug>/`: ingestion job folders with `input/`, `pdfs/`, `reports/`, optional `ocr_out/`, optional `logs/`.
+- `data/archive/`: old runs and legacy layouts kept for traceability.
+- `data/cache/`: disposable caches.
+- `data/tmp/`: ephemeral scratch.
 - `input/`: local CSV inputs (gitignored).
-- `data/telegram_jobs/`: DOI fetch job folders (`input/`, `pdfs/`, reports, and optional `ocr_out/`).
-- `data/local_runs/`: ad-hoc local run outputs and experiments.
-- `out/`: canonical OCR output target when you explicitly choose it in CLI examples.
+- `out/`: canonical OCR output target when chosen by CLI invocation.
+- `docs/`: design/architecture/operation docs (tracked).
 
-If older runs created root-level output folders, move them under `data/local_runs/root_outputs/` so the repository stays navigable.
+Audit layout any time with:
+
+```bash
+uv run paper-ocr data-audit data --strict
+```
+
+Detailed contract reference: `docs/data_layout_contract.md`.
 
 ## CLI Overview
 
@@ -134,7 +144,7 @@ uv run paper-ocr fetch-telegram <doi_csv> [output_root] [options]
 
 Arguments:
 - `doi_csv`: CSV with DOI column
-- `output_root`: default `data/telegram_jobs`
+- `output_root`: default `data/jobs`
 
 Fetch options:
 - `--doi-column` default `DOI`
@@ -164,18 +174,30 @@ This command scans existing OCR document folders, regenerates:
 
 and updates each document manifest with `structured_data_extraction`.
 
+### 4) Audit data layout contract
+
+```bash
+uv run paper-ocr data-audit [data_dir] [--strict] [--json]
+```
+
+Behavior:
+- validates top-level `data/` contract (`corpora/jobs/cache/archive/tmp`)
+- validates job and corpus folder conventions
+- flags misplaced PDFs
+- `--strict` returns non-zero on errors
+
 ## Recommended Workflows
 
 ### Workflow A: Local PDF folder -> OCR
 
 ```bash
-uv run paper-ocr run data/LISA out
+uv run paper-ocr run data/corpora/lisa/source_pdfs out
 ```
 
 ### Workflow A2: Born-digital structured extraction with optional GROBID
 
 ```bash
-uv run paper-ocr run data/LISA out \
+uv run paper-ocr run data/corpora/lisa/source_pdfs out \
   --digital-structured auto \
   --structured-backend hybrid \
   --marker-url http://<marker-host>:8008 \
@@ -220,7 +242,7 @@ uv run paper-ocr fetch-telegram input/papers.csv
 3. OCR fetched PDFs:
 
 ```bash
-uv run paper-ocr run data/telegram_jobs/papers/pdfs data/telegram_jobs/papers/ocr_out
+uv run paper-ocr run data/jobs/papers/pdfs data/jobs/papers/ocr_out
 ```
 
 ## Telegram Job Layout
@@ -228,7 +250,7 @@ uv run paper-ocr run data/telegram_jobs/papers/pdfs data/telegram_jobs/papers/oc
 For `input/papers.csv` (CSV stem = `papers`):
 
 ```text
-data/telegram_jobs/papers/
+data/jobs/papers/
   input/
     papers.csv
   pdfs/
