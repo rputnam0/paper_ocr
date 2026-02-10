@@ -358,7 +358,7 @@ def test_build_structured_exports_merges_ocr_symbols_into_marker_tables(tmp_path
         "caption_block_id": "c1",
         "page": 1,
         "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
-        "header_rows": [["Model", "Equation"]],
+        "header_rows": [["Model", "delta_D (MPa)1/2"]],
         "data_rows": [["Power law", "eta = a g^(n-1)"]],
         "caption_text": "Table 1",
     }
@@ -368,7 +368,7 @@ def test_build_structured_exports_merges_ocr_symbols_into_marker_tables(tmp_path
     ocr_dir.mkdir(parents=True, exist_ok=True)
     (ocr_dir / "table_01_page_0001.md").write_text(
         (
-            "<table><tr><th>Model</th><th>Equation</th></tr>"
+            "<table><tr><th>Model</th><th>\\( \\delta_D \\) (MPa)<sup>1/2</sup></th></tr>"
             "<tr><td>Power law</td><td>\u03b7 = a\u03b3^(n-1)</td></tr></table>"
         )
     )
@@ -385,7 +385,8 @@ def test_build_structured_exports_merges_ocr_symbols_into_marker_tables(tmp_path
     first_row = json.loads(table_manifest.read_text().splitlines()[0])
     csv_path = doc_dir / first_row["csv_path"]
     csv_text = csv_path.read_text()
-    assert "\u03b7 = a\u03b3^(n-1)" in csv_text
+    assert "δ_D (MPa)1/2" in csv_text
+    assert "eta = a g^(n-1)" in csv_text
 
     merge_report = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_ocr_merge.json"
     assert merge_report.exists()
@@ -399,7 +400,7 @@ def test_build_structured_exports_merges_ocr_symbols_into_markdown_tables(tmp_pa
         "\n".join(
             [
                 "Table 1: Model",
-                "| Model | Equation |",
+                "| Model | delta_D (MPa)1/2 |",
                 "| --- | --- |",
                 "| Power law | eta = a g^(n-1) |",
             ]
@@ -410,7 +411,7 @@ def test_build_structured_exports_merges_ocr_symbols_into_markdown_tables(tmp_pa
     ocr_dir.mkdir(parents=True, exist_ok=True)
     (ocr_dir / "table_01_page_0001.md").write_text(
         (
-            "<table><tr><th>Model</th><th>Equation</th></tr>"
+            "<table><tr><th>Model</th><th>\\( \\delta_D \\) (MPa)<sup>1/2</sup></th></tr>"
             "<tr><td>Power law</td><td>\u03b7 = a\u03b3^(n-1)</td></tr></table>"
         )
     )
@@ -426,4 +427,5 @@ def test_build_structured_exports_merges_ocr_symbols_into_markdown_tables(tmp_pa
 
     csv_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.csv"
     csv_text = csv_path.read_text()
-    assert "\u03b7 = a\u03b3^(n-1)" in csv_text
+    assert "δ_D (MPa)1/2" in csv_text
+    assert "eta = a g^(n-1)" in csv_text

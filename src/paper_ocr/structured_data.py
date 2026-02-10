@@ -18,6 +18,34 @@ from typing import Any
 FIGURE_MD_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 OCR_TABLE_FILE_RE = re.compile(r"table_(\d+)_page_(\d+)\.md$", re.IGNORECASE)
 SYMBOL_CHAR_RE = re.compile(r"[^\x00-\x7F]|[±≤≥≈×÷°µμδΔητσγβαΩω]")
+LATEX_GREEK_MAP = {
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "eta": "η",
+    "theta": "θ",
+    "kappa": "κ",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "pi": "π",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "phi": "φ",
+    "psi": "ψ",
+    "omega": "ω",
+    "Gamma": "Γ",
+    "Delta": "Δ",
+    "Theta": "Θ",
+    "Lambda": "Λ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Phi": "Φ",
+    "Psi": "Ψ",
+    "Omega": "Ω",
+}
 
 
 @dataclass
@@ -506,6 +534,13 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def _normalize_cell_text(value: str) -> str:
     text = str(value or "")
+    text = text.replace("\\(", " ").replace("\\)", " ").replace("$", " ")
+    text = re.sub(
+        r"\\([A-Za-z]+)",
+        lambda m: LATEX_GREEK_MAP.get(m.group(1), m.group(0)),
+        text,
+    )
+    text = text.replace("{", "").replace("}", "")
     text = text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
     return " ".join(text.split())
 
@@ -608,6 +643,8 @@ def _patch_table_grid(
     marker_rows: list[list[str]],
     ocr_headers: list[str],
     ocr_rows: list[list[str]],
+    *,
+    merge_scope: str,
 ) -> tuple[list[str], list[list[str]], int, dict[str, int]]:
     headers = list(marker_headers)
     rows = [list(row) for row in marker_rows]
@@ -622,23 +659,24 @@ def _patch_table_grid(
             patch_count += 1
             patch_reasons[reason] = patch_reasons.get(reason, 0) + 1
 
-    max_rows = min(len(rows), len(ocr_rows))
-    for row_idx in range(max_rows):
-        marker_row_sig = _alnum_signature(" ".join(str(cell) for cell in rows[row_idx]))
-        ocr_row_sig = _alnum_signature(" ".join(str(cell) for cell in ocr_rows[row_idx]))
-        row_similarity = SequenceMatcher(None, marker_row_sig, ocr_row_sig).ratio() if (marker_row_sig or ocr_row_sig) else 1.0
-        allow_empty_fill = row_similarity >= 0.90
-        max_cols = min(len(rows[row_idx]), len(ocr_rows[row_idx]))
-        for col_idx in range(max_cols):
-            merged, reason = _cell_patch_decision(
-                rows[row_idx][col_idx],
-                ocr_rows[row_idx][col_idx],
-                allow_empty_fill=allow_empty_fill,
-            )
-            if reason:
-                rows[row_idx][col_idx] = merged
-                patch_count += 1
-                patch_reasons[reason] = patch_reasons.get(reason, 0) + 1
+    if merge_scope == "full":
+        max_rows = min(len(rows), len(ocr_rows))
+        for row_idx in range(max_rows):
+            marker_row_sig = _alnum_signature(" ".join(str(cell) for cell in rows[row_idx]))
+            ocr_row_sig = _alnum_signature(" ".join(str(cell) for cell in ocr_rows[row_idx]))
+            row_similarity = SequenceMatcher(None, marker_row_sig, ocr_row_sig).ratio() if (marker_row_sig or ocr_row_sig) else 1.0
+            allow_empty_fill = row_similarity >= 0.90
+            max_cols = min(len(rows[row_idx]), len(ocr_rows[row_idx]))
+            for col_idx in range(max_cols):
+                merged, reason = _cell_patch_decision(
+                    rows[row_idx][col_idx],
+                    ocr_rows[row_idx][col_idx],
+                    allow_empty_fill=allow_empty_fill,
+                )
+                if reason:
+                    rows[row_idx][col_idx] = merged
+                    patch_count += 1
+                    patch_reasons[reason] = patch_reasons.get(reason, 0) + 1
     return headers, rows, patch_count, patch_reasons
 
 
@@ -647,6 +685,7 @@ def _merge_marker_tables_with_ocr_html(
     canonical_tables: list[dict[str, Any]],
     doc_dir: Path,
     ocr_html_dir: Path | None = None,
+    merge_scope: str = "header",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa"
     qa_root.mkdir(parents=True, exist_ok=True)
@@ -729,6 +768,7 @@ def _merge_marker_tables_with_ocr_html(
                 marker_rows=marker_rows,
                 ocr_headers=ocr_headers,
                 ocr_rows=ocr_rows,
+                merge_scope=merge_scope,
             )
 
             table["header_rows"] = [marker_headers] if marker_headers else []
@@ -769,6 +809,7 @@ def _merge_marker_tables_with_ocr_html(
 
     payload = {
         "enabled": True,
+        "merge_scope": merge_scope,
         "tables_considered": len(canonical_tables),
         "tables_matched": tables_matched,
         "tables_patched": tables_patched,
@@ -955,6 +996,7 @@ def build_structured_exports(
     deplot_timeout: int = 90,
     table_source: str = "marker-first",
     table_ocr_merge: bool = True,
+    table_ocr_merge_scope: str = "header",
     ocr_html_dir: Path | None = None,
     table_quality_gate: bool = True,
     table_escalation: str = "auto",
@@ -1003,6 +1045,7 @@ def build_structured_exports(
                 canonical_tables=canonical_tables,
                 doc_dir=doc_dir,
                 ocr_html_dir=ocr_html_dir,
+                merge_scope=table_ocr_merge_scope,
             )
             summary.ocr_merge = merge_summary
 
@@ -1029,6 +1072,7 @@ def build_structured_exports(
                         marker_rows=rows,
                         ocr_headers=ocr_headers,
                         ocr_rows=ocr_rows,
+                        merge_scope=table_ocr_merge_scope,
                     )
                     if patched_cells:
                         markdown_tables_patched += 1
@@ -1211,6 +1255,7 @@ def build_structured_exports(
         qa_root.mkdir(parents=True, exist_ok=True)
         merge_payload = {
             "enabled": True,
+            "merge_scope": table_ocr_merge_scope,
             "tables_considered": len(table_rows),
             "tables_matched": markdown_tables_matched,
             "tables_patched": markdown_tables_patched,

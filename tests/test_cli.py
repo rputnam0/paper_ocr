@@ -153,6 +153,7 @@ def test_parse_run_table_pipeline_defaults(monkeypatch):
     assert args.layout_fallback == "surya"
     assert args.table_source == "marker-first"
     assert args.table_ocr_merge is True
+    assert args.table_ocr_merge_scope == "header"
     assert args.table_quality_gate is True
     assert args.table_escalation == "auto"
     assert args.table_escalation_max == 20
@@ -177,6 +178,8 @@ def test_parse_export_table_pipeline_options(monkeypatch):
             "--table-escalation-max",
             "3",
             "--no-table-ocr-merge",
+            "--table-ocr-merge-scope",
+            "full",
         ],
     )
     args = cli._parse_args()
@@ -185,6 +188,7 @@ def test_parse_export_table_pipeline_options(monkeypatch):
     assert args.table_escalation == "always"
     assert args.table_escalation_max == 3
     assert args.table_ocr_merge is False
+    assert args.table_ocr_merge_scope == "full"
     assert args.compare_ocr_html is False
     assert args.ocr_html_dir is None
 
@@ -203,6 +207,7 @@ def test_parse_export_table_comparison_options(monkeypatch):
     )
     args = cli._parse_args()
     assert args.table_ocr_merge is True
+    assert args.table_ocr_merge_scope == "header"
     assert args.compare_ocr_html is True
     assert args.ocr_html_dir == Path("custom/ocr_html")
 
@@ -295,6 +300,7 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
         deplot_timeout=30,
         table_source="marker-first",
         table_ocr_merge=True,
+        table_ocr_merge_scope="header",
         ocr_html_dir=None,
         table_quality_gate=True,
         table_escalation="auto",
@@ -309,6 +315,7 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
     assert payload["structured_data_extraction"]["figure_count"] == 3
     assert payload["structured_data_extraction"]["ocr_html_comparison"]["tables_compared"] == 2
     assert seen_kwargs["table_ocr_merge"] is True
+    assert seen_kwargs["table_ocr_merge_scope"] == "header"
     assert seen_kwargs["ocr_html_dir"] is None
     assert seen_kwargs["grobid_status"] == "unknown"
 
@@ -334,6 +341,7 @@ def test_run_export_structured_data_passes_grobid_ok_when_manifest_records_usage
         deplot_timeout=30,
         table_source="marker-first",
         table_ocr_merge=True,
+        table_ocr_merge_scope="header",
         ocr_html_dir=None,
         table_quality_gate=True,
         table_escalation="auto",
@@ -350,6 +358,7 @@ def test_run_export_structured_data_requires_docs(tmp_path: Path):
         deplot_command="",
         deplot_timeout=90,
         table_ocr_merge=True,
+        table_ocr_merge_scope="header",
         ocr_html_dir=None,
     )
     args.ocr_out_dir.mkdir(parents=True, exist_ok=True)

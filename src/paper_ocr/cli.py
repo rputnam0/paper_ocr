@@ -179,6 +179,12 @@ def _parse_args() -> argparse.Namespace:
         help="Deterministically merge OCR HTML table cells into Marker tables to recover symbols/formatting.",
     )
     run.add_argument(
+        "--table-ocr-merge-scope",
+        choices=["header", "full"],
+        default="header",
+        help="Merge OCR data into table headers only (default) or full table grid.",
+    )
+    run.add_argument(
         "--table-quality-gate",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -247,6 +253,12 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Deterministically merge OCR HTML table cells into Marker tables to recover symbols/formatting.",
+    )
+    export.add_argument(
+        "--table-ocr-merge-scope",
+        choices=["header", "full"],
+        default="header",
+        help="Merge OCR data into table headers only (default) or full table grid.",
     )
     export.add_argument(
         "--table-quality-gate",
@@ -1118,6 +1130,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                     deplot_timeout=deplot_timeout,
                     table_source=str(getattr(args, "table_source", "marker-first")),
                     table_ocr_merge=bool(getattr(args, "table_ocr_merge", True)),
+                    table_ocr_merge_scope=str(getattr(args, "table_ocr_merge_scope", "header")),
                     ocr_html_dir=getattr(args, "ocr_html_dir", None),
                     table_quality_gate=bool(getattr(args, "table_quality_gate", True)),
                     table_escalation=str(getattr(args, "table_escalation", "auto")),
@@ -1307,6 +1320,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 deplot_timeout=int(getattr(args, "deplot_timeout", int(DEPLOT_TIMEOUT_DEFAULT))),
                 table_source=str(getattr(args, "table_source", "marker-first")),
                 table_ocr_merge=bool(getattr(args, "table_ocr_merge", True)),
+                table_ocr_merge_scope=str(getattr(args, "table_ocr_merge_scope", "header")),
                 ocr_html_dir=getattr(args, "ocr_html_dir", None),
                 table_quality_gate=bool(getattr(args, "table_quality_gate", True)),
                 table_escalation=str(getattr(args, "table_escalation", "auto")),
