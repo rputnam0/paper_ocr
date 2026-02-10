@@ -211,6 +211,38 @@ Notes:
 - Marker OCR is forced off by default in command mode (`--disable_ocr` is auto-added and `OCR_ENGINE=None` is set).
 - If GROBID is unavailable, run continues without TEI enrichment.
 
+## Routing Semantics (Two "Auto" Modes)
+
+There are two independent auto decisions:
+
+1. Page route auto (`--mode auto`):
+- decides per page: `anchored` or `unanchored`.
+- this is prompt routing for OCR/text pipeline internals.
+
+2. Document route auto (`--digital-structured auto`):
+- decides once per document whether to attempt Marker structured extraction first.
+- eligibility requires:
+  - first page routed `anchored`,
+  - at least 70% pages `anchored`,
+  - at least 60% pages pass `is_text_only_candidate`.
+
+Execution flow in plain terms:
+
+- If document is structured-eligible:
+  - attempt Marker per page (`structured_ok` on success).
+  - if Marker fails for a page: fallback for that page (`structured_fallback`), then continue through normal page pipeline.
+- If document is not structured-eligible:
+  - use normal page pipeline directly.
+
+Normal page pipeline outcomes:
+- `text_only`: born-digital page with strong text layer; no DeepInfra OCR call.
+- `ok`: OCR call path succeeded.
+- `skipped`: existing output reused (unless `--force`).
+
+Structured page outcomes:
+- `structured_ok`: Marker output written for that page.
+- `structured_fallback`: Marker failed, page handled by normal pipeline.
+
 ### Service Mode (General)
 
 You can run Marker and GROBID as independent services (local or remote) and point `paper-ocr` at their URLs.

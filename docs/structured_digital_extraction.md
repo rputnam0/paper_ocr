@@ -16,6 +16,14 @@ Also produce machine-readable table/figure artifacts for downstream analytics.
   - at least 60% pages satisfy `is_text_only_candidate`,
   - first page routes to `anchored`.
 
+### Important: Two Independent Auto Decisions
+
+- `--mode auto` is page-level route selection (`anchored` vs `unanchored`).
+- `--digital-structured auto` is document-level structured eligibility.
+- These are intentionally independent:
+  - a doc can be non-eligible for structured mode but still have some `text_only` pages.
+  - a structured-eligible doc can still produce page-level `structured_fallback` when Marker fails.
+
 ### Backends
 
 - `--structured-backend marker`: Marker-only structured extraction.
@@ -103,6 +111,9 @@ Page entries may include:
 
 - `status: structured_ok`
 - `status: structured_fallback`
+- `status: text_only`
+- `status: ok`
+- `status: skipped`
 - `structured: { backend, artifacts, fallback_reason }`
 
 ## Safety and Fallback
