@@ -149,6 +149,23 @@ def _parse_args() -> argparse.Namespace:
     fetch.add_argument("--report-file", type=Path, default=None)
     fetch.add_argument("--failed-file", type=Path, default=None)
 
+    export = sub.add_parser(
+        "export-structured-data",
+        help="Process existing OCR output folders into machine-readable table/figure artifacts",
+    )
+    export.add_argument("ocr_out_dir", type=Path)
+    export.add_argument(
+        "--deplot-command",
+        type=str,
+        default=os.getenv("PAPER_OCR_DEPLOT_COMMAND", ""),
+        help="Optional external command for chart-to-table extraction; supports {image} placeholder.",
+    )
+    export.add_argument(
+        "--deplot-timeout",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_DEPLOT_TIMEOUT", DEPLOT_TIMEOUT_DEFAULT)),
+    )
+
     return parser.parse_args()
 
 
@@ -934,6 +951,101 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
     await fetch_from_telegram(config)
 
 
+def _discover_ocr_doc_dirs(ocr_out_dir: Path) -> list[Path]:
+    if (ocr_out_dir / "pages").is_dir() and (ocr_out_dir / "metadata").is_dir():
+        return [ocr_out_dir]
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for manifest_path in sorted(ocr_out_dir.rglob("metadata/manifest.json")):
+        doc_dir = manifest_path.parent.parent
+        if not (doc_dir / "pages").is_dir():
+            continue
+        key = str(doc_dir.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(doc_dir)
+    return out
+
+
+def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
+    if not args.ocr_out_dir.exists():
+        raise SystemExit(f"OCR output directory does not exist: {args.ocr_out_dir}")
+
+    docs = _discover_ocr_doc_dirs(args.ocr_out_dir)
+    if not docs:
+        raise SystemExit(f"No OCR document folders found under: {args.ocr_out_dir}")
+
+    totals = {
+        "docs_processed": 0,
+        "table_count": 0,
+        "figure_count": 0,
+        "deplot_count": 0,
+    }
+
+    for doc_dir in docs:
+        metadata_dir = doc_dir / "metadata"
+        manifest_path = metadata_dir / "manifest.json"
+        try:
+            summary = build_structured_exports(
+                doc_dir=doc_dir,
+                deplot_command=str(getattr(args, "deplot_command", "") or ""),
+                deplot_timeout=int(getattr(args, "deplot_timeout", int(DEPLOT_TIMEOUT_DEFAULT)) or int(DEPLOT_TIMEOUT_DEFAULT)),
+            )
+            structured_data_manifest: dict[str, Any] = {
+                "enabled": True,
+                "table_count": summary.table_count,
+                "figure_count": summary.figure_count,
+                "deplot_count": summary.deplot_count,
+                "unresolved_figure_count": summary.unresolved_figure_count,
+                "errors": summary.errors,
+            }
+        except Exception as exc:  # noqa: BLE001
+            structured_data_manifest = {
+                "enabled": True,
+                "table_count": 0,
+                "figure_count": 0,
+                "deplot_count": 0,
+                "unresolved_figure_count": 0,
+                "errors": [str(exc)],
+            }
+
+        manifest: dict[str, Any]
+        if manifest_path.exists():
+            try:
+                loaded = json.loads(manifest_path.read_text())
+                manifest = loaded if isinstance(loaded, dict) else {}
+            except Exception:
+                manifest = {}
+        else:
+            manifest = {}
+        manifest["structured_data_extraction"] = structured_data_manifest
+        write_json(manifest_path, manifest)
+
+        totals["docs_processed"] += 1
+        totals["table_count"] += int(structured_data_manifest.get("table_count", 0))
+        totals["figure_count"] += int(structured_data_manifest.get("figure_count", 0))
+        totals["deplot_count"] += int(structured_data_manifest.get("deplot_count", 0))
+
+        print(
+            "[structured-export] "
+            f"doc={doc_dir} "
+            f"tables={structured_data_manifest['table_count']} "
+            f"figures={structured_data_manifest['figure_count']} "
+            f"deplot={structured_data_manifest['deplot_count']}"
+        )
+
+    print(
+        "[structured-export] done "
+        f"docs={totals['docs_processed']} "
+        f"tables={totals['table_count']} "
+        f"figures={totals['figure_count']} "
+        f"deplot={totals['deplot_count']}"
+    )
+    return totals
+
+
 def main() -> None:
     load_dotenv()
     args = _parse_args()
@@ -941,6 +1053,8 @@ def main() -> None:
         asyncio.run(_run(args))
     if args.command == "fetch-telegram":
         asyncio.run(_run_fetch_telegram(args))
+    if args.command == "export-structured-data":
+        _run_export_structured_data(args)
 
 
 if __name__ == "__main__":

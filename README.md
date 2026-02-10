@@ -135,6 +135,22 @@ Fetch options:
 - `--report-file` override report path
 - `--failed-file` override failed-report path
 
+### 3) Export structured data from existing OCR outputs
+
+```bash
+uv run paper-ocr export-structured-data <ocr_out_dir> [options]
+```
+
+Options:
+- `--deplot-command` optional external command with `{image}` placeholder
+- `--deplot-timeout` default `90`
+
+This command scans existing OCR document folders, regenerates:
+- `metadata/assets/structured/extracted/tables/*`
+- `metadata/assets/structured/extracted/figures/*`
+
+and updates each document manifest with `structured_data_extraction`.
+
 ## Recommended Workflows
 
 ### Workflow A: Local PDF folder -> OCR
