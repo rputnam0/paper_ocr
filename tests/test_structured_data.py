@@ -39,6 +39,29 @@ def test_extract_markdown_tables_keeps_empty_edge_cells():
     assert tables[0]["rows"] == [["", "1", "2", ""]]
 
 
+def test_extract_markdown_tables_normalizes_line_break_cells_in_csv(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text(
+        "\n".join(
+            [
+                "Table 1: Data",
+                "| Name | Note |",
+                "| --- | --- |",
+                "| A | first<br>line |",
+            ]
+        )
+    )
+
+    summary = build_structured_exports(doc_dir)
+    assert summary.table_count == 1
+    csv_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.csv"
+    text = csv_path.read_text()
+    assert "<br>" not in text
+    assert "first line" in text
+
+
 def test_build_structured_exports_writes_tables_and_figures(tmp_path: Path):
     doc_dir = tmp_path / "Doe_2024"
     pages_dir = doc_dir / "pages"
@@ -311,6 +334,36 @@ def test_build_structured_exports_merges_adjacent_continued_tables(tmp_path: Pat
     assert payloads[0]["pages"] == [2, 3]
 
 
+def test_build_structured_exports_flattens_multilevel_headers(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [
+            ["Polymer", "Solvent", "η = aγ^(n-1)", "η = aγ^(n-1)"],
+            ["", "", "a", "n"],
+        ],
+        "data_rows": [["HPMC", "Water", "1.4E-2", "0.93"]],
+        "caption_text": "Table 3",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 1
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first_row = json.loads(table_manifest.read_text().splitlines()[0])
+    csv_path = doc_dir / first_row["csv_path"]
+    header = csv_path.read_text().splitlines()[0]
+    assert "η = aγ^(n-1) (a)" in header
+    assert "η = aγ^(n-1) (n)" in header
+
+
 def test_compare_marker_tables_with_ocr_html_reports_symbol_differences(tmp_path: Path):
     doc_dir = tmp_path / "Doe_2024"
     tables_dir = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables"
@@ -345,6 +398,39 @@ def test_compare_marker_tables_with_ocr_html_reports_symbol_differences(tmp_path
         doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_ocr_html_compare.json"
     )
     assert report_path.exists()
+
+
+def test_compare_marker_tables_parses_html_with_colspan_and_rowspan(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    tables_dir = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    manifest_row = {
+        "table_id": "p0001_t01",
+        "page": 1,
+        "headers": ["Polymer", "Solvent", "eta = a g^(n-1) (a)", "eta = a g^(n-1) (n)"],
+        "rows": [["HPMC", "Water", "1.46E-02", "0.93"]],
+        "csv_path": "metadata/assets/structured/extracted/tables/p0001_t01.csv",
+    }
+    (tables_dir / "manifest.jsonl").write_text(json.dumps(manifest_row) + "\n")
+
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "table_01_page_0001.md").write_text(
+        (
+            "<table>"
+            "<tr><th rowspan='2'>Polymer</th><th rowspan='2'>Solvent</th><th colspan='2'>\\( \\eta = a\\gamma^{n-1} \\)</th></tr>"
+            "<tr><th>a</th><th>n</th></tr>"
+            "<tr><td>HPMC</td><td>Water</td><td>1.46E-02</td><td>0.93</td></tr>"
+            "</table>"
+        )
+    )
+
+    report = compare_marker_tables_with_ocr_html(doc_dir=doc_dir)
+    assert report["tables_compared"] == 1
+    result = report["results"][0]
+    assert result["ocr_cols"] == 4
+    assert "η" in result["ocr_symbols"]
+    assert "γ" in result["ocr_symbols"]
 
 
 def test_build_structured_exports_merges_ocr_symbols_into_marker_tables(tmp_path: Path):

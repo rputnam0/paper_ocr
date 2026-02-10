@@ -439,6 +439,66 @@ def test_run_marker_doc_service_derives_tables_raw_from_output_tree(monkeypatch,
     assert result.localization_page_status[1]["has_geometry"]
 
 
+def test_run_marker_doc_service_parses_colspan_rowspan_tables(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    assets_root = tmp_path / "assets"
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def read(self) -> bytes:
+            payload = {
+                "success": True,
+                "markdown": "# Service document\n",
+                "output": {
+                    "children": [
+                        {
+                            "id": "/page/0/Caption/1",
+                            "block_type": "Caption",
+                            "bbox": [10, 10, 480, 40],
+                            "html": "<p>Table 3: Rheology model</p>",
+                        },
+                        {
+                            "id": "/page/0/Table/2",
+                            "block_type": "Table",
+                            "bbox": [10, 45, 480, 300],
+                            "polygon": [[10, 45], [480, 45], [480, 300], [10, 300]],
+                            "html": (
+                                "<table>"
+                                "<tr><th rowspan='2'>Polymer</th><th rowspan='2'>Solvent</th><th colspan='2'>\\( \\eta = a\\gamma^{n-1} \\)</th></tr>"
+                                "<tr><th>a</th><th>n</th></tr>"
+                                "<tr><td>HPMC</td><td>Water</td><td>1.46E-02</td><td>0.93</td></tr>"
+                                "</table>"
+                            ),
+                        },
+                    ]
+                },
+            }
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: _Resp())
+    result = run_marker_doc(
+        pdf_path=pdf_path,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=assets_root,
+        profile="full_json",
+        marker_url="http://127.0.0.1:8008",
+    )
+    assert result.success
+    tables_raw_path = Path(result.artifacts["tables_raw"])
+    rows = [json.loads(line) for line in tables_raw_path.read_text().splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["header_rows"][0][2]
+    assert rows[0]["header_rows"][0][3]
+    assert rows[0]["data_rows"][0] == ["HPMC", "Water", "1.46E-02", "0.93"]
+
+
 def test_build_render_contract_and_grobid_coord_conversion():
     contract = build_render_contract(
         pdf_page_w_pt=612.0,

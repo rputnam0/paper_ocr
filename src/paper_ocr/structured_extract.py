@@ -625,7 +625,11 @@ class _HTMLTableParser(HTMLParser):
         self.in_cell = False
         self.cell_tag = ""
         self.cell_buf: list[str] = []
-        self.row_cells: list[tuple[str, str]] = []
+        self.cell_colspan = 1
+        self.cell_rowspan = 1
+        self.current_col = 0
+        self.row_cells: list[tuple[int, str, str]] = []
+        self.pending_rowspans: dict[int, tuple[int, str, str]] = {}
         self.header_rows: list[list[str]] = []
         self.data_rows: list[list[str]] = []
 
@@ -634,11 +638,16 @@ class _HTMLTableParser(HTMLParser):
         if t == "tr":
             self.in_tr = True
             self.row_cells = []
+            self.current_col = 0
+            self._consume_pending_spans()
             return
         if t in {"th", "td"} and self.in_tr:
+            self._consume_pending_spans()
             self.in_cell = True
             self.cell_tag = t
             self.cell_buf = []
+            self.cell_colspan = max(1, self._int_attr(attrs, "colspan", 1))
+            self.cell_rowspan = max(1, self._int_attr(attrs, "rowspan", 1))
             return
         if t == "br" and self.in_cell:
             self.cell_buf.append("\n")
@@ -647,31 +656,68 @@ class _HTMLTableParser(HTMLParser):
         t = tag.lower()
         if t in {"th", "td"} and self.in_cell:
             text = unescape("".join(self.cell_buf)).strip()
-            self.row_cells.append((self.cell_tag, text))
+            for _ in range(self.cell_colspan):
+                self.row_cells.append((self.current_col, self.cell_tag, text))
+                if self.cell_rowspan > 1:
+                    self.pending_rowspans[self.current_col] = (self.cell_rowspan - 1, self.cell_tag, text)
+                self.current_col += 1
             self.in_cell = False
             self.cell_tag = ""
             self.cell_buf = []
+            self.cell_colspan = 1
+            self.cell_rowspan = 1
             return
         if t == "tr" and self.in_tr:
+            self._consume_pending_spans()
             if self.row_cells:
-                tags = [k for k, _ in self.row_cells]
-                vals = [v for _, v in self.row_cells]
-                if all(k == "th" for k in tags):
+                max_col = max(c for c, _, _ in self.row_cells) + 1
+                vals = [""] * max_col
+                tags: list[str] = []
+                for col, cell_tag, text in self.row_cells:
+                    vals[col] = text
+                    tags.append(cell_tag)
+                if tags and all(k == "th" for k in tags):
                     self.header_rows.append(vals)
                 else:
                     self.data_rows.append(vals)
             self.in_tr = False
             self.row_cells = []
+            self.current_col = 0
 
     def handle_data(self, data: str) -> None:
         if self.in_cell:
             self.cell_buf.append(data)
+
+    def _int_attr(self, attrs: list[tuple[str, str | None]], key: str, default: int) -> int:
+        for name, value in attrs:
+            if str(name).lower() != key:
+                continue
+            try:
+                return int(str(value or default).strip())
+            except Exception:
+                return default
+        return default
+
+    def _consume_pending_spans(self) -> None:
+        while self.current_col in self.pending_rowspans:
+            remaining, cell_tag, text = self.pending_rowspans[self.current_col]
+            self.row_cells.append((self.current_col, cell_tag, text))
+            if remaining <= 1:
+                self.pending_rowspans.pop(self.current_col, None)
+            else:
+                self.pending_rowspans[self.current_col] = (remaining - 1, cell_tag, text)
+            self.current_col += 1
 
 
 def _parse_html_table_rows(table_html: str) -> tuple[list[list[str]], list[list[str]]]:
     parser = _HTMLTableParser()
     parser.feed(str(table_html or ""))
     parser.close()
+    all_rows = parser.header_rows + parser.data_rows
+    max_cols = max((len(r) for r in all_rows), default=0)
+    if max_cols:
+        parser.header_rows = [list(r) + [""] * (max_cols - len(r)) for r in parser.header_rows]
+        parser.data_rows = [list(r) + [""] * (max_cols - len(r)) for r in parser.data_rows]
     return parser.header_rows, parser.data_rows
 
 

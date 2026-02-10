@@ -241,9 +241,9 @@ def _write_table_csv(path: Path, headers: list[str], rows: list[list[str]]) -> N
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(headers)
+        writer.writerow([_normalize_cell_text(h) for h in headers])
         for row in rows:
-            writer.writerow(row)
+            writer.writerow([_normalize_cell_text(cell) for cell in row])
 
 
 def _portable_path(path: Path, root: Path) -> str:
@@ -313,7 +313,11 @@ class _HTMLTableParser(HTMLParser):
         self.in_cell = False
         self.cell_tag = ""
         self.cell_buf: list[str] = []
-        self.row_cells: list[tuple[str, str]] = []
+        self.cell_colspan = 1
+        self.cell_rowspan = 1
+        self.current_col = 0
+        self.row_cells: list[tuple[int, str, str]] = []
+        self.pending_rowspans: dict[int, tuple[int, str, str]] = {}
         self.header_rows: list[list[str]] = []
         self.data_rows: list[list[str]] = []
 
@@ -322,11 +326,16 @@ class _HTMLTableParser(HTMLParser):
         if t == "tr":
             self.in_tr = True
             self.row_cells = []
+            self.current_col = 0
+            self._consume_pending_spans()
             return
         if t in {"th", "td"} and self.in_tr:
+            self._consume_pending_spans()
             self.in_cell = True
             self.cell_tag = t
             self.cell_buf = []
+            self.cell_colspan = max(1, self._int_attr(attrs, "colspan", 1))
+            self.cell_rowspan = max(1, self._int_attr(attrs, "rowspan", 1))
             return
         if t == "br" and self.in_cell:
             self.cell_buf.append("\n")
@@ -335,31 +344,68 @@ class _HTMLTableParser(HTMLParser):
         t = tag.lower()
         if t in {"th", "td"} and self.in_cell:
             text = unescape("".join(self.cell_buf)).strip()
-            self.row_cells.append((self.cell_tag, text))
+            for _ in range(self.cell_colspan):
+                self.row_cells.append((self.current_col, self.cell_tag, text))
+                if self.cell_rowspan > 1:
+                    self.pending_rowspans[self.current_col] = (self.cell_rowspan - 1, self.cell_tag, text)
+                self.current_col += 1
             self.in_cell = False
             self.cell_tag = ""
             self.cell_buf = []
+            self.cell_colspan = 1
+            self.cell_rowspan = 1
             return
         if t == "tr" and self.in_tr:
+            self._consume_pending_spans()
             if self.row_cells:
-                tags = [k for k, _ in self.row_cells]
-                vals = [v for _, v in self.row_cells]
-                if all(k == "th" for k in tags):
+                max_col = max(c for c, _, _ in self.row_cells) + 1
+                vals = [""] * max_col
+                tags: list[str] = []
+                for col, cell_tag, text in self.row_cells:
+                    vals[col] = text
+                    tags.append(cell_tag)
+                if tags and all(k == "th" for k in tags):
                     self.header_rows.append(vals)
                 else:
                     self.data_rows.append(vals)
             self.in_tr = False
             self.row_cells = []
+            self.current_col = 0
 
     def handle_data(self, data: str) -> None:
         if self.in_cell:
             self.cell_buf.append(data)
+
+    def _int_attr(self, attrs: list[tuple[str, str | None]], key: str, default: int) -> int:
+        for name, value in attrs:
+            if str(name).lower() != key:
+                continue
+            try:
+                return int(str(value or default).strip())
+            except Exception:
+                return default
+        return default
+
+    def _consume_pending_spans(self) -> None:
+        while self.current_col in self.pending_rowspans:
+            remaining, cell_tag, text = self.pending_rowspans[self.current_col]
+            self.row_cells.append((self.current_col, cell_tag, text))
+            if remaining <= 1:
+                self.pending_rowspans.pop(self.current_col, None)
+            else:
+                self.pending_rowspans[self.current_col] = (remaining - 1, cell_tag, text)
+            self.current_col += 1
 
 
 def _parse_html_table_rows(table_html: str) -> tuple[list[list[str]], list[list[str]]]:
     parser = _HTMLTableParser()
     parser.feed(str(table_html or ""))
     parser.close()
+    all_rows = parser.header_rows + parser.data_rows
+    max_cols = max((len(r) for r in all_rows), default=0)
+    if max_cols:
+        parser.header_rows = [list(r) + [""] * (max_cols - len(r)) for r in parser.header_rows]
+        parser.data_rows = [list(r) + [""] * (max_cols - len(r)) for r in parser.data_rows]
     return parser.header_rows, parser.data_rows
 
 
@@ -545,6 +591,31 @@ def _normalize_cell_text(value: str) -> str:
     return " ".join(text.split())
 
 
+def _collapse_header_rows(header_rows: list[list[str]]) -> list[str]:
+    if not header_rows:
+        return []
+    max_cols = max((len(r) for r in header_rows), default=0)
+    if max_cols <= 0:
+        return []
+    normalized = [list(r) + [""] * (max_cols - len(r)) for r in header_rows]
+    out: list[str] = []
+    for col in range(max_cols):
+        tokens: list[str] = []
+        for row in normalized:
+            token = _normalize_cell_text(row[col])
+            if not token:
+                continue
+            if not tokens or tokens[-1] != token:
+                tokens.append(token)
+        if not tokens:
+            out.append("")
+        elif len(tokens) == 1:
+            out.append(tokens[0])
+        else:
+            out.append(f"{tokens[0]} ({' / '.join(tokens[1:])})")
+    return out
+
+
 def _flatten_table_text(headers: list[str], rows: list[list[str]]) -> str:
     parts: list[str] = []
     if headers:
@@ -574,7 +645,7 @@ def _parse_ocr_html_table(path: Path) -> tuple[list[str], list[list[str]]]:
             first = markdown_tables[0]
             return list(first.get("headers", [])), [list(r) for r in first.get("rows", [])]
         return [], []
-    headers = list(header_rows[0]) if header_rows else []
+    headers = _collapse_header_rows(header_rows) if header_rows else []
     rows = [list(r) for r in data_rows]
     return headers, rows
 
@@ -1057,8 +1128,8 @@ def build_structured_exports(
 
         tables = [] if canonical_tables else extract_markdown_tables(markdown)
         for t_index, table in enumerate(tables, start=1):
-            headers = list(table["headers"])
-            rows = [list(r) for r in table["rows"]]
+            headers = [_normalize_cell_text(x) for x in table["headers"]]
+            rows = [[_normalize_cell_text(x) for x in r] for r in table["rows"]]
             if table_ocr_merge:
                 ocr_tables = ocr_tables_by_page.get(page_index, [])
                 ocr_table = ocr_tables[t_index - 1] if t_index - 1 < len(ocr_tables) else None
@@ -1174,8 +1245,13 @@ def build_structured_exports(
         canonical_rows: list[dict[str, Any]] = []
         for table in canonical_tables:
             header = table.get("header_rows", [])
-            headers = list(header[0]) if header else []
-            rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
+            headers = _collapse_header_rows(header) if isinstance(header, list) else []
+            headers = [_normalize_cell_text(x) for x in headers]
+            rows = [
+                [_normalize_cell_text(x) for x in r]
+                for r in table.get("data_rows", [])
+                if isinstance(r, list)
+            ]
             metrics = _quality_metrics(headers, rows)
             if table_quality_gate and _fails_quality(metrics):
                 msg = f"{table.get('table_id')}: quality gate failed"
