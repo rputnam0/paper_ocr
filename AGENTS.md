@@ -97,7 +97,7 @@ out/<input_parent>/<author_year>/
 
 ## Repository Folder Contracts
 - `data/corpora/<slug>/source_pdfs/`: canonical source PDFs by topic/corpus.
-- `data/jobs/<job_slug>/`: pipeline jobs with required `input/`, `pdfs/`, `reports/`; optional `logs/`.
+- `data/jobs/<job_slug>/`: pipeline jobs with required `pdfs/`, `reports/`; optional `logs/`.
 - `data/archive/`: legacy outputs and historical runs.
 - `data/cache/`: disposable cache-only artifacts.
 - `data/tmp/`: transient scratch.
@@ -128,6 +128,7 @@ Validation command:
 
 ## Table Pipeline Guardrails
 - Keep table extraction `marker-first`; markdown table parsing is fallback only.
+- Keep OCR table merge enabled by default and scoped to headers (`--table-ocr-merge --table-ocr-merge-scope header`) to recover symbols without corrupting body rows.
 - Preserve canonical coordinate normalization (PDF-space to render-pixel transforms) before QA matching.
 - Do not compare raw GROBID coordinates directly against marker/crop pixel coordinates.
 - GROBID is a QA comparator, not a hard dependency; gate disagreement flags when GROBID parse quality is invalid.

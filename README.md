@@ -88,7 +88,7 @@ PAPER_OCR_GROBID_TIMEOUT=60
 Keep generated artifacts out of project root and use explicit contracts:
 
 - `data/corpora/<slug>/source_pdfs/`: curated source PDFs grouped by corpus/topic.
-- `data/jobs/<job_slug>/`: ingestion job folders with `input/`, `pdfs/`, `reports/`, optional `logs/`.
+- `data/jobs/<job_slug>/`: ingestion job folders with `pdfs/`, `reports/`, optional `logs/`.
 - `data/archive/`: old runs and legacy layouts kept for traceability.
 - `data/cache/`: disposable caches.
 - `data/tmp/`: ephemeral scratch.
@@ -141,6 +141,8 @@ Core options:
 - `--marker-localize-profile localize_only|full_json` default `full_json`
 - `--layout-fallback none|surya` default `surya`
 - `--table-source marker-first|markdown-only` default `marker-first`
+- `--table-ocr-merge` / `--no-table-ocr-merge` default enabled
+- `--table-ocr-merge-scope header|full` default `header`
 - `--table-quality-gate` / `--no-table-quality-gate` default enabled
 - `--table-escalation off|auto|always` default `auto`
 - `--table-escalation-max` default `20`
@@ -181,6 +183,8 @@ Options:
 - `--deplot-command` optional external command with `{image}` placeholder
 - `--deplot-timeout` default `90`
 - `--table-source marker-first|markdown-only` default `marker-first`
+- `--table-ocr-merge` / `--no-table-ocr-merge` default enabled
+- `--table-ocr-merge-scope header|full` default `header`
 - `--table-quality-gate` / `--no-table-quality-gate` default enabled
 - `--table-escalation off|auto|always` default `auto`
 - `--table-escalation-max` default `20`
@@ -191,6 +195,11 @@ This command scans existing OCR document folders, regenerates:
 - `metadata/assets/structured/extracted/figures/*`
 
 and updates each document manifest with `structured_data_extraction`.
+
+Default table stack:
+- Marker-first table extraction (`--table-source marker-first`)
+- OCR-assisted header merge (`--table-ocr-merge --table-ocr-merge-scope header`)
+- This recovers missing symbols in headers (for example `δ`, `η`, `γ`) while avoiding OCR body-row corruption.
 
 ### 4) Audit data layout contract
 
@@ -328,7 +337,7 @@ uv run paper-ocr fetch-telegram input/papers.csv
 3. OCR fetched PDFs:
 
 ```bash
-uv run paper-ocr run data/jobs/papers/pdfs out/jobs/papers
+uv run paper-ocr run data/jobs/papers/pdfs out/papers
 ```
 
 ## Telegram Job Layout
@@ -337,8 +346,6 @@ For `input/papers.csv` (CSV stem = `papers`):
 
 ```text
 data/jobs/papers/
-  input/
-    papers.csv
   pdfs/
     <bot_paper_title>.pdf
   reports/
@@ -349,7 +356,8 @@ data/jobs/papers/
 
 Notes:
 - `pdfs/` is the OCR input stage for fetched content.
-- Final OCR outputs must be written outside `data/jobs` (for example `out/jobs/<job_slug>`).
+- CSV sources remain in `input/` and are not copied into `data/jobs/`.
+- Final OCR outputs must be written outside `data/jobs` (for example `out/<job_slug>`).
 - PDF names are derived from bot-provided titles (DOI fallback if title unavailable).
 - `download_index.json` keeps DOI -> filename mapping stable across reruns.
 - Fetch progress is persisted incrementally, so rerunning the same CSV resumes safely:
