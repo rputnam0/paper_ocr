@@ -196,12 +196,12 @@ def run_data_audit(data_dir: Path) -> AuditReport:
                         )
                     )
             elif top_level == "jobs":
-                if len(rel_parts) < 4 or rel_parts[2] != "pdfs":
+                if len(rel_parts) < 4 or rel_parts[2] not in {"pdfs", "ocr_out"}:
                     issues.append(
                         AuditIssue(
                             code="misplaced_pdf",
                             path=_rel(candidate, root),
-                            message="Job PDF must live under jobs/<slug>/pdfs/.",
+                            message="Job PDF must live under jobs/<slug>/pdfs/ or jobs/<slug>/ocr_out/.",
                         )
                     )
             elif top_level not in {"archive", "cache", "tmp"}:
@@ -233,4 +233,3 @@ def format_audit_report(report: AuditReport) -> str:
     for item in report.issues:
         lines.append(f"- [{item.severity}] {item.code}: {item.path} ({item.message})")
     return "\n".join(lines)
-

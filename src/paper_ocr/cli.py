@@ -58,12 +58,15 @@ MAX_DELAY_DEFAULT = "8"
 RESPONSE_TIMEOUT_DEFAULT = 15
 SEARCH_TIMEOUT_DEFAULT = 40
 CSV_JOB_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+UNDERSCORE_RUN_RE = re.compile(r"_+")
 DIGITAL_STRUCTURED_DEFAULT = "auto"
 MARKER_COMMAND_DEFAULT = "marker_single"
 MARKER_URL_DEFAULT = ""
 MARKER_TIMEOUT_DEFAULT = "120"
 GROBID_TIMEOUT_DEFAULT = "60"
 DEPLOT_TIMEOUT_DEFAULT = "90"
+DEFAULT_FETCH_OUTPUT_ROOT = Path("data/jobs")
+LEGACY_FETCH_OUTPUT_ROOT = Path("data/telegram_jobs")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -492,14 +495,42 @@ def _collect_page_signals(doc: fitz.Document, mode: str) -> list[tuple[Any, str]
 
 def _render_dims_for_route(page_width_pt: float, page_height_pt: float, route: str, max_dim: int = 1288) -> tuple[int, int]:
     dpi = 200 if route == "anchored" else 300
-    w = max(int(round(page_width_pt * dpi / 72.0)), 1)
-    h = max(int(round(page_height_pt * dpi / 72.0)), 1)
+    # Keep manifest render dims aligned with render._resize_longest truncation semantics.
+    w = max(int(page_width_pt * dpi / 72.0), 1)
+    h = max(int(page_height_pt * dpi / 72.0), 1)
     longest = max(w, h)
     if longest > max_dim:
         scale = max_dim / float(longest)
-        w = max(int(round(w * scale)), 1)
-        h = max(int(round(h * scale)), 1)
+        w = max(int(w * scale), 1)
+        h = max(int(h * scale), 1)
     return w, h
+
+
+def _job_slug_from_csv_stem(stem: str) -> str:
+    slug = CSV_JOB_SAFE_RE.sub("_", stem).strip("._-").lower().replace(".", "_")
+    slug = UNDERSCORE_RUN_RE.sub("_", slug).strip("_")
+    return slug or "job"
+
+
+def _is_same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except Exception:  # noqa: BLE001
+        return str(a) == str(b)
+
+
+def _resolve_fetch_job_dir(output_root: Path, csv_slug: str) -> Path:
+    job_dir = output_root / csv_slug
+    if _is_same_path(output_root, DEFAULT_FETCH_OUTPUT_ROOT):
+        legacy_job_dir = LEGACY_FETCH_OUTPUT_ROOT / csv_slug
+        if legacy_job_dir.exists() and not job_dir.exists():
+            job_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy_job_dir), str(job_dir))
+            print(
+                "[fetch-telegram] migrated legacy job folder "
+                f"{legacy_job_dir} -> {job_dir}"
+            )
+    return job_dir
 
 
 async def _process_page_structured(
@@ -871,7 +902,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             doc_dir = _final_doc_dir(args, pdf_path, bibliography)
             final_dirs = ensure_dirs(doc_dir)
             marker_localization = {"enabled": bool(getattr(args, "marker_localize", True))}
-            if bool(getattr(args, "marker_localize", True)):
+            if bool(getattr(args, "marker_localize", True)) and page_count > 0:
                 marker_doc = await asyncio.to_thread(
                     run_marker_doc,
                     pdf_path,
@@ -887,6 +918,15 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                         "error": marker_doc.error,
                         "artifacts": marker_doc.artifacts,
                         "localization_page_status": marker_doc.localization_page_status,
+                    }
+                )
+            elif bool(getattr(args, "marker_localize", True)):
+                marker_localization.update(
+                    {
+                        "success": False,
+                        "error": "skipped_empty_document",
+                        "artifacts": {},
+                        "localization_page_status": {},
                     }
                 )
             first_page = _move_first_page_artifacts(first_page, dirs, final_dirs, args.debug)
@@ -1114,8 +1154,8 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         raise SystemExit("Missing target bot. Set TARGET_BOT in .env or pass --target-bot.")
 
     api_id, api_hash = _require_telegram_credentials()
-    csv_name = CSV_JOB_SAFE_RE.sub("_", args.doi_csv.stem).strip("_") or "job"
-    job_dir = args.output_root / csv_name
+    csv_name = _job_slug_from_csv_stem(args.doi_csv.stem)
+    job_dir = _resolve_fetch_job_dir(args.output_root, csv_name)
     input_dir = job_dir / "input"
     pdf_dir = job_dir / "pdfs"
     reports_dir = job_dir / "reports"
@@ -1183,6 +1223,28 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
     for doc_dir in docs:
         metadata_dir = doc_dir / "metadata"
         manifest_path = metadata_dir / "manifest.json"
+        manifest: dict[str, Any]
+        if manifest_path.exists():
+            try:
+                loaded = json.loads(manifest_path.read_text())
+                manifest = loaded if isinstance(loaded, dict) else {}
+            except Exception:
+                manifest = {}
+        else:
+            manifest = {}
+
+        structured_extraction = manifest.get("structured_extraction", {})
+        if not isinstance(structured_extraction, dict):
+            structured_extraction = {}
+        if bool(structured_extraction.get("grobid_used")):
+            grobid_status = "ok"
+        elif str(structured_extraction.get("grobid_error", "")).strip():
+            grobid_status = "error"
+        elif structured_extraction:
+            grobid_status = "missing"
+        else:
+            grobid_status = "unknown"
+
         try:
             summary = build_structured_exports(
                 doc_dir=doc_dir,
@@ -1193,6 +1255,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 table_escalation=str(getattr(args, "table_escalation", "auto")),
                 table_escalation_max=int(getattr(args, "table_escalation_max", 20)),
                 table_qa_mode=str(getattr(args, "table_qa_mode", "warn")),
+                grobid_status=grobid_status,
             )
             structured_data_manifest: dict[str, Any] = {
                 "enabled": True,
@@ -1211,16 +1274,6 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "unresolved_figure_count": 0,
                 "errors": [str(exc)],
             }
-
-        manifest: dict[str, Any]
-        if manifest_path.exists():
-            try:
-                loaded = json.loads(manifest_path.read_text())
-                manifest = loaded if isinstance(loaded, dict) else {}
-            except Exception:
-                manifest = {}
-        else:
-            manifest = {}
         manifest["structured_data_extraction"] = structured_data_manifest
         write_json(manifest_path, manifest)
 

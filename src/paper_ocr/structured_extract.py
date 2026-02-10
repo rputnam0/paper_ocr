@@ -54,6 +54,12 @@ def is_structured_candidate_doc(
     routes: list[str],
     heuristics_by_page: list[TextHeuristics],
 ) -> bool:
+    """Return True when a document should attempt Marker structured extraction.
+
+    The `routes` list is validated for length but route values are intentionally
+    recomputed in auto mode so `--mode` OCR overrides do not disable structured
+    extraction eligibility.
+    """
     mode = (digital_structured or "").strip().lower()
     if mode == "off":
         return False

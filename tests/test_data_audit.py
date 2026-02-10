@@ -75,3 +75,20 @@ def test_data_audit_flags_misplaced_pdf(tmp_path: Path):
     codes = {item.code for item in report.issues}
 
     assert "misplaced_pdf" in codes
+
+
+def test_data_audit_allows_pdfs_under_job_ocr_out(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    _mkdir(data_dir / "corpora")
+    _mkdir(data_dir / "jobs" / "job-1" / "input")
+    _mkdir(data_dir / "jobs" / "job-1" / "pdfs")
+    _mkdir(data_dir / "jobs" / "job-1" / "reports")
+    _mkdir(data_dir / "jobs" / "job-1" / "ocr_out")
+    _mkdir(data_dir / "cache")
+    _mkdir(data_dir / "archive")
+    _mkdir(data_dir / "tmp")
+
+    (data_dir / "jobs" / "job-1" / "ocr_out" / "derived.pdf").write_bytes(b"pdf")
+    report = run_data_audit(data_dir)
+    misplaced = [item for item in report.issues if item.code == "misplaced_pdf"]
+    assert not misplaced

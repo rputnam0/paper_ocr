@@ -48,7 +48,7 @@ Need queue-based orchestration, retry/dead-letter handling, throughput controls,
 
 ## Proposed Phased Plan
 
-## Phase 0 — Dataset Contract (must happen first)
+### Phase 0 — Dataset Contract (must happen first)
 Deliverables:
 - JSON schema for `property_record`.
 - Controlled vocab for property names/material classes.
@@ -72,7 +72,7 @@ Minimum `property_record` fields:
 - `extraction_stage`
 - `created_at`
 
-## Phase 1 — Table Fact Extraction
+### Phase 1 — Table Fact Extraction
 Deliverables:
 - Table semantic parser that maps exported table CSV/JSON into `property_record` rows.
 - Header hierarchy reconstruction.
@@ -82,20 +82,20 @@ Use GROBID figure/table index as:
 - validation cross-check against Marker table detections
 - fallback targeting signal for pages where Marker table extraction fails
 
-## Phase 2 — Figure/Graph Fact Extraction
+### Phase 2 — Figure/Graph Fact Extraction
 Deliverables:
 - Unified figure extraction stage (DePlot or equivalent) producing typed points/series.
 - Post-processing to map chart output into `property_record` fields.
 - Confidence and anomaly checks for axis/unit parsing.
 
-## Phase 3 — Normalization and Entity Resolution
+### Phase 3 — Normalization and Entity Resolution
 Deliverables:
 - Material name normalization and synonym resolution.
 - Property synonym mapping (e.g., viscosity variants).
 - Unit conversion and dimensional validation.
 - Duplicate/near-duplicate record consolidation across papers.
 
-## Phase 4 — Quality and Evaluation
+### Phase 4 — Quality and Evaluation
 Deliverables:
 - Gold-labeled benchmark set (100–300 papers initially).
 - Automated evaluation metrics:
@@ -104,7 +104,7 @@ Deliverables:
   - unit normalization accuracy
 - Regression tests gated in CI for extraction quality.
 
-## Phase 5 — Scale and Operations
+### Phase 5 — Scale and Operations
 Deliverables:
 - Queue-based batch processing (document-level idempotent jobs).
 - Retry and dead-letter strategy for failed papers/pages.

@@ -1,6 +1,6 @@
 # Data Layout Contract
 
-This document defines the required structure for `/Users/rexputnam/Documents/projects/paper_ocr/data`.
+This document defines the required structure for `<project_root>/data`.
 
 ## Top-Level
 
@@ -51,6 +51,7 @@ Rules:
 
 - `<job_slug>` must be lowercase slug format: `a-z`, `0-9`, `_`, `-`.
 - Job-acquired PDFs must be written under `pdfs/`.
+- OCR-generated PDF artifacts may live under `ocr_out/`.
 - CSV manifests and fetch reports belong under `reports/`.
 
 ## Archive / Cache / Tmp

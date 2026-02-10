@@ -241,17 +241,19 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
     manifest_path = doc_dir / "metadata" / "manifest.json"
     manifest_path.write_text(json.dumps({"doc_id": "abc"}))
 
-    monkeypatch.setattr(
-        cli,
-        "build_structured_exports",
-        lambda **kwargs: StructuredExportSummary(
+    seen_kwargs: dict[str, object] = {}
+
+    def _fake_build(**kwargs):  # noqa: ANN001
+        seen_kwargs.update(kwargs)
+        return StructuredExportSummary(
             table_count=2,
             figure_count=3,
             deplot_count=1,
             unresolved_figure_count=0,
             errors=[],
-        ),
-    )
+        )
+
+    monkeypatch.setattr(cli, "build_structured_exports", _fake_build)
 
     args = argparse.Namespace(
         ocr_out_dir=root,
@@ -268,6 +270,36 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
     payload = json.loads(manifest_path.read_text())
     assert payload["structured_data_extraction"]["table_count"] == 2
     assert payload["structured_data_extraction"]["figure_count"] == 3
+    assert seen_kwargs["grobid_status"] == "unknown"
+
+
+def test_run_export_structured_data_passes_grobid_ok_when_manifest_records_usage(monkeypatch, tmp_path: Path):
+    root = tmp_path / "out"
+    doc_dir = root / "group" / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    (doc_dir / "metadata").mkdir(parents=True)
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    manifest_path.write_text(json.dumps({"structured_extraction": {"grobid_used": True}}))
+    seen_kwargs: dict[str, object] = {}
+
+    def _fake_build(**kwargs):  # noqa: ANN001
+        seen_kwargs.update(kwargs)
+        return StructuredExportSummary()
+
+    monkeypatch.setattr(cli, "build_structured_exports", _fake_build)
+
+    args = argparse.Namespace(
+        ocr_out_dir=root,
+        deplot_command="",
+        deplot_timeout=30,
+        table_source="marker-first",
+        table_quality_gate=True,
+        table_escalation="auto",
+        table_escalation_max=20,
+        table_qa_mode="warn",
+    )
+    cli._run_export_structured_data(args)
+    assert seen_kwargs["grobid_status"] == "ok"
 
 
 def test_run_export_structured_data_requires_docs(tmp_path: Path):
@@ -416,6 +448,63 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
     assert config.report_file == tmp_path / "jobs" / "papers" / "reports" / "telegram_download_report.csv"
 
 
+def test_fetch_telegram_normalizes_job_slug(monkeypatch, tmp_path: Path):
+    args = argparse.Namespace(
+        doi_csv=tmp_path / "My.Papers.csv",
+        output_root=tmp_path / "jobs",
+        doi_column="DOI",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+    )
+    args.doi_csv.write_text("DOI\n10.1000/abc\n")
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+    config = _fake_fetch_from_telegram.last_config
+    assert config.in_dir == tmp_path / "jobs" / "my_papers" / "pdfs"
+
+
+def test_fetch_telegram_migrates_legacy_default_job_dir(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    args = argparse.Namespace(
+        doi_csv=tmp_path / "papers.csv",
+        output_root=Path("data/jobs"),
+        doi_column="DOI",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+    )
+    args.doi_csv.write_text("DOI\n10.1000/abc\n")
+    legacy_job = tmp_path / "data" / "telegram_jobs" / "papers"
+    (legacy_job / "reports").mkdir(parents=True, exist_ok=True)
+    (legacy_job / "reports" / "download_index.json").write_text("{}")
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+
+    assert not legacy_job.exists()
+    assert (tmp_path / "data" / "jobs" / "papers" / "reports" / "download_index.json").exists()
+
+
 def test_fetch_telegram_skips_copy_when_csv_already_in_job_input(monkeypatch, tmp_path: Path):
     output_root = tmp_path / "jobs"
     doi_csv = output_root / "papers" / "input" / "papers.csv"
@@ -441,6 +530,12 @@ def test_fetch_telegram_skips_copy_when_csv_already_in_job_input(monkeypatch, tm
 
     asyncio.run(cli._run_fetch_telegram(args))
     assert _fake_fetch_from_telegram.last_config.doi_csv == doi_csv
+
+
+def test_render_dims_for_route_matches_truncation_behavior():
+    w, h = cli._render_dims_for_route(610.0, 792.0, "unanchored", max_dim=10000)
+    assert w == 2541
+    assert h == 3300
 
 
 def test_final_doc_dir_avoids_collision_on_different_sha(monkeypatch, tmp_path: Path):

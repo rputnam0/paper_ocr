@@ -166,6 +166,9 @@ Fetch options:
 - `--report-file` override report path
 - `--failed-file` override failed-report path
 
+Compatibility note:
+- Legacy jobs under `data/telegram_jobs/<job_slug>/` are auto-migrated to `data/jobs/<job_slug>/` when using the default `output_root`.
+
 ### 3) Export structured data from existing OCR outputs
 
 ```bash

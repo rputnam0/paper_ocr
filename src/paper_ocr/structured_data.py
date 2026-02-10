@@ -28,6 +28,7 @@ class StructuredExportSummary:
 class TableFragment:
     fragment_id: str
     table_group_id: str
+    explicit_group_id: bool
     table_block_ids: list[str]
     caption_block_id: str
     note_block_ids: list[str]
@@ -261,6 +262,7 @@ def _bbox_from_polygons(polygons: list[list[list[float]]]) -> list[float]:
 
 
 TABLE_NUM_RE = re.compile(r"\b(?:table|tab\.?)\s*([0-9ivxlcdm]+)\b", re.IGNORECASE)
+TABLE_CONTINUED_RE = re.compile(r"\b(cont(?:inued)?\.?)\b", re.IGNORECASE)
 
 
 def _extract_table_number(caption: str) -> str:
@@ -282,7 +284,8 @@ def _normalize_fragment_from_marker(row: dict[str, Any], index: int) -> TableFra
     if not isinstance(data_rows, list):
         data_rows = []
     caption_text = str(row.get("caption_text", "") or "")
-    table_group_id = str(row.get("table_group_id", "") or f"group_{page}_{index}")
+    raw_group_id = str(row.get("table_group_id", "") or "").strip()
+    table_group_id = raw_group_id or f"group_{page}_{index}"
     block_ids = row.get("table_block_ids")
     if not isinstance(block_ids, list):
         block_ids = []
@@ -297,6 +300,7 @@ def _normalize_fragment_from_marker(row: dict[str, Any], index: int) -> TableFra
     return TableFragment(
         fragment_id=frag_id,
         table_group_id=table_group_id,
+        explicit_group_id=bool(raw_group_id),
         table_block_ids=[str(x) for x in block_ids],
         caption_block_id=caption_block_id,
         note_block_ids=[str(x) for x in row.get("note_block_ids", []) if str(x)],
@@ -312,12 +316,65 @@ def _normalize_fragment_from_marker(row: dict[str, Any], index: int) -> TableFra
     )
 
 
+def _normalized_header_tokens(frag: TableFragment) -> set[str]:
+    if not frag.header_rows:
+        return set()
+    first = frag.header_rows[0]
+    tokens: set[str] = set()
+    for cell in first:
+        for token in re.split(r"\W+", str(cell).lower()):
+            cleaned = token.strip()
+            if cleaned:
+                tokens.add(cleaned)
+    return tokens
+
+
+def _header_similarity(lhs: TableFragment, rhs: TableFragment) -> float:
+    l_tokens = _normalized_header_tokens(lhs)
+    r_tokens = _normalized_header_tokens(rhs)
+    if not l_tokens or not r_tokens:
+        return 0.0
+    overlap = l_tokens.intersection(r_tokens)
+    union = l_tokens.union(r_tokens)
+    return len(overlap) / max(len(union), 1)
+
+
+def _can_merge_by_table_number(prev: TableFragment, current: TableFragment) -> bool:
+    page_gap = current.page - prev.page
+    if page_gap < 0 or page_gap > 1:
+        return False
+    prev_caption = str(prev.caption_text or "")
+    current_caption = str(current.caption_text or "")
+    if TABLE_CONTINUED_RE.search(prev_caption) or TABLE_CONTINUED_RE.search(current_caption):
+        return True
+    return _header_similarity(prev, current) >= 0.75
+
+
 def _merge_table_fragments(fragments: list[TableFragment]) -> list[dict[str, Any]]:
     groups: dict[str, list[TableFragment]] = {}
-    for frag in fragments:
+    numbered_groups: dict[str, list[list[TableFragment]]] = {}
+    for frag in sorted(fragments, key=lambda f: (f.page, f.fragment_id)):
+        if frag.explicit_group_id:
+            key = f"group:{frag.table_group_id}"
+            groups.setdefault(key, []).append(frag)
+            continue
         table_number = _extract_table_number(frag.caption_text)
-        key = table_number or frag.table_group_id or frag.fragment_id
-        groups.setdefault(key, []).append(frag)
+        if not table_number:
+            groups.setdefault(f"fragment:{frag.fragment_id}", []).append(frag)
+            continue
+        chains = numbered_groups.setdefault(table_number, [])
+        if not chains:
+            chains.append([frag])
+            continue
+        last_chain = chains[-1]
+        if _can_merge_by_table_number(last_chain[-1], frag):
+            last_chain.append(frag)
+        else:
+            chains.append([frag])
+
+    for table_number, chains in numbered_groups.items():
+        for idx, chain in enumerate(chains, start=1):
+            groups[f"number:{table_number}:{idx}"] = chain
 
     out: list[dict[str, Any]] = []
     for key, frags in groups.items():
