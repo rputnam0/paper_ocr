@@ -44,15 +44,15 @@ Required subfolders:
 
 Optional subfolders:
 
-- `ocr_out/`
 - `logs/`
 
 Rules:
 
 - `<job_slug>` must be lowercase slug format: `a-z`, `0-9`, `_`, `-`.
 - Job-acquired PDFs must be written under `pdfs/`.
-- OCR-generated PDF artifacts may live under `ocr_out/`.
 - CSV manifests and fetch reports belong under `reports/`.
+- Final processed OCR outputs must be written under `<project_root>/out/`, not under `data/jobs/`.
+- Legacy `jobs/<slug>/ocr_out/` folders are tolerated but deprecated and reported as warnings by `data-audit`.
 
 ## Archive / Cache / Tmp
 

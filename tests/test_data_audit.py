@@ -91,4 +91,6 @@ def test_data_audit_allows_pdfs_under_job_ocr_out(tmp_path: Path):
     (data_dir / "jobs" / "job-1" / "ocr_out" / "derived.pdf").write_bytes(b"pdf")
     report = run_data_audit(data_dir)
     misplaced = [item for item in report.issues if item.code == "misplaced_pdf"]
+    deprecated = [item for item in report.issues if item.code in {"deprecated_job_subdir", "deprecated_job_ocr_out_pdf"}]
     assert not misplaced
+    assert deprecated

@@ -519,6 +519,14 @@ def _is_same_path(a: Path, b: Path) -> bool:
         return str(a) == str(b)
 
 
+def _is_path_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _resolve_fetch_job_dir(output_root: Path, csv_slug: str) -> Path:
     job_dir = output_root / csv_slug
     if _is_same_path(output_root, DEFAULT_FETCH_OUTPUT_ROOT):
@@ -1136,6 +1144,11 @@ def _write_group_readmes(records: list[dict[str, Any]]) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
+    if _is_path_within(args.out_dir, DEFAULT_FETCH_OUTPUT_ROOT):
+        raise SystemExit(
+            "Refusing to write final OCR outputs under data/jobs. "
+            "Use a canonical output folder such as out/<job_slug>."
+        )
     pdfs = discover_pdfs(args.in_dir)
     if not pdfs:
         raise SystemExit(f"No PDFs found in {args.in_dir}")
@@ -1159,11 +1172,9 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
     input_dir = job_dir / "input"
     pdf_dir = job_dir / "pdfs"
     reports_dir = job_dir / "reports"
-    ocr_out_dir = job_dir / "ocr_out"
     input_dir.mkdir(parents=True, exist_ok=True)
     pdf_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    ocr_out_dir.mkdir(parents=True, exist_ok=True)
     copied_csv = input_dir / args.doi_csv.name
     if args.doi_csv.resolve() != copied_csv.resolve():
         shutil.copy2(args.doi_csv, copied_csv)

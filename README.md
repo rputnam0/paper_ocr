@@ -88,12 +88,12 @@ PAPER_OCR_GROBID_TIMEOUT=60
 Keep generated artifacts out of project root and use explicit contracts:
 
 - `data/corpora/<slug>/source_pdfs/`: curated source PDFs grouped by corpus/topic.
-- `data/jobs/<job_slug>/`: ingestion job folders with `input/`, `pdfs/`, `reports/`, optional `ocr_out/`, optional `logs/`.
+- `data/jobs/<job_slug>/`: ingestion job folders with `input/`, `pdfs/`, `reports/`, optional `logs/`.
 - `data/archive/`: old runs and legacy layouts kept for traceability.
 - `data/cache/`: disposable caches.
 - `data/tmp/`: ephemeral scratch.
 - `input/`: local CSV inputs (gitignored).
-- `out/`: canonical OCR output target when chosen by CLI invocation.
+- `out/`: canonical final OCR output target.
 - `docs/`: design/architecture/operation docs (tracked).
 
 Audit layout any time with:
@@ -111,6 +111,8 @@ Detailed contract reference: `docs/data_layout_contract.md`.
 ```bash
 uv run paper-ocr run <in_dir> <out_dir> [options]
 ```
+
+`<out_dir>` must not be under `data/jobs/`; use `out/...` for canonical final outputs.
 
 Core options:
 - `--workers` default `32`
@@ -326,7 +328,7 @@ uv run paper-ocr fetch-telegram input/papers.csv
 3. OCR fetched PDFs:
 
 ```bash
-uv run paper-ocr run data/jobs/papers/pdfs data/jobs/papers/ocr_out
+uv run paper-ocr run data/jobs/papers/pdfs out/jobs/papers
 ```
 
 ## Telegram Job Layout
@@ -343,12 +345,11 @@ data/jobs/papers/
     telegram_download_report.csv
     telegram_failed_papers.csv
     download_index.json
-  ocr_out/
 ```
 
 Notes:
 - `pdfs/` is the OCR input stage for fetched content.
-- `ocr_out/` is reserved for final OCR outputs from `paper-ocr run`.
+- Final OCR outputs must be written outside `data/jobs` (for example `out/jobs/<job_slug>`).
 - PDF names are derived from bot-provided titles (DOI fallback if title unavailable).
 - `download_index.json` keeps DOI -> filename mapping stable across reruns.
 - Fetch progress is persisted incrementally, so rerunning the same CSV resumes safely:

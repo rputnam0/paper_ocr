@@ -532,6 +532,39 @@ def test_fetch_telegram_skips_copy_when_csv_already_in_job_input(monkeypatch, tm
     assert _fake_fetch_from_telegram.last_config.doi_csv == doi_csv
 
 
+def test_fetch_telegram_does_not_create_ocr_out_subdir(monkeypatch, tmp_path: Path):
+    args = argparse.Namespace(
+        doi_csv=tmp_path / "papers.csv",
+        output_root=tmp_path / "jobs",
+        doi_column="DOI",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+    )
+    args.doi_csv.write_text("DOI\n10.1000/abc\n")
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+    assert not (tmp_path / "jobs" / "papers" / "ocr_out").exists()
+
+
+def test_run_rejects_output_under_jobs_folder(tmp_path: Path):
+    args = argparse.Namespace(
+        in_dir=tmp_path / "in",
+        out_dir=Path("data/jobs/example/ocr_out"),
+    )
+    with pytest.raises(SystemExit, match="Refusing to write final OCR outputs under data/jobs"):
+        asyncio.run(cli._run(args))
+
+
 def test_render_dims_for_route_matches_truncation_behavior():
     w, h = cli._render_dims_for_route(610.0, 792.0, "unanchored", max_dim=10000)
     assert w == 2541
