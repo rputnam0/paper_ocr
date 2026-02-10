@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -105,6 +106,168 @@ def _marker_commands(marker_command: str, input_pdf: Path, output_dir: Path) -> 
     ]
 
 
+def _multipart_upload_request(
+    *,
+    url: str,
+    file_field: str,
+    file_path: Path,
+    content_type: str,
+    form_fields: dict[str, str] | None = None,
+) -> request.Request:
+    boundary = f"----paper-ocr-{uuid.uuid4().hex}"
+    body = bytearray()
+
+    for key, value in (form_fields or {}).items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        body.extend(str(value).encode())
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(
+        (
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{file_path.name}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode()
+    )
+    body.extend(file_path.read_bytes())
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+
+    req = request.Request(url=url, method="POST", data=bytes(body))
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    return req
+
+
+def _extract_marker_output(payload: dict[str, Any]) -> str:
+    output = payload.get("output")
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict):
+        for key in ("markdown", "text", "content"):
+            candidate = output.get(key)
+            if isinstance(candidate, str):
+                return candidate
+    for key in ("markdown", "text", "content"):
+        candidate = payload.get(key)
+        if isinstance(candidate, str):
+            return candidate
+    return ""
+
+
+def _write_marker_service_artifacts(
+    *,
+    payload: dict[str, Any],
+    markdown: str,
+    assets_root: Path,
+    page_index: int,
+) -> dict[str, str]:
+    marker_root = assets_root / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    page_tag = f"page_{page_index + 1:04d}"
+
+    md_path = marker_root / f"{page_tag}.md"
+    md_path.write_text(markdown)
+
+    image_names: list[str] = []
+    images = payload.get("images")
+    assets_dir: Path | None = None
+    if isinstance(images, dict) and images:
+        assets_dir = marker_root / f"{page_tag}_assets" / "service"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        for key, encoded in images.items():
+            if not isinstance(key, str) or not isinstance(encoded, str):
+                continue
+            name = Path(key).name or "image.jpeg"
+            if "." not in name:
+                name = f"{name}.jpeg"
+            dst = assets_dir / name
+            try:
+                dst.write_bytes(base64.b64decode(encoded))
+                image_names.append(name)
+            except Exception:
+                continue
+
+    metadata = payload.get("metadata")
+    metadata_obj = metadata if isinstance(metadata, dict) else {}
+    json_path = marker_root / f"{page_tag}.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "source": "marker_service",
+                "success": bool(payload.get("success", True)),
+                "format": str(payload.get("format", "markdown")),
+                "metadata": metadata_obj,
+                "image_names": image_names,
+                "output_chars": len(markdown),
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+    )
+
+    artifacts: dict[str, str] = {
+        "markdown": str(md_path),
+        "json": str(json_path),
+    }
+    if assets_dir is not None and image_names:
+        artifacts["assets_dir"] = str(assets_dir.parent)
+    return artifacts
+
+
+def _run_marker_page_via_service(
+    *,
+    marker_url: str,
+    single_pdf: Path,
+    timeout: int,
+    assets_root: Path | None,
+    page_index: int,
+) -> StructuredPageResult:
+    endpoint = marker_url.rstrip("/") + "/marker/upload"
+    req = _multipart_upload_request(
+        url=endpoint,
+        file_field="file",
+        file_path=single_pdf,
+        content_type="application/pdf",
+        form_fields={
+            "output_format": "markdown",
+            "force_ocr": "false",
+            "paginate_output": "false",
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        loaded = json.loads(raw)
+        payload = loaded if isinstance(loaded, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        return StructuredPageResult(success=False, error=str(exc))
+
+    if not bool(payload.get("success", True)):
+        error = str(payload.get("error", "")).strip() or "Marker service reported failure."
+        return StructuredPageResult(success=False, error=error)
+
+    markdown = _extract_marker_output(payload)
+    if not markdown.strip():
+        return StructuredPageResult(success=False, error="Marker service returned no markdown output.")
+
+    metadata = payload.get("metadata")
+    raw_json = metadata if isinstance(metadata, dict) else {}
+    artifacts: dict[str, str] = {}
+    if assets_root is not None:
+        artifacts = _write_marker_service_artifacts(
+            payload=payload,
+            markdown=markdown,
+            assets_root=assets_root,
+            page_index=page_index,
+        )
+    return StructuredPageResult(
+        success=True,
+        markdown=markdown,
+        raw_json=raw_json,
+        artifacts=artifacts,
+    )
+
+
 def write_structured_artifacts(
     marker_output_dir: Path,
     assets_root: Path,
@@ -163,6 +326,7 @@ def run_marker_page(
     timeout: int,
     assets_root: Path | None = None,
     asset_level: str = "standard",
+    marker_url: str = "",
 ) -> StructuredPageResult:
     env = os.environ.copy()
     env["OCR_ENGINE"] = "None"
@@ -172,6 +336,15 @@ def run_marker_page(
         tmp_dir = Path(tmp)
         single_pdf = tmp_dir / f"page_{page_index + 1:04d}.pdf"
         _single_page_pdf(pdf_path, page_index, single_pdf)
+
+        if str(marker_url).strip():
+            return _run_marker_page_via_service(
+                marker_url=marker_url,
+                single_pdf=single_pdf,
+                timeout=timeout,
+                assets_root=assets_root,
+                page_index=page_index,
+            )
 
         for cmd in _marker_commands(marker_command, single_pdf, tmp_dir / "out"):
             try:
@@ -222,20 +395,12 @@ def run_marker_page(
 
 
 def _multipart_request(url: str, pdf_path: Path) -> request.Request:
-    boundary = f"----paper-ocr-{uuid.uuid4().hex}"
-    body = bytearray()
-    body.extend(f"--{boundary}\r\n".encode())
-    body.extend(
-        (
-            f'Content-Disposition: form-data; name="input"; filename="{pdf_path.name}"\r\n'
-            "Content-Type: application/pdf\r\n\r\n"
-        ).encode()
+    return _multipart_upload_request(
+        url=url,
+        file_field="input",
+        file_path=pdf_path,
+        content_type="application/pdf",
     )
-    body.extend(pdf_path.read_bytes())
-    body.extend(f"\r\n--{boundary}--\r\n".encode())
-    req = request.Request(url=url, method="POST", data=bytes(body))
-    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-    return req
 
 
 def _tei_text(el: ET.Element | None) -> str:

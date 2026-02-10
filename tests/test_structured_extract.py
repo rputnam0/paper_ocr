@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -136,6 +137,75 @@ def test_run_marker_page_failure_when_no_markdown(monkeypatch, tmp_path: Path):
     )
     assert not result.success
     assert "markdown" in result.error.lower()
+
+
+def test_run_marker_page_via_service_success(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def read(self) -> bytes:
+            payload = {
+                "success": True,
+                "output": "# Service Title\n\n![](service_fig_1.jpeg)\n",
+                "images": {
+                    "service_fig_1.jpeg": base64.b64encode(b"imgdata").decode(),
+                },
+                "metadata": {"source": "service"},
+            }
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: _Resp())
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("should_not_call_subprocess")))
+
+    result = run_marker_page(
+        pdf_path=pdf_path,
+        page_index=0,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=tmp_path / "assets",
+        asset_level="full",
+        marker_url="http://127.0.0.1:8008",
+    )
+    assert result.success
+    assert "Service Title" in result.markdown
+    assert "page_0001.md" in result.artifacts["markdown"]
+    assert "page_0001.json" in result.artifacts["json"]
+    assert "assets_dir" in result.artifacts
+
+
+def test_run_marker_page_via_service_failure(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def read(self) -> bytes:
+            return b'{"success": false, "error": "service failed"}'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: _Resp())
+    result = run_marker_page(
+        pdf_path=pdf_path,
+        page_index=0,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=tmp_path / "assets",
+        asset_level="standard",
+        marker_url="http://127.0.0.1:8008",
+    )
+    assert not result.success
+    assert "service failed" in result.error
 
 
 def test_run_grobid_doc_success(monkeypatch, tmp_path: Path):

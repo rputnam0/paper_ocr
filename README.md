@@ -77,6 +77,7 @@ Optional born-digital structured defaults:
 ```ini
 PAPER_OCR_DIGITAL_STRUCTURED=auto
 PAPER_OCR_MARKER_COMMAND=marker_single
+PAPER_OCR_MARKER_URL=
 PAPER_OCR_GROBID_URL=
 PAPER_OCR_MARKER_TIMEOUT=120
 PAPER_OCR_GROBID_TIMEOUT=60
@@ -104,6 +105,7 @@ Core options:
 - `--digital-structured off|auto|on` default `auto`
 - `--structured-backend marker|hybrid` default `hybrid`
 - `--marker-command` default `marker_single`
+- `--marker-url` optional Marker API base URL (uses service mode when set)
 - `--marker-timeout` default `120`
 - `--grobid-url` optional URL (enables TEI enrichment)
 - `--grobid-timeout` default `60`
@@ -165,19 +167,30 @@ uv run paper-ocr run data/LISA out
 uv run paper-ocr run data/LISA out \
   --digital-structured auto \
   --structured-backend hybrid \
-  --marker-command marker_single \
-  --grobid-url http://<wsl-host>:8070 \
+  --marker-url http://<marker-host>:8008 \
+  --grobid-url http://<grobid-host>:8070 \
   --deplot-command "deplot-cli --image {image}"
 ```
 
 Notes:
 - `--digital-structured auto` applies document-level eligibility rules and falls back safely.
-- Marker is invoked as an external command and OCR is forced off by default (`--disable_ocr` is auto-added and `OCR_ENGINE=None` is set).
+- Marker supports both command mode (`--marker-command`) and service mode (`--marker-url`).
+- Marker OCR is forced off by default in command mode (`--disable_ocr` is auto-added and `OCR_ENGINE=None` is set).
 - If GROBID is unavailable, run continues without TEI enrichment.
 
-WSL GPU note:
-- Marker auto-selects CUDA when available in its runtime environment.
-- For non-interactive SSH sessions, you may need to export `PATH="$HOME/.local/bin:/usr/lib/wsl/lib:$PATH"` so both `marker_single` and `nvidia-smi` are discoverable.
+### Service Mode (General)
+
+You can run Marker and GROBID as independent services (local or remote) and point `paper-ocr` at their URLs.
+
+Marker service:
+- Set `--marker-url <base_url>` (for example `http://127.0.0.1:8008`)
+- Health check: `GET <marker_url>/openapi.json`
+
+GROBID service:
+- Set `--grobid-url <base_url>` (for example `http://127.0.0.1:8070`)
+- Health check: `GET <grobid_url>/api/isalive`
+
+This keeps `paper-ocr` orchestration separate from service hosting and allows heavy compute to run on dedicated hardware.
 
 ### Workflow B: DOI CSV -> Telegram fetch -> OCR
 
@@ -302,6 +315,7 @@ Project layout:
 - `FloodWaitError`: reduce request rate by increasing `--min-delay/--max-delay`.
 - High DeepInfra usage on born-digital PDFs: ensure `--no-text-only` is not set (text-only is default) and use `--force` when re-running old outputs so pages are reprocessed under current settings.
 - `marker_single: command not found`: install Marker separately or pass a valid `--marker-command`.
+- `--marker-url` connection errors: verify Marker API is reachable and `openapi.json` loads.
 - Marker extraction fails on some pages: run continues via fallback; inspect page-level `status=structured_fallback` in `manifest.json`.
 - GROBID connection errors: verify `--grobid-url` points to reachable service endpoint from this machine.
 

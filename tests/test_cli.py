@@ -215,6 +215,7 @@ def test_run_structured_defaults(monkeypatch):
     assert args.digital_structured == "auto"
     assert args.structured_backend == "hybrid"
     assert args.marker_command == "marker_single"
+    assert args.marker_url == ""
     assert args.marker_timeout == 120
     assert args.grobid_url == ""
     assert args.grobid_timeout == 60
@@ -244,6 +245,22 @@ def test_run_structured_export_overrides(monkeypatch):
     assert args.extract_structured_data is False
     assert args.deplot_command == "deplot-cli --image {image}"
     assert args.deplot_timeout == 30
+
+
+def test_run_marker_service_override(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "run",
+            "data/in",
+            "out",
+            "--marker-url",
+            "http://127.0.0.1:8008",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.marker_url == "http://127.0.0.1:8008"
 
 
 def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
@@ -388,6 +405,7 @@ def test_process_page_structured_success_skips_fallback(monkeypatch, tmp_path: P
             page_index=0,
             pdf_path=tmp_path / "doc.pdf",
             marker_command="marker_single",
+            marker_url="",
             marker_timeout=5,
             structured_asset_level="standard",
             structured_backend="hybrid",
@@ -433,6 +451,7 @@ def test_process_page_structured_failure_uses_fallback(monkeypatch, tmp_path: Pa
             page_index=0,
             pdf_path=tmp_path / "doc.pdf",
             marker_command="marker_single",
+            marker_url="",
             marker_timeout=5,
             structured_asset_level="standard",
             structured_backend="hybrid",

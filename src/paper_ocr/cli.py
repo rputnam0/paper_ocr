@@ -54,6 +54,7 @@ SEARCH_TIMEOUT_DEFAULT = 40
 CSV_JOB_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 DIGITAL_STRUCTURED_DEFAULT = "auto"
 MARKER_COMMAND_DEFAULT = "marker_single"
+MARKER_URL_DEFAULT = ""
 MARKER_TIMEOUT_DEFAULT = "120"
 GROBID_TIMEOUT_DEFAULT = "60"
 DEPLOT_TIMEOUT_DEFAULT = "90"
@@ -95,6 +96,12 @@ def _parse_args() -> argparse.Namespace:
         "--marker-command",
         type=str,
         default=os.getenv("PAPER_OCR_MARKER_COMMAND", MARKER_COMMAND_DEFAULT),
+    )
+    run.add_argument(
+        "--marker-url",
+        type=str,
+        default=os.getenv("PAPER_OCR_MARKER_URL", MARKER_URL_DEFAULT),
+        help="Optional Marker service base URL (for example http://127.0.0.1:8008).",
     )
     run.add_argument(
         "--marker-timeout",
@@ -411,6 +418,7 @@ async def _process_page_structured(
     page_index: int,
     pdf_path: Path,
     marker_command: str,
+    marker_url: str,
     marker_timeout: int,
     structured_asset_level: str,
     structured_backend: str,
@@ -439,6 +447,7 @@ async def _process_page_structured(
             marker_timeout,
             dirs["assets"],
             structured_asset_level,
+            marker_url,
         )
 
     if marker_result.success:
@@ -675,6 +684,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         digital_structured = str(getattr(args, "digital_structured", "off"))
         structured_backend = str(getattr(args, "structured_backend", "hybrid"))
         marker_command = str(getattr(args, "marker_command", MARKER_COMMAND_DEFAULT))
+        marker_url = str(getattr(args, "marker_url", MARKER_URL_DEFAULT) or "")
         marker_timeout = int(getattr(args, "marker_timeout", int(MARKER_TIMEOUT_DEFAULT)))
         structured_asset_level = str(getattr(args, "structured_asset_level", "standard"))
         grobid_url = str(getattr(args, "grobid_url", "") or "")
@@ -715,6 +725,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                     page_index=page_index,
                     pdf_path=pdf_path,
                     marker_command=marker_command,
+                    marker_url=marker_url,
                     marker_timeout=marker_timeout,
                     structured_asset_level=structured_asset_level,
                     structured_backend=structured_backend,

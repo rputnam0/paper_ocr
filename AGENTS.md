@@ -93,3 +93,18 @@ out/<input_parent>/<author_year>/
 - When changing routing heuristics or rendering settings, update tests accordingly.
 - If adding new dependencies, update `pyproject.toml` and ensure `uv sync` remains clean.
 - Avoid committing secrets or API keys; rely on `.env` and `.gitignore`.
+
+## Remote Service Guidance (Marker/GROBID)
+- Prefer service URLs for heavy structured extraction when running from low-resource clients.
+- `paper-ocr run` supports both:
+  - Marker CLI mode: `--marker-command ...`
+  - Marker service mode: `--marker-url <base_url>`
+- GROBID service mode: `--grobid-url <base_url>`
+- Environment defaults for service mode:
+  - `PAPER_OCR_MARKER_URL`
+  - `PAPER_OCR_GROBID_URL`
+- Service health checks before long runs:
+  - Marker: `GET <marker_url>/openapi.json`
+  - GROBID: `GET <grobid_url>/api/isalive`
+- If services are remote, agents may use SSH local forwarding to bind remote service ports to localhost, then pass localhost URLs to CLI options/env vars.
+- Marker OCR must remain disabled by default; do not remove no-OCR safeguards in structured extraction path.
