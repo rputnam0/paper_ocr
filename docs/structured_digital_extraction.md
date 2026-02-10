@@ -35,6 +35,15 @@ Also produce machine-readable table/figure artifacts for downstream analytics.
 - TEI is persisted to:
   - `metadata/assets/structured/grobid/fulltext.tei.xml`
 - Parsed TEI can patch missing bibliography values (`title`, `authors`, `year`) and provide section candidates.
+- Parsed TEI also emits:
+  - `metadata/assets/structured/grobid/figures_tables.jsonl`
+- Each JSONL record includes:
+  - `doc_id`
+  - `type` (`figure` or `table`)
+  - `label`
+  - `caption_text`
+  - `page`
+  - `coords[]` entries parsed from TEI coordinate strings (`page,x,y,w,h`)
 - GROBID failures are non-fatal and do not stop OCR.
 
 ## Output Contract
@@ -53,6 +62,7 @@ New structured artifacts are additive:
 - `metadata/assets/structured/marker/page_0001.json`
 - `metadata/assets/structured/marker/page_0001_assets/*`
 - `metadata/assets/structured/grobid/fulltext.tei.xml`
+- `metadata/assets/structured/grobid/figures_tables.jsonl`
 - `metadata/assets/structured/extracted/manifest.json`
 - `metadata/assets/structured/extracted/tables/manifest.jsonl`
 - `metadata/assets/structured/extracted/tables/p0001_t01.csv`
@@ -107,6 +117,7 @@ Environment variables:
 
 - `PAPER_OCR_DIGITAL_STRUCTURED`
 - `PAPER_OCR_MARKER_COMMAND`
+- `PAPER_OCR_MARKER_URL`
 - `PAPER_OCR_GROBID_URL`
 - `PAPER_OCR_MARKER_TIMEOUT`
 - `PAPER_OCR_GROBID_TIMEOUT`
@@ -116,6 +127,7 @@ CLI options:
 - `--digital-structured off|auto|on`
 - `--structured-backend marker|hybrid`
 - `--marker-command <cmd>`
+- `--marker-url <url>`
 - `--marker-timeout <sec>`
 - `--grobid-url <url>`
 - `--grobid-timeout <sec>`

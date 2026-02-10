@@ -35,6 +35,7 @@ class GrobidResult:
     tei_xml: str = ""
     bibliography_patch: dict[str, Any] = field(default_factory=dict)
     sections: list[dict[str, Any]] = field(default_factory=list)
+    figures_tables: list[dict[str, Any]] = field(default_factory=list)
     artifacts: dict[str, str] = field(default_factory=dict)
     error: str = ""
 
@@ -409,7 +410,91 @@ def _tei_text(el: ET.Element | None) -> str:
     return " ".join("".join(el.itertext()).split())
 
 
-def _parse_grobid_tei(tei_xml: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _coord_page(value: str) -> int | None:
+    token = str(value).strip()
+    if not token:
+        return None
+    try:
+        return int(float(token))
+    except Exception:
+        return None
+
+
+def _parse_coords_string(raw: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for chunk in str(raw or "").split(";"):
+        item = chunk.strip()
+        if not item:
+            continue
+        parts = [p.strip() for p in item.split(",")]
+        if len(parts) < 5:
+            continue
+        page = _coord_page(parts[0])
+        try:
+            x, y, w, h = (float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]))
+        except Exception:
+            continue
+        out.append(
+            {
+                "raw": item,
+                "page": page,
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+            }
+        )
+    return out
+
+
+def _parse_figures_tables(
+    root: ET.Element,
+    ns: dict[str, str],
+    doc_id: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for fig in root.findall(".//tei:figure", ns):
+        fig_type = str(fig.attrib.get("type", "figure")).strip().lower()
+        if fig_type != "table":
+            fig_type = "figure"
+        label = _tei_text(fig.find("tei:label", ns))
+        head = _tei_text(fig.find("tei:head", ns))
+        fig_desc = _tei_text(fig.find("tei:figDesc", ns))
+        caption_parts = [p for p in (head, fig_desc) if p]
+        caption_text = " ".join(caption_parts).strip()
+
+        coord_strings: list[str] = []
+        for node in fig.iter():
+            raw = str(node.attrib.get("coords", "")).strip()
+            if raw:
+                coord_strings.append(raw)
+        dedup_coords = list(dict.fromkeys(coord_strings))
+        coords: list[dict[str, Any]] = []
+        for coord_raw in dedup_coords:
+            coords.extend(_parse_coords_string(coord_raw))
+
+        page = next((int(c["page"]) for c in coords if c.get("page") is not None), None)
+        if page is None:
+            pb = fig.find(".//tei:pb", ns)
+            if pb is not None:
+                page = _coord_page(pb.attrib.get("n", ""))
+
+        if not (label or caption_text or coords):
+            continue
+        records.append(
+            {
+                "doc_id": doc_id,
+                "type": fig_type,
+                "label": label,
+                "caption_text": caption_text,
+                "page": page,
+                "coords": coords,
+            }
+        )
+    return records
+
+
+def _parse_grobid_tei(tei_xml: str, doc_id: str = "") -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     ns = {"tei": "http://www.tei-c.org/ns/1.0"}
     root = ET.fromstring(tei_xml)
 
@@ -468,7 +553,8 @@ def _parse_grobid_tei(tei_xml: str) -> tuple[dict[str, Any], list[dict[str, Any]
         "authors": authors,
         "year": year,
     }
-    return patch, sections
+    figures_tables = _parse_figures_tables(root, ns, doc_id)
+    return patch, sections, figures_tables
 
 
 def run_grobid_doc(
@@ -476,6 +562,7 @@ def run_grobid_doc(
     grobid_url: str,
     timeout: int,
     tei_out_path: Path,
+    doc_id: str = "",
 ) -> GrobidResult:
     if not str(grobid_url).strip():
         return GrobidResult(success=False, error="No GROBID URL configured.")
@@ -487,13 +574,24 @@ def run_grobid_doc(
             tei_xml = resp.read().decode("utf-8", errors="replace")
         tei_out_path.parent.mkdir(parents=True, exist_ok=True)
         tei_out_path.write_text(tei_xml)
-        patch, sections = _parse_grobid_tei(tei_xml)
+        patch, sections, figures_tables = _parse_grobid_tei(tei_xml, doc_id=doc_id)
+        figures_tables_path = tei_out_path.parent / "figures_tables.jsonl"
+        if figures_tables:
+            figures_tables_path.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=True) for row in figures_tables) + "\n"
+            )
+        else:
+            figures_tables_path.write_text("")
         return GrobidResult(
             success=True,
             tei_xml=tei_xml,
             bibliography_patch=patch,
             sections=sections,
-            artifacts={"tei_xml": str(tei_out_path)},
+            figures_tables=figures_tables,
+            artifacts={
+                "tei_xml": str(tei_out_path),
+                "figures_tables": str(figures_tables_path),
+            },
         )
     except Exception as exc:  # noqa: BLE001
         return GrobidResult(success=False, error=str(exc))

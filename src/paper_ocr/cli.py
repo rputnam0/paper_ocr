@@ -702,6 +702,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         grobid_used = False
         grobid_error = ""
         grobid_sections: list[dict[str, Any]] = []
+        grobid_figures_tables_count = 0
 
         async def _process_one_page(page_index: int, page_dirs: dict[str, Path]) -> dict[str, Any]:
             heuristics = heuristics_by_page[page_index] if page_signals else compute_text_heuristics(doc.load_page(page_index).get_text("dict"))
@@ -753,10 +754,12 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                     grobid_url,
                     grobid_timeout,
                     dirs["assets"] / "structured" / "grobid" / "fulltext.tei.xml",
+                    doc_id,
                 )
                 if grobid_result.success:
                     grobid_used = True
                     grobid_sections = grobid_result.sections
+                    grobid_figures_tables_count = len(grobid_result.figures_tables)
                     bibliography = _merge_bibliography_with_patch(bibliography, grobid_result.bibliography_patch)
                 else:
                     grobid_error = grobid_result.error
@@ -795,6 +798,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "enabled": structured_enabled,
             "backend": structured_backend if structured_enabled else "none",
             "grobid_used": grobid_used,
+            "grobid_figures_tables_count": grobid_figures_tables_count,
             "fallback_count": fallback_count,
             "structured_page_count": structured_page_count,
         }

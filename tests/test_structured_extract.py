@@ -271,3 +271,56 @@ def test_run_grobid_doc_failure(monkeypatch, tmp_path: Path):
     )
     assert not result.success
     assert "boom" in result.error
+
+
+def test_run_grobid_doc_extracts_figures_tables(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    tei = b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<TEI xmlns=\"http://www.tei-c.org/ns/1.0\">
+  <text>
+    <body>
+      <figure type=\"table\" coords=\"2,10,20,30,40\">
+        <label>Table 2</label>
+        <figDesc>Viscosity values for polymers.</figDesc>
+      </figure>
+      <figure coords=\"3,11,21,31,41;3,15,25,35,45\">
+        <label>Figure 5</label>
+        <head>Flow curve</head>
+      </figure>
+    </body>
+  </text>
+</TEI>
+"""
+
+    class _Resp:
+        def __enter__(self):  # noqa: D401
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def read(self) -> bytes:
+            return tei
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: _Resp())
+    tei_out = tmp_path / "assets" / "structured" / "grobid" / "fulltext.tei.xml"
+    result = run_grobid_doc(
+        pdf_path=pdf_path,
+        grobid_url="http://localhost:8070",
+        timeout=10,
+        tei_out_path=tei_out,
+        doc_id="doc_abc123",
+    )
+    assert result.success
+    assert len(result.figures_tables) == 2
+    assert result.figures_tables[0]["doc_id"] == "doc_abc123"
+    assert result.figures_tables[0]["type"] == "table"
+    assert result.figures_tables[0]["label"] == "Table 2"
+    assert result.figures_tables[0]["page"] == 2
+    assert len(result.figures_tables[1]["coords"]) == 2
+    assert "figures_tables" in result.artifacts
+    figures_tables_path = Path(result.artifacts["figures_tables"])
+    assert figures_tables_path.exists()
+    lines = [ln for ln in figures_tables_path.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 2

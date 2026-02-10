@@ -263,6 +263,7 @@ out/<input_parent_folder>/<author_year>/
           page_0001_assets/
         grobid/
           fulltext.tei.xml
+          figures_tables.jsonl
         extracted/
           manifest.json
           tables/
@@ -281,6 +282,7 @@ Behavior notes:
 - Consolidated markdown filename is derived from extracted title.
 - Group-level readmes are generated for folder-level discoverability.
 - `manifest.json` includes a `structured_extraction` block with `enabled`, `backend`, `grobid_used`, `fallback_count`, and `structured_page_count`.
+- `metadata/assets/structured/grobid/figures_tables.jsonl` provides a GROBID-derived figure/table index with labels, captions, page, and coords for QA/fallback targeting.
 - `manifest.json` includes `structured_data_extraction` with table/figure/deplot counts and extraction errors.
 - Figure records are resolved against Marker page asset folders, making embedded figure files addressable for downstream ML extraction.
 
