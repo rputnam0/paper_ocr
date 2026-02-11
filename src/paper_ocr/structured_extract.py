@@ -916,6 +916,7 @@ def run_marker_doc(
                     (marker_root / "full_document.md").write_text(md)
                 (marker_root / "raw_service_payload.json").write_text(json.dumps(payload, indent=2, ensure_ascii=True))
                 block_rows: list[dict[str, Any]] = [b for b in (payload.get("chunks") or payload.get("blocks") or []) if isinstance(b, dict)]
+                derived_rows: list[dict[str, Any]] = []
                 tree_obj: Any | None = None
                 output_obj = payload.get("output")
                 if isinstance(output_obj, dict):
@@ -930,22 +931,17 @@ def run_marker_doc(
                 flat_blocks = _flatten_marker_blocks(tree_obj) if tree_obj is not None else []
                 if flat_blocks:
                     derived_rows = _marker_rows_for_localization(flat_blocks)
-                    if not block_rows:
-                        block_rows = derived_rows
-                    if derived_rows:
-                        (marker_root / "blocks.jsonl").write_text(
-                            "\n".join(json.dumps(r, ensure_ascii=True) for r in derived_rows) + "\n"
-                        )
                     tables_raw = _extract_tables_raw_from_blocks(flat_blocks)
                     if tables_raw:
                         (marker_root / "tables_raw.jsonl").write_text(
                             "\n".join(json.dumps(r, ensure_ascii=True) for r in tables_raw) + "\n"
                         )
-                if block_rows and not (marker_root / "blocks.jsonl").exists():
+                # Prefer derived rows from output-tree flattening when available.
+                if derived_rows:
+                    block_rows = derived_rows
+                if block_rows:
                     (marker_root / "blocks.jsonl").write_text(
                         "\n".join(json.dumps(r, ensure_ascii=True) for r in block_rows) + "\n"
-                    )
-
                     )
                 status = _collect_localization_status(block_rows, page_count=page_count)
                 artifacts = {

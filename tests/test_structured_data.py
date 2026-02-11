@@ -336,6 +336,36 @@ def test_build_structured_exports_merges_adjacent_continued_tables(tmp_path: Pat
     assert payloads[0]["pages"] == [2, 3]
 
 
+def test_build_structured_exports_does_not_merge_adjacent_same_number_without_header_similarity(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "page": 2,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["Polymer", "Value"]],
+            "data_rows": [["A", "10"]],
+            "caption_text": "Table 5: Main run",
+        },
+        {
+            "page": 3,
+            "polygons": [[[12, 12], [102, 12], [102, 202], [12, 202]]],
+            "header_rows": [["Solvent", "Viscosity"]],
+            "data_rows": [["Water", "12"]],
+            "caption_text": "Table 5: Alternate set",
+        },
+    ]
+    (marker_root / "tables_raw.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 2
+    canonical = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "canonical.jsonl"
+    payloads = [json.loads(line) for line in canonical.read_text().splitlines() if line.strip()]
+    assert len(payloads) == 2
+
+
 def test_build_structured_exports_flattens_multilevel_headers(tmp_path: Path):
     doc_dir = tmp_path / "Doe_2024"
     (doc_dir / "pages").mkdir(parents=True)

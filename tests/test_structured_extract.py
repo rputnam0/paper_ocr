@@ -499,6 +499,60 @@ def test_run_marker_doc_service_parses_colspan_rowspan_tables(monkeypatch, tmp_p
     assert rows[0]["data_rows"][0] == ["HPMC", "Water", "1.46E-02", "0.93"]
 
 
+def test_run_marker_doc_service_prefers_output_tree_blocks_over_chunks(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    assets_root = tmp_path / "assets"
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def read(self) -> bytes:
+            payload = {
+                "success": True,
+                "markdown": "# Service document\n",
+                # Simulate less structured chunk rows present in payload root.
+                "chunks": [{"type": "paragraph", "page": 1}],
+                # Simulate richer output-tree blocks also present.
+                "output": {
+                    "children": [
+                        {
+                            "id": "/page/0/Table/2",
+                            "block_type": "Table",
+                            "bbox": [10, 45, 480, 300],
+                            "polygon": [[10, 45], [480, 45], [480, 300], [10, 300]],
+                            "html": (
+                                "<table><tr><th>Polymer</th><th>Value</th></tr>"
+                                "<tr><td>PVP</td><td>1.20</td></tr></table>"
+                            ),
+                        },
+                    ]
+                },
+            }
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: _Resp())
+    result = run_marker_doc(
+        pdf_path=pdf_path,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=assets_root,
+        profile="full_json",
+        marker_url="http://127.0.0.1:8008",
+    )
+    assert result.success
+    blocks_path = Path(result.artifacts["blocks"])
+    rows = [json.loads(line) for line in blocks_path.read_text().splitlines() if line.strip()]
+    assert rows
+    assert rows[0]["type"] == "table"
+    assert rows[0].get("bbox")
+    assert result.localization_page_status[1]["has_geometry"] is True
+
+
 def test_build_render_contract_and_grobid_coord_conversion():
     contract = build_render_contract(
         pdf_page_w_pt=612.0,

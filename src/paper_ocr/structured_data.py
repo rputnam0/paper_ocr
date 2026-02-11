@@ -751,7 +751,7 @@ def _match_tables_for_page(
         for o_idx, ocr in enumerate(ocr_tables):
             o_headers = [str(x) for x in ocr.get("headers", [])]
             o_rows = [[str(x) for x in row] for row in ocr.get("rows", []) if isinstance(row, list)]
-            header_sim = _header_similarity(m_headers, m_rows, o_headers, o_rows)
+            header_sim = _header_similarity_by_tokens(m_headers, m_rows, o_headers, o_rows)
             col_sim = 1.0 - (abs(len(m_headers) - len(o_headers)) / max(len(m_headers), len(o_headers), 1))
             row_sim = 1.0 - (abs(len(m_rows) - len(o_rows)) / max(len(m_rows), len(o_rows), 1))
             score = (0.7 * header_sim) + (0.2 * col_sim) + (0.1 * row_sim)
