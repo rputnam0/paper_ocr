@@ -20,6 +20,27 @@ TABLE_VALIDATION_SCHEMA: dict[str, Any] = {
         "false_positive_risk": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "recommended_action": {"type": "string", "enum": ["accept", "review", "reject"]},
         "issues": {"type": "array", "items": {"type": "string"}},
+        "failure_modes": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": [
+                    "split_table_continuation",
+                    "header_misalignment",
+                    "row_shift_or_merge",
+                    "column_shift_or_merge",
+                    "symbol_or_unit_loss",
+                    "caption_mismatch",
+                    "code_legend_unresolved",
+                    "table_not_present",
+                    "ocr_noise",
+                    "other",
+                ],
+            },
+        },
+        "root_cause_hypothesis": {"type": "string"},
+        "needs_followup": {"type": "boolean"},
+        "followup_recommendations": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "table_present_on_page",
@@ -217,12 +238,32 @@ def _normalize_review(payload: dict[str, Any], *, raw_response: str) -> dict[str
             if text:
                 issues.append(text)
 
+    failure_modes_raw = payload.get("failure_modes", [])
+    failure_modes: list[str] = []
+    if isinstance(failure_modes_raw, list):
+        for item in failure_modes_raw:
+            text = str(item).strip()
+            if text:
+                failure_modes.append(text)
+
+    followup_raw = payload.get("followup_recommendations", [])
+    followup_recommendations: list[str] = []
+    if isinstance(followup_raw, list):
+        for item in followup_raw:
+            text = str(item).strip()
+            if text:
+                followup_recommendations.append(text)
+
     return {
         "table_present_on_page": presence,
         "extraction_quality": quality,
         "false_positive_risk": risk,
         "recommended_action": action,
         "issues": issues,
+        "failure_modes": failure_modes,
+        "root_cause_hypothesis": str(payload.get("root_cause_hypothesis", "") or "").strip(),
+        "needs_followup": bool(payload.get("needs_followup", False)),
+        "followup_recommendations": followup_recommendations,
         "raw_response": raw_response,
     }
 
@@ -232,6 +273,94 @@ def _short(value: Any, *, limit: int = 80) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+def _truncate_text(text: str, *, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+
+
+def _resolve_csv_text(doc_dir: Path, table_row: dict[str, Any]) -> str:
+    csv_path_raw = str(table_row.get("csv_path", "")).strip()
+    if not csv_path_raw:
+        return ""
+    csv_path = Path(csv_path_raw)
+    candidates = [csv_path]
+    if not csv_path.is_absolute():
+        candidates.append(doc_dir / csv_path)
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            try:
+                return candidate.read_text()
+            except Exception:
+                return ""
+    return ""
+
+
+def _resolve_fragment_index(doc_dir: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    fragments_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "table_fragments.jsonl"
+    for row in _load_jsonl(fragments_path):
+        fid = str(row.get("fragment_id", "")).strip()
+        if fid:
+            out[fid] = row
+    return out
+
+
+def _resolve_table_validation_context(
+    *,
+    doc_dir: Path,
+    table_row: dict[str, Any],
+    fragment_index: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    table_id = str(table_row.get("table_id", "")).strip()
+    detail_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / f"{table_id}.json"
+    detail = _load_json(detail_path) if table_id else {}
+    csv_text = _resolve_csv_text(doc_dir, table_row)
+
+    fragment_rows: list[dict[str, Any]] = []
+    fragment_ids = detail.get("fragment_ids", [])
+    if isinstance(fragment_ids, list):
+        for item in fragment_ids:
+            fid = str(item).strip()
+            frag = fragment_index.get(fid)
+            if not frag:
+                continue
+            fragment_rows.append(
+                {
+                    "fragment_id": fid,
+                    "page": frag.get("page"),
+                    "table_group_id": frag.get("table_group_id"),
+                    "header_rows": frag.get("header_rows", []),
+                    "data_rows": frag.get("data_rows", []),
+                    "caption_text": frag.get("caption_text", ""),
+                }
+            )
+
+    ocr_html = ""
+    ocr_merge = detail.get("ocr_merge", {}) if isinstance(detail, dict) else {}
+    if isinstance(ocr_merge, dict):
+        ocr_path_raw = str(ocr_merge.get("ocr_html_path", "")).strip()
+        if ocr_path_raw:
+            ocr_path = Path(ocr_path_raw)
+            candidates = [ocr_path]
+            if not ocr_path.is_absolute():
+                candidates.append(doc_dir / ocr_path)
+            for candidate in candidates:
+                if candidate.exists() and candidate.is_file():
+                    try:
+                        ocr_html = candidate.read_text()
+                    except Exception:
+                        ocr_html = ""
+                    break
+
+    return {
+        "table_detail": detail,
+        "extracted_csv": csv_text,
+        "marker_fragments": fragment_rows,
+        "ocr_html": ocr_html,
+    }
 
 
 def _resolve_validation_pages(table_row: dict[str, Any], doc_dir: Path) -> list[int]:
@@ -266,34 +395,115 @@ def _resolve_validation_pages(table_row: dict[str, Any], doc_dir: Path) -> list[
     return deduped
 
 
+GROUP_PAGE_TABLE_RE = re.compile(r"page_(\d+)_table_(\d+)$")
+
+
+def _resolve_table_crop_paths(
+    *,
+    doc_dir: Path,
+    validation_pages: list[int],
+    context: dict[str, Any],
+) -> list[Path]:
+    crops_root = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_crops"
+    if not crops_root.exists():
+        return []
+    paths: list[Path] = []
+    seen: set[str] = set()
+
+    fragments = context.get("marker_fragments", [])
+    if isinstance(fragments, list):
+        for frag in fragments:
+            if not isinstance(frag, dict):
+                continue
+            page = int(frag.get("page", 0) or 0)
+            group = str(frag.get("table_group_id", "")).strip()
+            m = GROUP_PAGE_TABLE_RE.search(group)
+            if page <= 0 or not m:
+                continue
+            ordinal = int(m.group(2))
+            crop_path = crops_root / f"table_{ordinal:02d}_page_{page:04d}.png"
+            key = str(crop_path)
+            if crop_path.exists() and key not in seen:
+                seen.add(key)
+                paths.append(crop_path)
+
+    if paths:
+        return paths
+
+    # Fallback: include all crops on continuation pages when fragment mapping is absent.
+    for page in validation_pages:
+        for path in sorted(crops_root.glob(f"table_*_page_{int(page):04d}.png")):
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(path)
+    return paths
+
+
 def _build_review_prompt(table_row: dict[str, Any]) -> str:
     raw_headers = table_row.get("headers", [])
-    headers = [_short(x, limit=56) for x in raw_headers[:8]] if isinstance(raw_headers, list) else []
+    headers = [str(x) for x in raw_headers] if isinstance(raw_headers, list) else []
     raw_rows = table_row.get("rows", [])
-    first_row: list[str] = []
-    if isinstance(raw_rows, list) and raw_rows and isinstance(raw_rows[0], list):
-        first_row = [_short(cell, limit=56) for cell in raw_rows[0][:8]]
+    rows: list[list[str]] = []
+    if isinstance(raw_rows, list):
+        for row in raw_rows:
+            if isinstance(row, list):
+                rows.append([str(cell) for cell in row])
+
+    extracted_table_json = _truncate_text(
+        json.dumps({"headers": headers, "rows": rows}, ensure_ascii=True),
+        limit=32000,
+    )
+    extracted_csv_text = _truncate_text(str(table_row.get("extracted_csv", "") or ""), limit=32000)
+    marker_fragments_json = _truncate_text(
+        json.dumps(table_row.get("marker_fragments", []), ensure_ascii=True),
+        limit=24000,
+    )
+    ocr_html_text = _truncate_text(str(table_row.get("ocr_html", "") or ""), limit=12000)
+    table_detail_json = _truncate_text(
+        json.dumps(table_row.get("table_detail", {}), ensure_ascii=True),
+        limit=16000,
+    )
 
     return (
         "Task: Validate one extracted table candidate against the provided page image(s).\n"
-        "Important: If multiple images are provided, they represent continuation pages of the same table.\n"
+        "Important: If multiple page images are provided, they represent continuation pages of the same table.\n"
+        "Use all provided evidence (page images, optional table crop images, marker fragments, OCR html, and final extracted table).\n"
+        "Judge whether final extraction preserves structure, headers, rows, symbols/units, and continuation semantics.\n"
+        "If table uses encoded labels/codes not resolved in the extracted output, flag code_legend_unresolved.\n"
         "Return JSON only (no markdown) with keys exactly:\n"
         'table_present_on_page ("yes"|"no"|"uncertain"),\n'
         "extraction_quality (0..1),\n"
         "false_positive_risk (0..1),\n"
         'recommended_action ("accept"|"review"|"reject"),\n'
-        "issues (string array).\n"
+        "issues (string array),\n"
+        "failure_modes (string array),\n"
+        "root_cause_hypothesis (string),\n"
+        "needs_followup (boolean),\n"
+        "followup_recommendations (string array).\n"
         "Scoring guidance:\n"
         "- Accept only when table structure/cells are mostly correct.\n"
         "- Review when table exists but extraction has notable issues.\n"
         "- Reject when table candidate is mostly wrong.\n"
+        "Failure mode taxonomy:\n"
+        "- split_table_continuation, header_misalignment, row_shift_or_merge, column_shift_or_merge,\n"
+        "  symbol_or_unit_loss, caption_mismatch, code_legend_unresolved, table_not_present, ocr_noise, other.\n"
         "Candidate summary:\n"
         f"table_id={_short(table_row.get('table_id', ''), limit=32)}\n"
         f"page={int(table_row.get('page', 0) or 0)}\n"
         f"validation_pages={table_row.get('validation_pages', [])}\n"
         f"caption={_short(table_row.get('caption', ''), limit=180)}\n"
-        f"headers={' | '.join(headers)}\n"
-        f"first_row={' | '.join(first_row)}"
+        "Final extracted table (JSON, full where possible):\n"
+        f"{extracted_table_json}\n"
+        "Final extracted CSV text:\n"
+        f"{extracted_csv_text}\n"
+        "Canonical table detail JSON:\n"
+        f"{table_detail_json}\n"
+        "Marker fragment lineage (JSON):\n"
+        f"{marker_fragments_json}\n"
+        "OCR merged table html/text (if available):\n"
+        f"{ocr_html_text}"
     )
 
 
@@ -311,7 +521,8 @@ async def _review_table_with_gemini(
     *,
     client: Any,
     config: GeminiValidationConfig,
-    image_bytes_list: list[bytes],
+    page_image_bytes_list: list[bytes],
+    crop_image_bytes_list: list[bytes],
     page_numbers: list[int],
     table_row: dict[str, Any],
 ) -> dict[str, Any]:
@@ -323,8 +534,10 @@ async def _review_table_with_gemini(
         raw_response = await client.generate_table_review(
             model=model,
             prompt=prompt,
-            image_bytes=image_bytes_list[0] if image_bytes_list else b"",
-            image_bytes_list=image_bytes_list,
+            image_bytes=page_image_bytes_list[0] if page_image_bytes_list else b"",
+            image_bytes_list=page_image_bytes_list + crop_image_bytes_list,
+            page_image_bytes_list=page_image_bytes_list,
+            crop_image_bytes_list=crop_image_bytes_list,
             page_numbers=page_numbers,
             generation_config=_generate_config(config),
         )
@@ -334,7 +547,11 @@ async def _review_table_with_gemini(
         return review
 
     content_parts: list[types.Part] = [types.Part.from_text(text=prompt)]
-    for image_bytes in image_bytes_list:
+    for idx, image_bytes in enumerate(page_image_bytes_list, start=1):
+        content_parts.append(types.Part.from_text(text=f"Page image {idx}/{len(page_image_bytes_list)}"))
+        content_parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/png"))
+    for idx, image_bytes in enumerate(crop_image_bytes_list, start=1):
+        content_parts.append(types.Part.from_text(text=f"Table crop image {idx}/{len(crop_image_bytes_list)}"))
         content_parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/png"))
 
     response = await client.aio.models.generate_content(
@@ -428,6 +645,7 @@ async def run_gemini_table_validation(
 
             doc_rows: list[dict[str, Any]] = []
             page_cache: dict[int, bytes] = {}
+            fragment_index = _resolve_fragment_index(doc_dir)
             with fitz.open(source_pdf) as pdf:
                 for table in tables:
                     page = int(table.get("page", 0) or 0)
@@ -445,12 +663,33 @@ async def run_gemini_table_validation(
                         if p not in page_cache:
                             page_cache[p] = _render_page_png(pdf, p, int(config.render_dpi))
                         image_bytes_list.append(page_cache[p])
+                    context = _resolve_table_validation_context(
+                        doc_dir=doc_dir,
+                        table_row=table,
+                        fragment_index=fragment_index,
+                    )
+                    crop_paths = _resolve_table_crop_paths(
+                        doc_dir=doc_dir,
+                        validation_pages=pages,
+                        context=context,
+                    )
+                    crop_image_bytes_list: list[bytes] = []
+                    for crop_path in crop_paths:
+                        try:
+                            crop_image_bytes_list.append(crop_path.read_bytes())
+                        except Exception:
+                            continue
                     table_for_prompt = dict(table)
                     table_for_prompt["validation_pages"] = pages
+                    table_for_prompt["table_detail"] = context.get("table_detail", {})
+                    table_for_prompt["extracted_csv"] = context.get("extracted_csv", "")
+                    table_for_prompt["marker_fragments"] = context.get("marker_fragments", [])
+                    table_for_prompt["ocr_html"] = context.get("ocr_html", "")
                     review = await _review_table_with_gemini(
                         client=review_client,
                         config=config,
-                        image_bytes_list=image_bytes_list,
+                        page_image_bytes_list=image_bytes_list,
+                        crop_image_bytes_list=crop_image_bytes_list,
                         page_numbers=pages,
                         table_row=table_for_prompt,
                     )
@@ -460,6 +699,7 @@ async def run_gemini_table_validation(
                             "table_id": str(table.get("table_id", "")),
                             "page": page,
                             "validation_pages": pages,
+                            "table_crop_count": len(crop_image_bytes_list),
                             "caption": str(table.get("caption", "")),
                             "headers": table.get("headers", []),
                             "rows": table.get("rows", []),
