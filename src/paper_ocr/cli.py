@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 from io import BytesIO
@@ -75,6 +76,8 @@ TABLE_HEADER_OCR_MODEL_DEFAULT = "allenai/olmOCR-2-7B-1025"
 TABLE_HEADER_OCR_MAX_TOKENS_DEFAULT = 1400
 DEFAULT_FETCH_OUTPUT_ROOT = Path("data/jobs")
 LEGACY_FETCH_OUTPUT_ROOT = Path("data/telegram_jobs")
+RESOURCE_GUARD_MIN_MEM_GB_DEFAULT = 24.0
+RESOURCE_GUARD_MIN_CPUS_DEFAULT = 8
 
 
 def _parse_args() -> argparse.Namespace:
@@ -241,6 +244,14 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional directory containing OCR HTML tables (default: metadata/assets/structured/qa/bbox_ocr_outputs).",
+    )
+    run.add_argument(
+        "--allow-local-heavy",
+        action="store_true",
+        help=(
+            "Allow local structured extraction even when resource guard recommends remote WSL services "
+            "(not recommended on low-resource machines)."
+        ),
     )
 
     fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")
@@ -455,6 +466,62 @@ def _require_telegram_credentials() -> tuple[int, str]:
     except ValueError as exc:
         raise SystemExit("Invalid TG_API_ID. Must be an integer.") from exc
     return api_id, api_hash
+
+
+def _system_memory_gib() -> float:
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        total = float(page_size * pages)
+        return total / (1024.0**3)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _resource_guard_violation(
+    args: argparse.Namespace,
+    *,
+    cpu_count: int | None = None,
+    mem_gib: float | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    env_map = env or dict(os.environ)
+    if bool(getattr(args, "allow_local_heavy", False)):
+        return ""
+    if str(env_map.get("PAPER_OCR_ALLOW_LOCAL_HEAVY", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return ""
+
+    digital_structured = str(getattr(args, "digital_structured", "off")).strip().lower()
+    marker_url = str(getattr(args, "marker_url", "") or "").strip()
+    if digital_structured not in {"auto", "on"}:
+        return ""
+    if marker_url:
+        return ""
+
+    require_wsl = str(env_map.get("PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    cpus = int(cpu_count if cpu_count is not None else (os.cpu_count() or 0))
+    memory_gib = float(mem_gib if mem_gib is not None else _system_memory_gib())
+    min_mem_gib = float(env_map.get("PAPER_OCR_RESOURCE_GUARD_MIN_MEM_GB", str(RESOURCE_GUARD_MIN_MEM_GB_DEFAULT)))
+    min_cpus = int(env_map.get("PAPER_OCR_RESOURCE_GUARD_MIN_CPUS", str(RESOURCE_GUARD_MIN_CPUS_DEFAULT)))
+    low_resource = (memory_gib > 0 and memory_gib < min_mem_gib) or (cpus > 0 and cpus < min_cpus)
+
+    # On low-resource hosts (or explicit policy), prevent accidental local Marker CLI execution.
+    if not (require_wsl or low_resource):
+        return ""
+
+    host = f"{platform.system()} cpus={cpus} mem_gib={memory_gib:.1f}"
+    return (
+        "Resource guard blocked local structured run: digital-structured requires remote Marker service on this host "
+        f"({host}). Configure WSL service URLs and retry:\n"
+        "  ssh -N -L 8008:127.0.0.1:8008 -L 8070:127.0.0.1:8070 wsl\n"
+        "  uv run paper-ocr run <in_dir> <out_dir> --marker-url http://127.0.0.1:8008 --grobid-url http://127.0.0.1:8070\n"
+        "If you intentionally want local heavy execution, pass --allow-local-heavy or set PAPER_OCR_ALLOW_LOCAL_HEAVY=1."
+    )
 
 
 def _page_out_path(pages_dir: Path, page_index: int) -> Path:
@@ -1580,6 +1647,9 @@ async def _run(args: argparse.Namespace) -> None:
             "Refusing to write final OCR outputs under data/jobs. "
             "Use a canonical output folder such as out/<job_slug>."
         )
+    violation = _resource_guard_violation(args)
+    if violation:
+        raise SystemExit(violation)
     pdfs = discover_pdfs(args.in_dir)
     if not pdfs:
         raise SystemExit(f"No PDFs found in {args.in_dir}")

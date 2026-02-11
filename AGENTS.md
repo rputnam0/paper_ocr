@@ -129,6 +129,9 @@ Validation command:
 - This machine is a low-resource MacBook Air; keep non-heavy processing local.
 - Use WSL-hosted services only for heavy GPU-oriented structured extraction and GROBID document parsing.
 - Treat local CLI extraction as fallback only when the user explicitly requests it.
+- `paper-ocr run` enforces a resource guard for structured extraction:
+  - If `--digital-structured auto|on` and `--marker-url` is missing on a low-resource host, run fails fast and instructs WSL service usage.
+  - Override only when explicitly requested: `--allow-local-heavy` or `PAPER_OCR_ALLOW_LOCAL_HEAVY=1`.
 - `paper-ocr run` supports both:
   - Marker CLI mode: `--marker-command ...`
   - Marker service mode: `--marker-url <base_url>`

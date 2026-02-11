@@ -84,6 +84,15 @@ PAPER_OCR_MARKER_TIMEOUT=120
 PAPER_OCR_GROBID_TIMEOUT=60
 ```
 
+Resource guard defaults (to avoid accidental local heavy runs on low-resource hosts):
+
+```ini
+PAPER_OCR_RESOURCE_GUARD_MIN_MEM_GB=24
+PAPER_OCR_RESOURCE_GUARD_MIN_CPUS=8
+PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED=0
+PAPER_OCR_ALLOW_LOCAL_HEAVY=0
+```
+
 ## Repository Organization
 
 Keep generated artifacts out of project root and use explicit contracts:
@@ -148,6 +157,12 @@ Core options:
 - `--table-escalation off|auto|always` default `auto`
 - `--table-escalation-max` default `20`
 - `--table-qa-mode off|warn|strict` default `warn`
+- `--allow-local-heavy` bypass resource guard and allow local structured execution
+
+Resource guard behavior:
+- If `--digital-structured` is `auto|on` and no `--marker-url` is set, `paper-ocr run` checks host resources.
+- On low-resource hosts, run fails fast with instructions to use WSL Marker/GROBID services through SSH tunneling.
+- Override only when intentional: `--allow-local-heavy` or `PAPER_OCR_ALLOW_LOCAL_HEAVY=1`.
 
 ### 2) Fetch PDFs from DOI CSV via Telegram bot
 

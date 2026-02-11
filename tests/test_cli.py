@@ -275,6 +275,56 @@ def test_parse_run_table_pipeline_defaults(monkeypatch):
     assert args.table_qa_mode == "warn"
     assert args.compare_ocr_html is False
     assert args.ocr_html_dir is None
+    assert args.allow_local_heavy is False
+
+
+def test_parse_run_allow_local_heavy_flag(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "run",
+            "data/in",
+            "out",
+            "--allow-local-heavy",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.allow_local_heavy is True
+
+
+def test_resource_guard_blocks_local_structured_on_low_resource():
+    args = argparse.Namespace(
+        digital_structured="auto",
+        marker_url="",
+        allow_local_heavy=False,
+    )
+    msg = cli._resource_guard_violation(
+        args,
+        cpu_count=4,
+        mem_gib=8.0,
+        env={},
+    )
+    assert "Resource guard blocked local structured run" in msg
+    assert "--marker-url http://127.0.0.1:8008" in msg
+
+
+def test_resource_guard_allows_when_marker_service_url_is_set():
+    args = argparse.Namespace(
+        digital_structured="auto",
+        marker_url="http://127.0.0.1:8008",
+        allow_local_heavy=False,
+    )
+    assert cli._resource_guard_violation(args, cpu_count=4, mem_gib=8.0, env={}) == ""
+
+
+def test_resource_guard_allows_with_explicit_override():
+    args = argparse.Namespace(
+        digital_structured="auto",
+        marker_url="",
+        allow_local_heavy=True,
+    )
+    assert cli._resource_guard_violation(args, cpu_count=4, mem_gib=8.0, env={}) == ""
 
 
 def test_parse_export_table_pipeline_options(monkeypatch):
