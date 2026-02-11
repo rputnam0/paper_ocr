@@ -34,6 +34,10 @@ Core metrics:
 
 - `table_detection_precision`
 - `table_detection_recall`
+- `row_count_match_rate`
+- `column_count_match_rate`
+- `key_cell_accuracy`
+- `numeric_parse_success`
 
 Pipeline-level metrics (from manifests/flags):
 
@@ -52,7 +56,18 @@ Extraction quality metrics (for CSV-backed gold subset):
 
 ## Regression Policy
 
-Suggested policy in CI:
+Regression CLI:
+
+```bash
+uv run paper-ocr eval-table-pipeline <gold_dir> <pred_dir> \
+  --baseline <baseline.json> \
+  --strict-regression \
+  --max-precision-drop 0.03 \
+  --max-recall-drop 0.03 \
+  --min-numeric-parse 0.8
+```
+
+Policy in CI:
 
 - fail when precision or recall drops by more than `0.03` from baseline
 - fail when QA disagreement rate increases by more than `0.05` without approved baseline update

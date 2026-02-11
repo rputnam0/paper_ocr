@@ -236,6 +236,38 @@ def test_parse_eval_table_pipeline_args(monkeypatch):
     assert args.command == "eval-table-pipeline"
     assert args.gold_dir == Path("gold")
     assert args.pred_dir == Path("pred")
+    assert args.baseline is None
+    assert args.strict_regression is False
+    assert args.max_precision_drop == 0.03
+    assert args.max_recall_drop == 0.03
+    assert args.min_numeric_parse == 0.8
+
+
+def test_parse_eval_table_pipeline_regression_options(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "eval-table-pipeline",
+            "gold",
+            "pred",
+            "--baseline",
+            "baseline.json",
+            "--strict-regression",
+            "--max-precision-drop",
+            "0.05",
+            "--max-recall-drop",
+            "0.04",
+            "--min-numeric-parse",
+            "0.9",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.baseline == Path("baseline.json")
+    assert args.strict_regression is True
+    assert args.max_precision_drop == 0.05
+    assert args.max_recall_drop == 0.04
+    assert args.min_numeric_parse == 0.9
 
 
 def test_parse_data_audit_args(monkeypatch):
@@ -254,6 +286,34 @@ def test_parse_data_audit_args(monkeypatch):
     assert args.data_dir == Path("data")
     assert args.strict is True
     assert args.json is True
+
+
+def test_run_eval_table_pipeline_strict_regression_raises(tmp_path: Path):
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "table_detection_precision": 0.95,
+                "table_detection_recall": 0.95,
+                "numeric_parse_success": 0.95,
+            }
+        )
+    )
+    args = argparse.Namespace(
+        gold_dir=tmp_path / "gold",
+        pred_dir=tmp_path / "pred",
+        baseline=baseline,
+        strict_regression=True,
+        max_precision_drop=0.03,
+        max_recall_drop=0.03,
+        min_numeric_parse=0.8,
+    )
+    (args.gold_dir).mkdir(parents=True, exist_ok=True)
+    (args.pred_dir).mkdir(parents=True, exist_ok=True)
+    (args.gold_dir / "tables.jsonl").write_text(json.dumps({"page": 1}) + "\n")
+    (args.pred_dir / "tables.jsonl").write_text("")
+    with pytest.raises(SystemExit, match="Regression checks failed"):
+        cli._run_eval_table_pipeline(args)
 
 
 def test_run_data_audit_strict_raises(tmp_path: Path):

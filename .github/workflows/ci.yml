@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: uv sync
+      - name: Run tests
+        run: uv run pytest
+      - name: Evaluate table pipeline regression
+        run: |
+          uv run paper-ocr eval-table-pipeline \
+            tests/fixtures/table_eval/gold \
+            tests/fixtures/table_eval/pred \
+            --baseline tests/fixtures/table_eval/baseline.json \
+            --strict-regression

@@ -1,0 +1,5 @@
+{
+  "table_detection_precision": 1.0,
+  "table_detection_recall": 1.0,
+  "numeric_parse_success": 1.0
+}

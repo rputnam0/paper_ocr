@@ -344,6 +344,21 @@ def _parse_args() -> argparse.Namespace:
     )
     eval_tables.add_argument("gold_dir", type=Path)
     eval_tables.add_argument("pred_dir", type=Path)
+    eval_tables.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help="Optional baseline metrics JSON for regression checks.",
+    )
+    eval_tables.add_argument(
+        "--strict-regression",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fail when regression thresholds are exceeded against baseline metrics.",
+    )
+    eval_tables.add_argument("--max-precision-drop", type=float, default=0.03)
+    eval_tables.add_argument("--max-recall-drop", type=float, default=0.03)
+    eval_tables.add_argument("--min-numeric-parse", type=float, default=0.8)
 
     audit = sub.add_parser("data-audit", help="Validate data/ folder organization contract")
     audit.add_argument("data_dir", type=Path, nargs="?", default=Path("data"))
@@ -1702,6 +1717,41 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
 
 def _run_eval_table_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     metrics = evaluate_table_pipeline(args.gold_dir, args.pred_dir)
+    baseline_path = getattr(args, "baseline", None)
+    strict_regression = bool(getattr(args, "strict_regression", False))
+    if baseline_path:
+        try:
+            baseline = json.loads(Path(baseline_path).read_text())
+        except Exception as exc:  # noqa: BLE001
+            raise SystemExit(f"Invalid baseline metrics file: {baseline_path} ({exc})") from exc
+        if not isinstance(baseline, dict):
+            raise SystemExit(f"Invalid baseline metrics file: {baseline_path}")
+        precision_drop = float(baseline.get("table_detection_precision", 0.0)) - float(metrics.get("table_detection_precision", 0.0))
+        recall_drop = float(baseline.get("table_detection_recall", 0.0)) - float(metrics.get("table_detection_recall", 0.0))
+        numeric_parse_success = float(metrics.get("numeric_parse_success", 0.0))
+        max_precision_drop = float(getattr(args, "max_precision_drop", 0.03))
+        max_recall_drop = float(getattr(args, "max_recall_drop", 0.03))
+        min_numeric_parse = float(getattr(args, "min_numeric_parse", 0.8))
+        regression = {
+            "baseline_path": str(Path(baseline_path)),
+            "precision_drop": precision_drop,
+            "recall_drop": recall_drop,
+            "numeric_parse_success": numeric_parse_success,
+            "max_precision_drop": max_precision_drop,
+            "max_recall_drop": max_recall_drop,
+            "min_numeric_parse": min_numeric_parse,
+            "violations": [],
+        }
+        if precision_drop > max_precision_drop:
+            regression["violations"].append(f"precision_drop={precision_drop:.4f} > {max_precision_drop:.4f}")
+        if recall_drop > max_recall_drop:
+            regression["violations"].append(f"recall_drop={recall_drop:.4f} > {max_recall_drop:.4f}")
+        if numeric_parse_success < min_numeric_parse:
+            regression["violations"].append(f"numeric_parse_success={numeric_parse_success:.4f} < {min_numeric_parse:.4f}")
+        metrics["regression"] = regression
+        if strict_regression and regression["violations"]:
+            print(json.dumps(metrics, indent=2))
+            raise SystemExit("Regression checks failed")
     print(json.dumps(metrics, indent=2))
     return metrics
 
