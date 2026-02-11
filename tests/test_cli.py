@@ -447,7 +447,7 @@ def test_parse_validate_tables_gemini_defaults(monkeypatch):
     assert args.model == "gemini-2.5-flash"
     assert args.api_key_env == "GEMINI_API_KEY"
     assert args.api_key == ""
-    assert args.max_output_tokens == 320
+    assert args.max_output_tokens == 900
     assert args.render_dpi == 220
     assert args.only_problem_docs is True
     assert args.max_docs == 0

@@ -29,9 +29,13 @@ TABLE_VALIDATION_SCHEMA: dict[str, Any] = {
                     "header_misalignment",
                     "row_shift_or_merge",
                     "column_shift_or_merge",
+                    "multi_level_header_loss",
                     "symbol_or_unit_loss",
                     "caption_mismatch",
                     "code_legend_unresolved",
+                    "partial_table_extracted",
+                    "duplicate_or_hallucinated_rows",
+                    "missing_required_columns",
                     "table_not_present",
                     "ocr_noise",
                     "other",
@@ -41,6 +45,31 @@ TABLE_VALIDATION_SCHEMA: dict[str, Any] = {
         "root_cause_hypothesis": {"type": "string"},
         "needs_followup": {"type": "boolean"},
         "followup_recommendations": {"type": "array", "items": {"type": "string"}},
+        "missing_required_information": {"type": "array", "items": {"type": "string"}},
+        "formatting_issues": {"type": "array", "items": {"type": "string"}},
+        "rubric": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "formatting_fidelity": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "structural_fidelity": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "data_completeness": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "unit_symbol_fidelity": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "context_resolution": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "overall_robustness": {
+                    "type": "string",
+                    "enum": ["robust", "mostly_robust", "fragile", "failed"],
+                },
+            },
+            "required": [
+                "formatting_fidelity",
+                "structural_fidelity",
+                "data_completeness",
+                "unit_symbol_fidelity",
+                "context_resolution",
+                "overall_robustness",
+            ],
+        },
     },
     "required": [
         "table_present_on_page",
@@ -48,6 +77,13 @@ TABLE_VALIDATION_SCHEMA: dict[str, Any] = {
         "false_positive_risk",
         "recommended_action",
         "issues",
+        "failure_modes",
+        "root_cause_hypothesis",
+        "needs_followup",
+        "followup_recommendations",
+        "missing_required_information",
+        "formatting_issues",
+        "rubric",
     ],
 }
 
@@ -56,7 +92,7 @@ TABLE_VALIDATION_SCHEMA: dict[str, Any] = {
 class GeminiValidationConfig:
     model: str = "gemini-2.5-flash"
     api_key: str = ""
-    max_output_tokens: int = 320
+    max_output_tokens: int = 900
     render_dpi: int = 220
     thinking_budget: int = 0
 
@@ -191,6 +227,22 @@ def _extract_partial_review_fields(text: str) -> dict[str, Any]:
             if issue:
                 issues.append(issue)
         out["issues"] = issues
+    m_failure = re.search(r'"failure_modes"\s*:\s*\[(.*?)\]', raw, flags=re.IGNORECASE | re.DOTALL)
+    if m_failure:
+        modes: list[str] = []
+        for m in re.finditer(r'"([^"]+)"', m_failure.group(1)):
+            mode = m.group(1).strip()
+            if mode:
+                modes.append(mode)
+        out["failure_modes"] = modes
+    m_missing = re.search(r'"missing_required_information"\s*:\s*\[(.*?)\]', raw, flags=re.IGNORECASE | re.DOTALL)
+    if m_missing:
+        missing: list[str] = []
+        for m in re.finditer(r'"([^"]+)"', m_missing.group(1)):
+            item = m.group(1).strip()
+            if item:
+                missing.append(item)
+        out["missing_required_information"] = missing
     return out
 
 
@@ -254,6 +306,43 @@ def _normalize_review(payload: dict[str, Any], *, raw_response: str) -> dict[str
             if text:
                 followup_recommendations.append(text)
 
+    missing_info_raw = payload.get("missing_required_information", [])
+    missing_required_information: list[str] = []
+    if isinstance(missing_info_raw, list):
+        for item in missing_info_raw:
+            text = str(item).strip()
+            if text:
+                missing_required_information.append(text)
+
+    formatting_issues_raw = payload.get("formatting_issues", [])
+    formatting_issues: list[str] = []
+    if isinstance(formatting_issues_raw, list):
+        for item in formatting_issues_raw:
+            text = str(item).strip()
+            if text:
+                formatting_issues.append(text)
+
+    rubric_payload = payload.get("rubric", {})
+    if not isinstance(rubric_payload, dict):
+        rubric_payload = {}
+    rubric = {
+        "formatting_fidelity": _clamp01(rubric_payload.get("formatting_fidelity", quality), default=quality),
+        "structural_fidelity": _clamp01(rubric_payload.get("structural_fidelity", quality), default=quality),
+        "data_completeness": _clamp01(rubric_payload.get("data_completeness", quality), default=quality),
+        "unit_symbol_fidelity": _clamp01(rubric_payload.get("unit_symbol_fidelity", quality), default=quality),
+        "context_resolution": _clamp01(rubric_payload.get("context_resolution", quality), default=quality),
+        "overall_robustness": str(rubric_payload.get("overall_robustness", "") or "").strip().lower(),
+    }
+    if rubric["overall_robustness"] not in {"robust", "mostly_robust", "fragile", "failed"}:
+        if quality >= 0.9:
+            rubric["overall_robustness"] = "robust"
+        elif quality >= 0.75:
+            rubric["overall_robustness"] = "mostly_robust"
+        elif quality >= 0.45:
+            rubric["overall_robustness"] = "fragile"
+        else:
+            rubric["overall_robustness"] = "failed"
+
     return {
         "table_present_on_page": presence,
         "extraction_quality": quality,
@@ -264,6 +353,9 @@ def _normalize_review(payload: dict[str, Any], *, raw_response: str) -> dict[str
         "root_cause_hypothesis": str(payload.get("root_cause_hypothesis", "") or "").strip(),
         "needs_followup": bool(payload.get("needs_followup", False)),
         "followup_recommendations": followup_recommendations,
+        "missing_required_information": missing_required_information,
+        "formatting_issues": formatting_issues,
+        "rubric": rubric,
         "raw_response": raw_response,
     }
 
@@ -470,8 +562,9 @@ def _build_review_prompt(table_row: dict[str, Any]) -> str:
         "Task: Validate one extracted table candidate against the provided page image(s).\n"
         "Important: If multiple page images are provided, they represent continuation pages of the same table.\n"
         "Use all provided evidence (page images, optional table crop images, marker fragments, OCR html, and final extracted table).\n"
-        "Judge whether final extraction preserves structure, headers, rows, symbols/units, and continuation semantics.\n"
+        "Judge whether final extraction preserves structure, formatting, headers, rows, symbols/units, and continuation semantics.\n"
         "If table uses encoded labels/codes not resolved in the extracted output, flag code_legend_unresolved.\n"
+        "Also determine if required information is missing (units, legend/code mappings, key columns, continuation rows, or references required to interpret rows).\n"
         "Return JSON only (no markdown) with keys exactly:\n"
         'table_present_on_page ("yes"|"no"|"uncertain"),\n'
         "extraction_quality (0..1),\n"
@@ -481,14 +574,25 @@ def _build_review_prompt(table_row: dict[str, Any]) -> str:
         "failure_modes (string array),\n"
         "root_cause_hypothesis (string),\n"
         "needs_followup (boolean),\n"
-        "followup_recommendations (string array).\n"
+        "followup_recommendations (string array),\n"
+        "missing_required_information (string array),\n"
+        "formatting_issues (string array),\n"
+        'rubric (object with formatting_fidelity, structural_fidelity, data_completeness, unit_symbol_fidelity, context_resolution in [0..1], and overall_robustness in {"robust","mostly_robust","fragile","failed"}).\n'
         "Scoring guidance:\n"
         "- Accept only when table structure/cells are mostly correct.\n"
         "- Review when table exists but extraction has notable issues.\n"
         "- Reject when table candidate is mostly wrong.\n"
+        "Rubric guidance:\n"
+        "- formatting_fidelity: CSV/layout faithfulness to table formatting intent.\n"
+        "- structural_fidelity: header/column/row alignment and hierarchy correctness.\n"
+        "- data_completeness: whether rows/columns/cells are missing or hallucinated.\n"
+        "- unit_symbol_fidelity: units/symbols/superscripts/subscripts/signs preserved.\n"
+        "- context_resolution: whether aliases/codes/legend references are resolved enough to interpret data.\n"
         "Failure mode taxonomy:\n"
         "- split_table_continuation, header_misalignment, row_shift_or_merge, column_shift_or_merge,\n"
-        "  symbol_or_unit_loss, caption_mismatch, code_legend_unresolved, table_not_present, ocr_noise, other.\n"
+        "  multi_level_header_loss, symbol_or_unit_loss, caption_mismatch, code_legend_unresolved,\n"
+        "  partial_table_extracted, duplicate_or_hallucinated_rows, missing_required_columns,\n"
+        "  table_not_present, ocr_noise, other.\n"
         "Candidate summary:\n"
         f"table_id={_short(table_row.get('table_id', ''), limit=32)}\n"
         f"page={int(table_row.get('page', 0) or 0)}\n"
@@ -609,9 +713,32 @@ async def run_gemini_table_validation(
         "recommended_accept": 0,
         "recommended_review": 0,
         "recommended_reject": 0,
+        "needs_followup_count": 0,
+        "failure_mode_counts": {},
+        "robustness_counts": {
+            "robust": 0,
+            "mostly_robust": 0,
+            "fragile": 0,
+            "failed": 0,
+        },
+        "rubric_averages": {
+            "formatting_fidelity": 0.0,
+            "structural_fidelity": 0.0,
+            "data_completeness": 0.0,
+            "unit_symbol_fidelity": 0.0,
+            "context_resolution": 0.0,
+        },
     }
     if not docs:
         return summary
+
+    rubric_sums = {
+        "formatting_fidelity": 0.0,
+        "structural_fidelity": 0.0,
+        "data_completeness": 0.0,
+        "unit_symbol_fidelity": 0.0,
+        "context_resolution": 0.0,
+    }
 
     owns_client = client is None
     review_client = client or genai.Client(api_key=config.api_key)
@@ -721,6 +848,20 @@ async def run_gemini_table_validation(
                         summary["recommended_reject"] += 1
                     else:
                         summary["recommended_review"] += 1
+                    if bool(review.get("needs_followup", False)):
+                        summary["needs_followup_count"] += 1
+                    for mode in review.get("failure_modes", []):
+                        key = str(mode).strip()
+                        if not key:
+                            continue
+                        summary["failure_mode_counts"][key] = int(summary["failure_mode_counts"].get(key, 0)) + 1
+                    rubric = review.get("rubric", {})
+                    if isinstance(rubric, dict):
+                        rob = str(rubric.get("overall_robustness", "")).strip()
+                        if rob in summary["robustness_counts"]:
+                            summary["robustness_counts"][rob] += 1
+                        for rk in rubric_sums:
+                            rubric_sums[rk] += _clamp01(rubric.get(rk, 0.0), default=0.0)
 
             if not doc_rows:
                 continue
@@ -741,8 +882,28 @@ async def run_gemini_table_validation(
                 "recommended_accept": sum(1 for row in doc_rows if row["model_review"]["recommended_action"] == "accept"),
                 "recommended_review": sum(1 for row in doc_rows if row["model_review"]["recommended_action"] == "review"),
                 "recommended_reject": sum(1 for row in doc_rows if row["model_review"]["recommended_action"] == "reject"),
+                "needs_followup_count": sum(1 for row in doc_rows if bool(row["model_review"].get("needs_followup", False))),
+                "failure_mode_counts": {},
+                "robustness_counts": {
+                    "robust": 0,
+                    "mostly_robust": 0,
+                    "fragile": 0,
+                    "failed": 0,
+                },
                 "report_path": str(report_path),
             }
+            for row in doc_rows:
+                review = row.get("model_review", {})
+                for mode in review.get("failure_modes", []):
+                    key = str(mode).strip()
+                    if not key:
+                        continue
+                    doc_summary["failure_mode_counts"][key] = int(doc_summary["failure_mode_counts"].get(key, 0)) + 1
+                rubric = review.get("rubric", {})
+                if isinstance(rubric, dict):
+                    rob = str(rubric.get("overall_robustness", "")).strip()
+                    if rob in doc_summary["robustness_counts"]:
+                        doc_summary["robustness_counts"][rob] += 1
             (validation_root / "gemini_table_review_summary.json").write_text(
                 json.dumps(doc_summary, indent=2, ensure_ascii=True)
             )
@@ -751,5 +912,10 @@ async def run_gemini_table_validation(
             await review_client.aio.aclose()
         if owns_client and hasattr(review_client, "close"):
             review_client.close()
+
+    reviewed = int(summary.get("tables_reviewed", 0) or 0)
+    if reviewed > 0:
+        for rk, value in rubric_sums.items():
+            summary["rubric_averages"][rk] = round(float(value) / float(reviewed), 3)
 
     return summary

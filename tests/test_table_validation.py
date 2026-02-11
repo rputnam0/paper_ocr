@@ -95,7 +95,71 @@ def test_run_gemini_table_validation_writes_doc_report(tmp_path: Path):
     assert report_path.exists()
     rows = [json.loads(line) for line in report_path.read_text().splitlines() if line.strip()]
     assert rows[0]["model_review"]["recommended_action"] == "accept"
+    assert rows[0]["model_review"]["rubric"]["overall_robustness"] in {"robust", "mostly_robust", "fragile", "failed"}
     assert fake_client.calls == 1
+
+
+def test_run_gemini_table_validation_tracks_rubric_and_failure_modes(tmp_path: Path):
+    _make_doc(tmp_path, status="warnings")
+    fake_client = _FakeClient(
+        json.dumps(
+            {
+                "table_present_on_page": "yes",
+                "extraction_quality": 0.62,
+                "false_positive_risk": 0.18,
+                "recommended_action": "review",
+                "issues": ["Alias polymer codes are unresolved"],
+                "failure_modes": ["code_legend_unresolved", "missing_required_columns"],
+                "root_cause_hypothesis": "Legend mapping was not merged into table output.",
+                "needs_followup": True,
+                "followup_recommendations": ["Resolve polymer alias codes from nearby text before export."],
+                "missing_required_information": ["Polymer code legend mapping"],
+                "formatting_issues": ["Unit superscript formatting dropped in two headers."],
+                "rubric": {
+                    "formatting_fidelity": 0.7,
+                    "structural_fidelity": 0.65,
+                    "data_completeness": 0.6,
+                    "unit_symbol_fidelity": 0.5,
+                    "context_resolution": 0.2,
+                    "overall_robustness": "fragile",
+                },
+            }
+        )
+    )
+    cfg = GeminiValidationConfig(model="gemini-3-flash", api_key="x")
+
+    summary = asyncio.run(
+        run_gemini_table_validation(
+            ocr_out_dir=tmp_path / "out",
+            config=cfg,
+            client=fake_client,
+            only_problem_docs=True,
+            max_docs=0,
+            max_tables_per_doc=0,
+        )
+    )
+    assert summary["tables_reviewed"] == 1
+    assert summary["needs_followup_count"] == 1
+    assert summary["failure_mode_counts"]["code_legend_unresolved"] == 1
+    assert summary["failure_mode_counts"]["missing_required_columns"] == 1
+    assert summary["robustness_counts"]["fragile"] == 1
+    assert summary["rubric_averages"]["context_resolution"] == 0.2
+
+    report_path = (
+        tmp_path
+        / "out"
+        / "group"
+        / "doc_abc"
+        / "metadata"
+        / "assets"
+        / "structured"
+        / "validation"
+        / "gemini_table_review.jsonl"
+    )
+    rows = [json.loads(line) for line in report_path.read_text().splitlines() if line.strip()]
+    review = rows[0]["model_review"]
+    assert review["missing_required_information"] == ["Polymer code legend mapping"]
+    assert review["formatting_issues"] == ["Unit superscript formatting dropped in two headers."]
 
 
 def test_run_gemini_table_validation_skips_ok_docs_when_problem_filter_enabled(tmp_path: Path):
