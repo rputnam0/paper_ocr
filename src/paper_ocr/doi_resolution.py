@@ -41,6 +41,7 @@ ACCEPTED_FETCH_STATUSES = {
 
 WORK_SELECT_FIELDS = "DOI,title,author,issued,type,container-title,URL,score"
 SEARCH_SELECT_FIELDS = "DOI,title,author,issued,type,container-title,URL,score"
+UNKNOWN_MARKERS = {"unknown", "n/a", "na", "none", "null", "-"}
 
 RESOLVED_COLUMNS = [
     "row_index",
@@ -311,6 +312,7 @@ def _resolve_row(row: dict[str, str], config: DoiResolutionConfig, state: _Resol
                     "author_match": cand["author_match"],
                     "year_match": cand["year_match"],
                     "type_preference": cand["type_preference"],
+                    "container_similarity": cand["container_similarity"],
                 }
                 for cand in scored
             ],
@@ -326,7 +328,8 @@ def _resolve_row(row: dict[str, str], config: DoiResolutionConfig, state: _Resol
                 and gap >= 0.08
                 and (not best_row["first_author"] or top["author_match"] > 0.0)
             )
-            if auto_accept:
+            confirmed_triplet = _is_confirmed_bibliographic_match(best_row, top)
+            if auto_accept or confirmed_triplet:
                 out = _canonicalize_candidate(
                     candidate=top["doi"],
                     row=best_row,
@@ -479,39 +482,44 @@ def _crossref_work(doi: str, config: DoiResolutionConfig, state: _ResolverState)
 
 
 def _crossref_search(row: dict[str, str], config: DoiResolutionConfig, state: _ResolverState) -> list[dict[str, Any]]:
-    pieces = [row.get("title", ""), row.get("year", ""), row.get("container_title", "")]
+    pieces = [_searchable_title(row.get("title", "")), row.get("year", ""), row.get("container_title", "")]
     query_bibliographic = " ".join(piece.strip() for piece in pieces if piece.strip())
     if not query_bibliographic:
         return []
-    params: dict[str, str] = {
-        "query.bibliographic": query_bibliographic,
-        "rows": str(max(int(config.rows), 1)),
-        "sort": "score",
-        "order": "desc",
-        "select": SEARCH_SELECT_FIELDS,
-    }
-    if row.get("first_author"):
-        params["query.author"] = row["first_author"]
-    year = _year_to_int(row.get("year", ""))
-    if year is not None:
-        params["filter"] = f"from-pub-date:{year},until-pub-date:{year}"
-    path = "/works"
-    url = _crossref_url(path, params, config.crossref_mailto)
-    result = _http_request(
-        method="GET",
-        url=url,
-        config=config,
-        state=state,
-        request_headers={"Accept": "application/json"},
-    )
-    if result.status != 200:
-        return []
-    payload = _parse_json(result.body)
-    message = payload.get("message", {}) if isinstance(payload, dict) else {}
-    if not isinstance(message, dict):
-        return []
-    items = message.get("items", [])
-    return [item for item in _as_list(items) if isinstance(item, dict)]
+    author = row.get("first_author", "")
+    include_author_options = [True, False] if author else [False]
+    for include_author in include_author_options:
+        for filter_value in _crossref_filter_variants(row.get("year", "")):
+            params: dict[str, str] = {
+                "query.bibliographic": query_bibliographic,
+                "rows": str(max(int(config.rows), 1)),
+                "sort": "score",
+                "order": "desc",
+                "select": SEARCH_SELECT_FIELDS,
+            }
+            if include_author and author:
+                params["query.author"] = author
+            if filter_value:
+                params["filter"] = filter_value
+            path = "/works"
+            url = _crossref_url(path, params, config.crossref_mailto)
+            result = _http_request(
+                method="GET",
+                url=url,
+                config=config,
+                state=state,
+                request_headers={"Accept": "application/json"},
+            )
+            if result.status != 200:
+                continue
+            payload = _parse_json(result.body)
+            message = payload.get("message", {}) if isinstance(payload, dict) else {}
+            if not isinstance(message, dict):
+                continue
+            items = [item for item in _as_list(message.get("items", [])) if isinstance(item, dict)]
+            if items:
+                return items
+    return []
 
 
 def _doi_org_lookup(doi: str, config: DoiResolutionConfig, state: _ResolverState) -> dict[str, Any]:
@@ -674,6 +682,8 @@ def _score_candidates(row: dict[str, str], items: list[dict[str, Any]]) -> list[
         author_match = _author_similarity(row.get("first_author", ""), item.get("author"))
         year_match = _year_similarity(_year_to_int(row.get("year", "")), _extract_work_year(item))
         type_preference = 1.0 if str(item.get("type", "")).strip().lower() == "journal-article" else 0.0
+        candidate_container = str((_as_list(item.get("container-title")) or [""])[0])
+        container_similarity = _container_similarity(row.get("container_title", ""), candidate_container)
         score = (
             0.55 * title_similarity
             + 0.20 * author_match
@@ -688,6 +698,7 @@ def _score_candidates(row: dict[str, str], items: list[dict[str, Any]]) -> list[
                 "author_match": round(author_match, 6),
                 "year_match": round(year_match, 6),
                 "type_preference": round(type_preference, 6),
+                "container_similarity": round(container_similarity, 6),
             }
         )
     scored.sort(key=lambda item: (-float(item["score"]), item["doi"]))
@@ -705,6 +716,14 @@ def _title_similarity(left: str, right: str) -> float:
     union = left_tokens | right_tokens
     jaccard = len(left_tokens & right_tokens) / len(union) if union else 0.0
     return max(0.0, min(1.0, (seq + jaccard) / 2.0))
+
+
+def _container_similarity(left: str, right: str) -> float:
+    a = _norm_text(left)
+    b = _norm_text(right)
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
 
 
 def _author_similarity(input_author: str, candidate_authors: Any) -> float:
@@ -802,6 +821,8 @@ def _first_author(raw: str) -> str:
     text = re.split(r"\bet\.?\s*al\.?\b", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
     if ";" in text:
         text = text.split(";", 1)[0].strip()
+    if _is_unknown_value(text):
+        return ""
     return text
 
 
@@ -813,6 +834,55 @@ def _author_last_name(raw: str) -> str:
         return text.split(",", 1)[0].strip()
     pieces = [piece.strip() for piece in text.split() if piece.strip()]
     return pieces[-1] if pieces else ""
+
+
+def _is_unknown_value(raw: str) -> bool:
+    norm = (raw or "").strip().lower()
+    if not norm:
+        return True
+    return norm in UNKNOWN_MARKERS
+
+
+def _searchable_title(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    # Strip synthetic prefixes and source DOI annotations from derived corpus rows.
+    text = re.sub(r"^hs-\d+\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\(source\s+10\.[^)]+\)", "", text, flags=re.IGNORECASE)
+    text = text.replace("...", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _crossref_filter_variants(year_raw: str) -> list[str]:
+    year = _year_to_int(year_raw)
+    if year is None:
+        return ["type:journal-article", ""]
+    return [
+        f"from-pub-date:{year},until-pub-date:{year},type:journal-article",
+        f"from-pub-date:{year - 1},until-pub-date:{year + 1},type:journal-article",
+        f"from-pub-date:{year},until-pub-date:{year}",
+        "type:journal-article",
+        "",
+    ]
+
+
+def _is_confirmed_bibliographic_match(row: dict[str, str], candidate: dict[str, Any]) -> bool:
+    has_required = bool(row.get("title") and row.get("first_author") and row.get("year"))
+    if not has_required:
+        return False
+    if float(candidate.get("title_similarity", 0.0)) < 0.92:
+        return False
+    if float(candidate.get("author_match", 0.0)) < 1.0:
+        return False
+    if float(candidate.get("year_match", 0.0)) < 0.5:
+        return False
+    container = (row.get("container_title", "") or "").strip()
+    if container:
+        if float(candidate.get("container_similarity", 0.0)) < 0.6:
+            return False
+    return True
 
 
 def _author_family(author: Any) -> str:

@@ -1,6 +1,7 @@
 import csv
 import json
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import paper_ocr.doi_resolution as doi_resolution
 
@@ -285,6 +286,135 @@ def test_resolve_dois_search_scoring_marks_ambiguous_needs_review(tmp_path: Path
     assert row["doi_canonical"] == ""
     fetch_rows = _read_csv(Path(summary["fetch_ready_csv"]))
     assert fetch_rows == []
+
+
+def test_resolve_dois_promotes_confirmed_title_author_year_even_with_close_runner_up(tmp_path: Path):
+    in_csv = tmp_path / "in.csv"
+    in_csv.write_text("title,first_author,year,journal\nBetter Viscosity Models,Shah,2020,AAPS\n")
+    out_dir = tmp_path / "reports" / "doi_resolution"
+
+    def _fake_urlopen(req, timeout):  # noqa: ANN001,ARG001
+        url = req.full_url
+        method = req.get_method()
+        if "query.bibliographic" in url:
+            return _Resp(
+                200,
+                body=json.dumps(
+                    {
+                        "status": "ok",
+                        "message": {
+                            "items": [
+                                {
+                                    "DOI": "10.1000/a",
+                                    "title": ["Better Viscosity Models"],
+                                    "author": [{"family": "Shah"}],
+                                    "issued": {"date-parts": [[2020]]},
+                                    "type": "journal-article",
+                                    "container-title": ["AAPS"],
+                                },
+                                {
+                                    "DOI": "10.1000/b",
+                                    "title": ["Better Viscosity Models"],
+                                    "author": [{"family": "Shah"}],
+                                    "issued": {"date-parts": [[2020]]},
+                                    "type": "journal-article",
+                                    "container-title": ["AAPS"],
+                                },
+                            ]
+                        },
+                    }
+                ),
+            )
+        if "/agency" in url:
+            return _Resp(
+                200,
+                body=json.dumps({"status": "ok", "message": {"DOI": "10.1000/a", "agency": {"id": "crossref"}}}),
+            )
+        if method == "HEAD" and "/works/" in url:
+            return _Resp(200, body="")
+        if method == "GET" and "/works/" in url and "/agency" not in url:
+            return _Resp(
+                200,
+                body=json.dumps(
+                    {
+                        "status": "ok",
+                        "message": {
+                            "DOI": "10.1000/A",
+                            "title": ["Better Viscosity Models"],
+                            "author": [{"family": "Shah"}],
+                            "issued": {"date-parts": [[2020]]},
+                            "type": "journal-article",
+                            "container-title": ["AAPS"],
+                        },
+                    }
+                ),
+            )
+        raise AssertionError(f"unexpected {method} {url}")
+
+    summary = doi_resolution.resolve_dois(
+        doi_resolution.DoiResolutionConfig(
+            input_csv=in_csv,
+            output_dir=out_dir,
+            urlopen=_fake_urlopen,
+        )
+    )
+    row = _read_csv(Path(summary["resolved_csv"]))[0]
+    assert row["doi_status"] == "inferred_crossref"
+    assert row["doi_canonical"] == "10.1000/a"
+
+
+def test_crossref_search_uses_bibliographic_template_and_type_filter(tmp_path: Path):
+    in_csv = tmp_path / "in.csv"
+    in_csv.write_text("title,first_author,year,journal\nBetter Viscosity Models,Shah,2020,AAPS\n")
+    out_dir = tmp_path / "reports" / "doi_resolution"
+    seen_search_params: list[dict[str, list[str]]] = []
+
+    def _fake_urlopen(req, timeout):  # noqa: ANN001,ARG001
+        url = req.full_url
+        if "query.bibliographic" in url:
+            seen_search_params.append(parse_qs(urlparse(url).query))
+            return _Resp(200, body=json.dumps({"status": "ok", "message": {"items": []}}))
+        raise AssertionError(f"unexpected {url}")
+
+    doi_resolution.resolve_dois(
+        doi_resolution.DoiResolutionConfig(
+            input_csv=in_csv,
+            output_dir=out_dir,
+            urlopen=_fake_urlopen,
+        )
+    )
+    assert seen_search_params
+    first = seen_search_params[0]
+    assert "query.bibliographic" in first
+    assert "query.author" in first
+    assert "filter" in first
+    assert "type:journal-article" in first["filter"][0]
+    assert "from-pub-date:2020" in first["filter"][0]
+    assert "until-pub-date:2020" in first["filter"][0]
+
+
+def test_crossref_search_omits_query_author_when_unknown(tmp_path: Path):
+    in_csv = tmp_path / "in.csv"
+    in_csv.write_text("title,first_author,year,journal\nBetter Viscosity Models,Unknown,2020,AAPS\n")
+    out_dir = tmp_path / "reports" / "doi_resolution"
+    seen_search_params: list[dict[str, list[str]]] = []
+
+    def _fake_urlopen(req, timeout):  # noqa: ANN001,ARG001
+        url = req.full_url
+        if "query.bibliographic" in url:
+            seen_search_params.append(parse_qs(urlparse(url).query))
+            return _Resp(200, body=json.dumps({"status": "ok", "message": {"items": []}}))
+        raise AssertionError(f"unexpected {url}")
+
+    doi_resolution.resolve_dois(
+        doi_resolution.DoiResolutionConfig(
+            input_csv=in_csv,
+            output_dir=out_dir,
+            urlopen=_fake_urlopen,
+        )
+    )
+    assert seen_search_params
+    assert all("query.author" not in params for params in seen_search_params)
 
 
 def test_parse_landing_metadata_supports_highwire_dc_and_jsonld():
