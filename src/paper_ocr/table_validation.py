@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -710,6 +711,281 @@ def _render_page_png(pdf: fitz.Document, page_number: int, dpi: int) -> bytes:
     return pix.tobytes("png")
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _infer_metrics_report_path(ocr_out_dir: Path) -> Path:
+    base_name = ocr_out_dir.name
+    if base_name.lower() == "pdfs" and ocr_out_dir.parent.name:
+        base_name = ocr_out_dir.parent.name
+    clean_slug = re.sub(r"_\d{8}_\d{6}$", "", base_name)
+    candidates = [
+        Path("data/jobs") / clean_slug / "reports",
+        Path("data/jobs") / ocr_out_dir.name / "reports",
+    ]
+    report_root = next((path for path in candidates if path.exists()), candidates[0])
+    report_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return report_root / f"table_fix_backlog_metrics_{stamp}.json"
+
+
+def _extract_action_counts(payload: dict[str, Any]) -> dict[str, int]:
+    counts = payload.get("action_counts", {})
+    if isinstance(counts, dict) and counts:
+        return {
+            "accept": int(counts.get("accept", 0) or 0),
+            "review": int(counts.get("review", 0) or 0),
+            "reject": int(counts.get("reject", 0) or 0),
+        }
+    legacy = payload.get("actions", {})
+    if isinstance(legacy, dict):
+        return {
+            "accept": int(legacy.get("accept", 0) or 0),
+            "review": int(legacy.get("review", 0) or 0),
+            "reject": int(legacy.get("reject", 0) or 0),
+        }
+    return {"accept": 0, "review": 0, "reject": 0}
+
+
+def _extract_failure_mode_counts(payload: dict[str, Any]) -> dict[str, int]:
+    counts = payload.get("failure_mode_counts", {})
+    if isinstance(counts, dict) and counts:
+        return {str(k): int(v or 0) for k, v in counts.items()}
+    top = payload.get("top_failure_modes", [])
+    if isinstance(top, list):
+        out: dict[str, int] = {}
+        for row in top:
+            if isinstance(row, list) and len(row) >= 2:
+                key = str(row[0]).strip()
+                if key:
+                    out[key] = int(row[1] or 0)
+                continue
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("mode", "")).strip()
+            if not key:
+                continue
+            out[key] = int(row.get("count", 0) or 0)
+        return out
+    return {}
+
+
+def _extract_rubric_averages(payload: dict[str, Any]) -> dict[str, float]:
+    rubric = payload.get("rubric_averages", {})
+    if isinstance(rubric, dict) and rubric:
+        return {str(k): _safe_float(v, default=0.0) for k, v in rubric.items()}
+    return {}
+
+
+def _extract_robustness_counts(payload: dict[str, Any]) -> dict[str, int]:
+    counts = payload.get("robustness_counts", {})
+    if isinstance(counts, dict):
+        return {str(k): int(v or 0) for k, v in counts.items()}
+    return {}
+
+
+def _evaluate_backlog_gates(
+    *,
+    current: dict[str, Any],
+    baseline: dict[str, Any] | None,
+    gates: dict[str, Any] | None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {"available": False, "passed": True, "checks": []}
+    if not baseline or not gates:
+        return out
+    out["available"] = True
+    current_actions = _extract_action_counts(current)
+    baseline_actions = _extract_action_counts(baseline)
+    current_modes = _extract_failure_mode_counts(current)
+    baseline_modes = _extract_failure_mode_counts(baseline)
+    current_rubric = _extract_rubric_averages(current)
+    baseline_rubric = _extract_rubric_averages(baseline)
+
+    global_targets = gates.get("global_targets", {}) if isinstance(gates.get("global_targets", {}), dict) else {}
+    reject_max = int(global_targets.get("recommended_reject_max", 10**9))
+    accept_delta_min = int(global_targets.get("recommended_accept_delta_min", -10**9))
+    table_present_no_max = int(global_targets.get("table_present_no_max", 10**9))
+    current_table_present_no = int(current.get("table_present_no", 0) or 0)
+
+    checks: list[dict[str, Any]] = []
+    checks.append(
+        {
+            "name": "recommended_reject_max",
+            "actual": int(current_actions.get("reject", 0)),
+            "target": reject_max,
+            "pass": int(current_actions.get("reject", 0)) <= reject_max,
+        }
+    )
+    checks.append(
+        {
+            "name": "recommended_accept_delta_min",
+            "actual": int(current_actions.get("accept", 0)) - int(baseline_actions.get("accept", 0)),
+            "target": accept_delta_min,
+            "pass": (int(current_actions.get("accept", 0)) - int(baseline_actions.get("accept", 0))) >= accept_delta_min,
+        }
+    )
+    checks.append(
+        {
+            "name": "table_present_no_max",
+            "actual": current_table_present_no,
+            "target": table_present_no_max,
+            "pass": current_table_present_no <= table_present_no_max,
+        }
+    )
+
+    mode_targets = gates.get("failure_mode_reduction_targets", {})
+    if isinstance(mode_targets, dict):
+        for mode, reduction_min in mode_targets.items():
+            base_count = int(baseline_modes.get(str(mode), 0))
+            current_count = int(current_modes.get(str(mode), 0))
+            if base_count <= 0:
+                passed = True
+                actual_reduction = 1.0 if current_count == 0 else 0.0
+            else:
+                actual_reduction = max(0.0, (base_count - current_count) / float(base_count))
+                passed = actual_reduction >= _safe_float(reduction_min, default=0.0)
+            checks.append(
+                {
+                    "name": f"failure_mode_reduction:{mode}",
+                    "actual": round(actual_reduction, 3),
+                    "target": _safe_float(reduction_min, default=0.0),
+                    "baseline_count": base_count,
+                    "current_count": current_count,
+                    "pass": passed,
+                }
+            )
+
+    rubric_targets = gates.get("rubric_targets", {})
+    if isinstance(rubric_targets, dict):
+        if "data_completeness_delta_min" in rubric_targets:
+            delta = _safe_float(current_rubric.get("data_completeness", 0.0)) - _safe_float(
+                baseline_rubric.get("data_completeness", 0.0)
+            )
+            target = _safe_float(rubric_targets.get("data_completeness_delta_min", 0.0))
+            checks.append({"name": "rubric:data_completeness_delta_min", "actual": round(delta, 3), "target": target, "pass": delta >= target})
+        if "unit_symbol_fidelity_min" in rubric_targets:
+            actual = _safe_float(current_rubric.get("unit_symbol_fidelity", 0.0))
+            target = _safe_float(rubric_targets.get("unit_symbol_fidelity_min", 0.0))
+            checks.append({"name": "rubric:unit_symbol_fidelity_min", "actual": round(actual, 3), "target": target, "pass": actual >= target})
+        if "context_resolution_delta_min" in rubric_targets:
+            delta = _safe_float(current_rubric.get("context_resolution", 0.0)) - _safe_float(
+                baseline_rubric.get("context_resolution", 0.0)
+            )
+            target = _safe_float(rubric_targets.get("context_resolution_delta_min", 0.0))
+            checks.append({"name": "rubric:context_resolution_delta_min", "actual": round(delta, 3), "target": target, "pass": delta >= target})
+
+    out["checks"] = checks
+    out["passed"] = all(bool(row.get("pass", False)) for row in checks)
+    return out
+
+
+def summarize_gemini_failures(
+    *,
+    ocr_out_dir: Path,
+    report_out: Path | None = None,
+    baseline_path: Path | None = None,
+    gates_path: Path | None = None,
+) -> dict[str, Any]:
+    docs = _discover_ocr_doc_dirs(ocr_out_dir)
+    action_counts = {"accept": 0, "review": 0, "reject": 0}
+    failure_mode_counts: dict[str, int] = {}
+    robustness_counts = {"robust": 0, "mostly_robust": 0, "fragile": 0, "failed": 0}
+    table_present_yes = 0
+    table_present_no = 0
+    table_present_uncertain = 0
+    rubric_sums = {
+        "formatting_fidelity": 0.0,
+        "structural_fidelity": 0.0,
+        "data_completeness": 0.0,
+        "unit_symbol_fidelity": 0.0,
+        "context_resolution": 0.0,
+    }
+    tables_reviewed = 0
+
+    for doc_dir in docs:
+        review_path = doc_dir / "metadata" / "assets" / "structured" / "validation" / "gemini_table_review.jsonl"
+        rows = _load_jsonl(review_path)
+        for row in rows:
+            review = row.get("model_review", {})
+            if not isinstance(review, dict):
+                continue
+            tables_reviewed += 1
+            action = str(review.get("recommended_action", "review")).strip().lower()
+            if action not in action_counts:
+                action = "review"
+            action_counts[action] += 1
+            presence = str(review.get("table_present_on_page", "uncertain")).strip().lower()
+            if presence == "yes":
+                table_present_yes += 1
+            elif presence == "no":
+                table_present_no += 1
+            else:
+                table_present_uncertain += 1
+            for mode in review.get("failure_modes", []):
+                key = str(mode).strip()
+                if not key:
+                    continue
+                failure_mode_counts[key] = int(failure_mode_counts.get(key, 0)) + 1
+            rubric = review.get("rubric", {})
+            if isinstance(rubric, dict):
+                robustness = str(rubric.get("overall_robustness", "")).strip().lower()
+                if robustness in robustness_counts:
+                    robustness_counts[robustness] += 1
+                for key in rubric_sums:
+                    rubric_sums[key] += _safe_float(rubric.get(key, 0.0), default=0.0)
+
+    rubric_averages = {key: 0.0 for key in rubric_sums}
+    if tables_reviewed > 0:
+        rubric_averages = {key: round(value / float(tables_reviewed), 3) for key, value in rubric_sums.items()}
+
+    payload: dict[str, Any] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "ocr_out_dir": str(ocr_out_dir),
+        "docs_discovered": len(docs),
+        "tables_reviewed": tables_reviewed,
+        "table_present_yes": table_present_yes,
+        "table_present_no": table_present_no,
+        "table_present_uncertain": table_present_uncertain,
+        "action_counts": action_counts,
+        "failure_mode_counts": dict(sorted(failure_mode_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "robustness_counts": robustness_counts,
+        "rubric_averages": rubric_averages,
+    }
+    baseline_payload: dict[str, Any] | None = None
+    gates_payload: dict[str, Any] | None = None
+    if baseline_path and baseline_path.exists():
+        loaded = _load_json(baseline_path)
+        if loaded:
+            baseline_payload = loaded
+            payload["baseline_path"] = str(baseline_path)
+    if gates_path and gates_path.exists():
+        loaded = _load_json(gates_path)
+        if loaded:
+            gates_payload = loaded
+            payload["gates_path"] = str(gates_path)
+    if baseline_payload is None and gates_payload and isinstance(gates_payload.get("baseline_report"), str):
+        candidate = Path(str(gates_payload.get("baseline_report", "")).strip())
+        if candidate.exists():
+            loaded = _load_json(candidate)
+            if loaded:
+                baseline_payload = loaded
+                payload["baseline_path"] = str(candidate)
+    payload["gate_evaluation"] = _evaluate_backlog_gates(
+        current=payload,
+        baseline=baseline_payload,
+        gates=gates_payload,
+    )
+    output_path = report_out or _infer_metrics_report_path(ocr_out_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+    payload["report_path"] = str(output_path)
+    return payload
+
+
 async def run_gemini_table_validation(
     *,
     ocr_out_dir: Path,
@@ -754,6 +1030,7 @@ async def run_gemini_table_validation(
             "unit_symbol_fidelity": 0.0,
             "context_resolution": 0.0,
         },
+        "api_error_count": 0,
     }
     if not docs:
         return summary
@@ -838,14 +1115,30 @@ async def run_gemini_table_validation(
                     table_for_prompt["extracted_csv"] = context.get("extracted_csv", "")
                     table_for_prompt["marker_fragments"] = context.get("marker_fragments", [])
                     table_for_prompt["ocr_html"] = context.get("ocr_html", "")
-                    review = await _review_table_with_gemini(
-                        client=review_client,
-                        config=config,
-                        page_image_bytes_list=image_bytes_list,
-                        crop_image_bytes_list=crop_image_bytes_list,
-                        page_numbers=pages,
-                        table_row=table_for_prompt,
-                    )
+                    try:
+                        review = await _review_table_with_gemini(
+                            client=review_client,
+                            config=config,
+                            page_image_bytes_list=image_bytes_list,
+                            crop_image_bytes_list=crop_image_bytes_list,
+                            page_numbers=pages,
+                            table_row=table_for_prompt,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        summary["api_error_count"] = int(summary.get("api_error_count", 0) or 0) + 1
+                        review = _normalize_review(
+                            {
+                                "recommended_action": "review",
+                                "needs_followup": True,
+                                "issues": [f"gemini_api_error:{type(exc).__name__}"],
+                                "failure_modes": ["other"],
+                                "followup_recommendations": [
+                                    "Retry Gemini validation for this table because the API call failed."
+                                ],
+                            },
+                            raw_response="",
+                        )
+                        review["error"] = str(exc)
                     doc_rows.append(
                         {
                             "doc_dir": str(doc_dir),

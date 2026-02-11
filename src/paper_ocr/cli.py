@@ -56,7 +56,7 @@ from .structured_extract import (
     run_marker_page,
 )
 from .table_eval import evaluate_table_pipeline
-from .table_validation import GeminiValidationConfig, run_gemini_table_validation
+from .table_validation import GeminiValidationConfig, run_gemini_table_validation, summarize_gemini_failures
 from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
 METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
@@ -490,6 +490,30 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Maximum tables reviewed per document (0 means no limit).",
+    )
+
+    summarize_failures = sub.add_parser(
+        "summarize-gemini-failures",
+        help="Aggregate Gemini validation findings into deterministic backlog metrics.",
+    )
+    summarize_failures.add_argument("ocr_out_dir", type=Path)
+    summarize_failures.add_argument(
+        "--report-out",
+        type=Path,
+        default=None,
+        help="Optional output path for metrics JSON (default: inferred data/jobs/<slug>/reports).",
+    )
+    summarize_failures.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help="Optional baseline metrics JSON for gate comparisons.",
+    )
+    summarize_failures.add_argument(
+        "--gates",
+        type=Path,
+        default=Path("docs/table_fix_backlog_gates.json"),
+        help="Gate configuration JSON path.",
     )
 
     audit = sub.add_parser("data-audit", help="Validate data/ folder organization contract")
@@ -2092,6 +2116,19 @@ def _run_validate_tables_gemini(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
+def _run_summarize_gemini_failures(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.ocr_out_dir.exists():
+        raise SystemExit(f"OCR output directory does not exist: {args.ocr_out_dir}")
+    payload = summarize_gemini_failures(
+        ocr_out_dir=args.ocr_out_dir,
+        report_out=getattr(args, "report_out", None),
+        baseline_path=getattr(args, "baseline", None),
+        gates_path=getattr(args, "gates", None),
+    )
+    print(json.dumps(payload, indent=2))
+    return payload
+
+
 def _run_data_audit(args: argparse.Namespace) -> dict[str, Any]:
     report = run_data_audit(args.data_dir)
     payload = report.to_dict()
@@ -2123,6 +2160,8 @@ def main() -> None:
         _run_eval_table_pipeline(args)
     elif args.command == "validate-tables-gemini":
         _run_validate_tables_gemini(args)
+    elif args.command == "summarize-gemini-failures":
+        _run_summarize_gemini_failures(args)
 
 
 if __name__ == "__main__":

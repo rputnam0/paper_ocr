@@ -489,6 +489,45 @@ def test_parse_validate_tables_gemini_overrides(monkeypatch):
     assert args.max_tables_per_doc == 2
 
 
+def test_parse_summarize_gemini_failures_defaults(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "summarize-gemini-failures",
+            "out",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "summarize-gemini-failures"
+    assert args.ocr_out_dir == Path("out")
+    assert args.report_out is None
+    assert args.baseline is None
+    assert args.gates == Path("docs/table_fix_backlog_gates.json")
+
+
+def test_parse_summarize_gemini_failures_overrides(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "summarize-gemini-failures",
+            "out",
+            "--report-out",
+            "reports/metrics.json",
+            "--baseline",
+            "reports/baseline.json",
+            "--gates",
+            "docs/gates.json",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.ocr_out_dir == Path("out")
+    assert args.report_out == Path("reports/metrics.json")
+    assert args.baseline == Path("reports/baseline.json")
+    assert args.gates == Path("docs/gates.json")
+
+
 def test_parse_data_audit_args(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -505,6 +544,34 @@ def test_parse_data_audit_args(monkeypatch):
     assert args.data_dir == Path("data")
     assert args.strict is True
     assert args.json is True
+
+
+def test_run_summarize_gemini_failures_passes_through(monkeypatch, tmp_path: Path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    args = argparse.Namespace(
+        ocr_out_dir=out_dir,
+        report_out=tmp_path / "report.json",
+        baseline=tmp_path / "baseline.json",
+        gates=tmp_path / "gates.json",
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_summarize(*, ocr_out_dir, report_out, baseline_path, gates_path):  # noqa: ANN001
+        captured["ocr_out_dir"] = ocr_out_dir
+        captured["report_out"] = report_out
+        captured["baseline_path"] = baseline_path
+        captured["gates_path"] = gates_path
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "summarize_gemini_failures", _fake_summarize)
+    payload = cli._run_summarize_gemini_failures(args)
+    assert payload == {"ok": True}
+    assert captured["ocr_out_dir"] == out_dir
+    assert captured["report_out"] == tmp_path / "report.json"
+    assert captured["baseline_path"] == tmp_path / "baseline.json"
+    assert captured["gates_path"] == tmp_path / "gates.json"
 
 
 def test_run_eval_table_pipeline_strict_regression_raises(tmp_path: Path):
