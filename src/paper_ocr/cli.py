@@ -857,6 +857,23 @@ def _job_slug_from_csv_stem(stem: str) -> str:
     return slug or "job"
 
 
+def _infer_fetch_job_slug(doi_csv: Path, output_root: Path) -> str:
+    """Resolve job slug from CSV location when the CSV is already inside a job reports tree."""
+    fallback = _job_slug_from_csv_stem(doi_csv.stem)
+    try:
+        rel = doi_csv.resolve().relative_to(output_root.resolve())
+    except Exception:  # noqa: BLE001
+        return fallback
+
+    # Expected job-scoped patterns:
+    # - <job_slug>/reports/<file>.csv
+    # - <job_slug>/reports/<subdir>/<file>.csv
+    parts = rel.parts
+    if len(parts) >= 3 and parts[1] == "reports":
+        return _job_slug_from_csv_stem(parts[0])
+    return fallback
+
+
 def _is_same_path(a: Path, b: Path) -> bool:
     try:
         return a.resolve() == b.resolve()
@@ -1601,7 +1618,7 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         raise SystemExit("Missing target bot. Set TARGET_BOT in .env or pass --target-bot.")
 
     api_id, api_hash = _require_telegram_credentials()
-    csv_name = _job_slug_from_csv_stem(args.doi_csv.stem)
+    csv_name = _infer_fetch_job_slug(args.doi_csv, args.output_root)
     job_dir = _resolve_fetch_job_dir(args.output_root, csv_name)
     pdf_dir = job_dir / "pdfs"
     reports_dir = job_dir / "reports"

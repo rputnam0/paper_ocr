@@ -1023,6 +1023,96 @@ def test_fetch_telegram_auto_resolve_rewrites_input_csv(monkeypatch, tmp_path: P
     assert _fake_resolve_dois.last_config.input_csv == args.doi_csv
 
 
+def test_fetch_telegram_reuses_job_when_input_csv_is_in_reports(monkeypatch, tmp_path: Path):
+    output_root = tmp_path / "jobs"
+    doi_csv = output_root / "fetch_ready_dois" / "reports" / "telegram_failed_papers.csv"
+    doi_csv.parent.mkdir(parents=True, exist_ok=True)
+    doi_csv.write_text("doi_normalized\n10.1000/abc\n")
+
+    args = argparse.Namespace(
+        doi_csv=doi_csv,
+        output_root=output_root,
+        doi_column="doi_normalized",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
+    )
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+    config = _fake_fetch_from_telegram.last_config
+    assert config.in_dir == output_root / "fetch_ready_dois" / "pdfs"
+    assert config.report_file == output_root / "fetch_ready_dois" / "reports" / "telegram_download_report.csv"
+
+
+def test_fetch_telegram_reuses_job_for_nested_doi_resolution_csv(monkeypatch, tmp_path: Path):
+    output_root = tmp_path / "jobs"
+    doi_csv = output_root / "canonical_polymer_solution_rheology_sources" / "reports" / "doi_resolution" / "fetch_ready_dois.csv"
+    doi_csv.parent.mkdir(parents=True, exist_ok=True)
+    doi_csv.write_text("DOI\n10.1000/abc\n")
+
+    args = argparse.Namespace(
+        doi_csv=doi_csv,
+        output_root=output_root,
+        doi_column="DOI",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
+    )
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+    config = _fake_fetch_from_telegram.last_config
+    assert config.in_dir == output_root / "canonical_polymer_solution_rheology_sources" / "pdfs"
+    assert config.report_file == output_root / "canonical_polymer_solution_rheology_sources" / "reports" / "telegram_download_report.csv"
+
+
 def test_run_rejects_output_under_jobs_folder(tmp_path: Path):
     args = argparse.Namespace(
         in_dir=tmp_path / "in",
