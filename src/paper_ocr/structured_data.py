@@ -1182,7 +1182,8 @@ def _merge_marker_tables_with_ocr_html(
             ocr_table = ocr_tables[o_idx]
             table_id = str(table.get("table_id", ""))
             header_rows = table.get("header_rows", [])
-            marker_headers = list(header_rows[0]) if isinstance(header_rows, list) and header_rows else []
+            marker_header_rows = [list(r) for r in header_rows if isinstance(r, list)] if isinstance(header_rows, list) else []
+            marker_headers = list(marker_header_rows[0]) if marker_header_rows else []
             marker_rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
             marker_symbols_before = _extract_symbols(_flatten_table_text(marker_headers, marker_rows))
             table_cell_patches = 0
@@ -1199,7 +1200,11 @@ def _merge_marker_tables_with_ocr_html(
                 merge_scope=merge_scope,
             )
 
-            table["header_rows"] = [marker_headers] if marker_headers else []
+            if marker_header_rows:
+                marker_header_rows[0] = marker_headers
+                table["header_rows"] = marker_header_rows
+            else:
+                table["header_rows"] = [marker_headers] if marker_headers else []
             table["data_rows"] = marker_rows
             if table_cell_patches:
                 table["source_format"] = "hybrid"
