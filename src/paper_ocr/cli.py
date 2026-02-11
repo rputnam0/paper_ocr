@@ -466,7 +466,7 @@ def _parse_args() -> argparse.Namespace:
     validate_tables.add_argument(
         "--max-output-tokens",
         type=int,
-        default=900,
+        default=2000,
     )
     validate_tables.add_argument(
         "--render-dpi",
@@ -2076,7 +2076,7 @@ def _run_validate_tables_gemini(args: argparse.Namespace) -> dict[str, Any]:
     config = GeminiValidationConfig(
         model=str(getattr(args, "model", GEMINI_TABLE_VALIDATION_MODEL_DEFAULT)),
         api_key=api_key,
-        max_output_tokens=int(getattr(args, "max_output_tokens", 900)),
+        max_output_tokens=int(getattr(args, "max_output_tokens", 2000)),
         render_dpi=int(getattr(args, "render_dpi", 220)),
     )
     summary = asyncio.run(

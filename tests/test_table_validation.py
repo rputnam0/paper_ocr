@@ -113,6 +113,10 @@ def test_run_gemini_table_validation_tracks_rubric_and_failure_modes(tmp_path: P
                 "root_cause_hypothesis": "Legend mapping was not merged into table output.",
                 "needs_followup": True,
                 "followup_recommendations": ["Resolve polymer alias codes from nearby text before export."],
+                "llm_extraction_instructions": [
+                    "Preserve multi-level headers as separate header rows before flattening.",
+                    "Resolve alias codes by linking table rows to legend paragraphs in nearby text.",
+                ],
                 "missing_required_information": ["Polymer code legend mapping"],
                 "formatting_issues": ["Unit superscript formatting dropped in two headers."],
                 "rubric": {
@@ -144,6 +148,8 @@ def test_run_gemini_table_validation_tracks_rubric_and_failure_modes(tmp_path: P
     assert summary["failure_mode_counts"]["missing_required_columns"] == 1
     assert summary["robustness_counts"]["fragile"] == 1
     assert summary["rubric_averages"]["context_resolution"] == 0.2
+    assert summary["tables_with_llm_instructions"] == 1
+    assert summary["llm_instruction_count"] == 2
 
     report_path = (
         tmp_path
@@ -160,6 +166,10 @@ def test_run_gemini_table_validation_tracks_rubric_and_failure_modes(tmp_path: P
     review = rows[0]["model_review"]
     assert review["missing_required_information"] == ["Polymer code legend mapping"]
     assert review["formatting_issues"] == ["Unit superscript formatting dropped in two headers."]
+    assert review["llm_extraction_instructions"] == [
+        "Preserve multi-level headers as separate header rows before flattening.",
+        "Resolve alias codes by linking table rows to legend paragraphs in nearby text.",
+    ]
 
 
 def test_run_gemini_table_validation_skips_ok_docs_when_problem_filter_enabled(tmp_path: Path):

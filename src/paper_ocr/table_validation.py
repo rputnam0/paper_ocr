@@ -45,6 +45,7 @@ TABLE_VALIDATION_SCHEMA: dict[str, Any] = {
         "root_cause_hypothesis": {"type": "string"},
         "needs_followup": {"type": "boolean"},
         "followup_recommendations": {"type": "array", "items": {"type": "string"}},
+        "llm_extraction_instructions": {"type": "array", "items": {"type": "string"}},
         "missing_required_information": {"type": "array", "items": {"type": "string"}},
         "formatting_issues": {"type": "array", "items": {"type": "string"}},
         "rubric": {
@@ -81,6 +82,7 @@ TABLE_VALIDATION_SCHEMA: dict[str, Any] = {
         "root_cause_hypothesis",
         "needs_followup",
         "followup_recommendations",
+        "llm_extraction_instructions",
         "missing_required_information",
         "formatting_issues",
         "rubric",
@@ -92,7 +94,7 @@ TABLE_VALIDATION_SCHEMA: dict[str, Any] = {
 class GeminiValidationConfig:
     model: str = "gemini-2.5-flash"
     api_key: str = ""
-    max_output_tokens: int = 900
+    max_output_tokens: int = 2000
     render_dpi: int = 220
     thinking_budget: int = 0
 
@@ -243,6 +245,14 @@ def _extract_partial_review_fields(text: str) -> dict[str, Any]:
             if item:
                 missing.append(item)
         out["missing_required_information"] = missing
+    m_llm = re.search(r'"llm_extraction_instructions"\s*:\s*\[(.*?)\]', raw, flags=re.IGNORECASE | re.DOTALL)
+    if m_llm:
+        llm: list[str] = []
+        for m in re.finditer(r'"([^"]+)"', m_llm.group(1)):
+            item = m.group(1).strip()
+            if item:
+                llm.append(item)
+        out["llm_extraction_instructions"] = llm
     return out
 
 
@@ -306,6 +316,14 @@ def _normalize_review(payload: dict[str, Any], *, raw_response: str) -> dict[str
             if text:
                 followup_recommendations.append(text)
 
+    llm_instr_raw = payload.get("llm_extraction_instructions", [])
+    llm_extraction_instructions: list[str] = []
+    if isinstance(llm_instr_raw, list):
+        for item in llm_instr_raw:
+            text = str(item).strip()
+            if text:
+                llm_extraction_instructions.append(text)
+
     missing_info_raw = payload.get("missing_required_information", [])
     missing_required_information: list[str] = []
     if isinstance(missing_info_raw, list):
@@ -353,6 +371,7 @@ def _normalize_review(payload: dict[str, Any], *, raw_response: str) -> dict[str
         "root_cause_hypothesis": str(payload.get("root_cause_hypothesis", "") or "").strip(),
         "needs_followup": bool(payload.get("needs_followup", False)),
         "followup_recommendations": followup_recommendations,
+        "llm_extraction_instructions": llm_extraction_instructions,
         "missing_required_information": missing_required_information,
         "formatting_issues": formatting_issues,
         "rubric": rubric,
@@ -575,6 +594,7 @@ def _build_review_prompt(table_row: dict[str, Any]) -> str:
         "root_cause_hypothesis (string),\n"
         "needs_followup (boolean),\n"
         "followup_recommendations (string array),\n"
+        "llm_extraction_instructions (string array of concrete prompt instructions for a future LLM-based extractor),\n"
         "missing_required_information (string array),\n"
         "formatting_issues (string array),\n"
         'rubric (object with formatting_fidelity, structural_fidelity, data_completeness, unit_symbol_fidelity, context_resolution in [0..1], and overall_robustness in {"robust","mostly_robust","fragile","failed"}).\n'
@@ -588,6 +608,10 @@ def _build_review_prompt(table_row: dict[str, Any]) -> str:
         "- data_completeness: whether rows/columns/cells are missing or hallucinated.\n"
         "- unit_symbol_fidelity: units/symbols/superscripts/subscripts/signs preserved.\n"
         "- context_resolution: whether aliases/codes/legend references are resolved enough to interpret data.\n"
+        "For llm_extraction_instructions:\n"
+        "- Provide 2-6 concise, imperative instructions that could be inserted into an extraction prompt.\n"
+        "- Focus on fixing the observed failure mechanisms for this table.\n"
+        "- Mention exact needs (e.g., preserve multi-row headers, resolve polymer alias codes from legend text, keep units/symbols verbatim).\n"
         "Failure mode taxonomy:\n"
         "- split_table_continuation, header_misalignment, row_shift_or_merge, column_shift_or_merge,\n"
         "  multi_level_header_loss, symbol_or_unit_loss, caption_mismatch, code_legend_unresolved,\n"
@@ -714,6 +738,8 @@ async def run_gemini_table_validation(
         "recommended_review": 0,
         "recommended_reject": 0,
         "needs_followup_count": 0,
+        "tables_with_llm_instructions": 0,
+        "llm_instruction_count": 0,
         "failure_mode_counts": {},
         "robustness_counts": {
             "robust": 0,
@@ -850,6 +876,10 @@ async def run_gemini_table_validation(
                         summary["recommended_review"] += 1
                     if bool(review.get("needs_followup", False)):
                         summary["needs_followup_count"] += 1
+                    llm_instructions = review.get("llm_extraction_instructions", [])
+                    if isinstance(llm_instructions, list) and llm_instructions:
+                        summary["tables_with_llm_instructions"] += 1
+                        summary["llm_instruction_count"] += len(llm_instructions)
                     for mode in review.get("failure_modes", []):
                         key = str(mode).strip()
                         if not key:
@@ -883,6 +913,14 @@ async def run_gemini_table_validation(
                 "recommended_review": sum(1 for row in doc_rows if row["model_review"]["recommended_action"] == "review"),
                 "recommended_reject": sum(1 for row in doc_rows if row["model_review"]["recommended_action"] == "reject"),
                 "needs_followup_count": sum(1 for row in doc_rows if bool(row["model_review"].get("needs_followup", False))),
+                "tables_with_llm_instructions": sum(
+                    1 for row in doc_rows if row["model_review"].get("llm_extraction_instructions", [])
+                ),
+                "llm_instruction_count": sum(
+                    len(row["model_review"].get("llm_extraction_instructions", []))
+                    for row in doc_rows
+                    if isinstance(row["model_review"].get("llm_extraction_instructions", []), list)
+                ),
                 "failure_mode_counts": {},
                 "robustness_counts": {
                     "robust": 0,
