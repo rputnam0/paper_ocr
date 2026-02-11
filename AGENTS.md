@@ -5,9 +5,12 @@
   - Install deps: `uv sync`
   - Run CLI: `uv run paper-ocr run <in_dir> <out_dir>`
   - Run tests: `uv run pytest`
-- Use the WSL-hosted structured services for all processing work by default.
-  - Access services through SSH alias `wsl`.
-  - Do not run local Marker CLI extraction unless explicitly requested by the user.
+- Run normal/lightweight tasks locally on this machine by default.
+- Use WSL only for heavy structured workloads that need GPU-backed services:
+  - Marker service workloads
+  - GROBID document parsing workloads
+- Access WSL services through SSH alias `wsl` with local port forwarding.
+- Do not run local Marker CLI extraction unless explicitly requested by the user.
 - Make **frequent git commits** after meaningful additions to the codebase.
 - Use **test-driven development** for new features.
   - Write tests first, then implement.
@@ -115,7 +118,8 @@ Validation command:
 - Do not write final `paper-ocr run` outputs under `data/jobs`; use `out/<...>`.
 
 ## Remote Service Guidance (Marker/GROBID)
-- All structured extraction must use WSL-hosted services via SSH access to `wsl`.
+- This machine is a low-resource MacBook Air; keep non-heavy processing local.
+- Use WSL-hosted services only for heavy GPU-oriented structured extraction and GROBID document parsing.
 - Treat local CLI extraction as fallback only when the user explicitly requests it.
 - `paper-ocr run` supports both:
   - Marker CLI mode: `--marker-command ...`
@@ -127,7 +131,7 @@ Validation command:
 - Service health checks before long runs:
   - Marker: `GET <marker_url>/openapi.json`
   - GROBID: `GET <grobid_url>/api/isalive`
-- Agents must use SSH local forwarding through `wsl` and then pass localhost URLs to CLI options/env vars.
+- Agents should call WSL as a service endpoint via SSH local forwarding and pass localhost URLs to CLI options/env vars.
   - Example tunnel:
     - `ssh -N -L 8008:127.0.0.1:8008 -L 8070:127.0.0.1:8070 wsl`
   - Example env:
