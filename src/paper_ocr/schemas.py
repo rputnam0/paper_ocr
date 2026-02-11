@@ -33,6 +33,9 @@ def new_manifest(
             "marker_version": "",
             "marker_config_hash": "",
             "grobid_version": "",
+            "deterministic_params": {"temperature": 0},
+            "source_sha_match": False,
+            "rerun_policy": "skip_if_manifest_sha_match_unless_force",
         },
         "table_pipeline": {
             "enabled": False,

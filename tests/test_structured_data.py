@@ -605,3 +605,94 @@ def test_build_structured_exports_strict_mode_requires_marker_artifacts(tmp_path
     assert status_path.exists()
     payload = json.loads(status_path.read_text())
     assert payload["status"] == "error"
+
+
+def test_build_structured_exports_escalation_applied_when_full_merge_improves(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "caption_confidence": 0.95,
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["H1", "H2"]],
+        "data_rows": [["", "x"], ["", "x"], ["", "x"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "table_01_page_0001.md").write_text(
+        "<table><tr><th>H1</th><th>H2</th></tr><tr><td>δ</td><td>x</td></tr><tr><td>η</td><td>x</td></tr><tr><td>γ</td><td>x</td></tr></table>"
+    )
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=True,
+        table_ocr_merge_scope="header",
+        table_escalation="auto",
+        table_escalation_max=2,
+    )
+    assert summary.table_count == 1
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "escalation_applied" for flag in flags)
+
+
+def test_build_structured_exports_escalation_missing_ocr_flag(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "caption_confidence": 0.95,
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["H1", "H2"]],
+        "data_rows": [["", "x"], ["", "x"], ["", "x"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=True,
+        table_ocr_merge_scope="header",
+        table_escalation="auto",
+        table_escalation_max=1,
+    )
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "escalation_missing_ocr" for flag in flags)
+
+
+def test_build_structured_exports_writes_caption_low_confidence_flag(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "",
+        "caption_confidence": 0.6,
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["A", "B"]],
+        "data_rows": [["1", "2"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+    build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "caption_low_confidence" for flag in flags)

@@ -570,6 +570,26 @@ def _fails_quality(metrics: dict[str, Any]) -> bool:
     )
 
 
+def _escalation_improves_quality(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    keys = (
+        "empty_cell_ratio",
+        "repeated_text_ratio",
+        "column_instability_ratio",
+    )
+    improved = False
+    for key in keys:
+        try:
+            before_v = float(before.get(key, 0.0))
+            after_v = float(after.get(key, 0.0))
+        except Exception:
+            continue
+        if (before_v - after_v) >= 0.05:
+            improved = True
+        if (after_v - before_v) > 0.05:
+            return False
+    return improved
+
+
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if rows:
@@ -802,7 +822,7 @@ def _patch_table_grid(
             marker_row_sig = _alnum_signature(" ".join(str(cell) for cell in rows[row_idx]))
             ocr_row_sig = _alnum_signature(" ".join(str(cell) for cell in ocr_rows[row_idx]))
             row_similarity = SequenceMatcher(None, marker_row_sig, ocr_row_sig).ratio() if (marker_row_sig or ocr_row_sig) else 1.0
-            allow_empty_fill = row_similarity >= 0.90
+            allow_empty_fill = row_similarity >= 0.50
             max_cols = min(len(rows[row_idx]), len(ocr_rows[row_idx]))
             for col_idx in range(max_cols):
                 merged, reason = _cell_patch_decision(
@@ -1374,6 +1394,7 @@ def build_structured_exports(
                 }
             )
         _write_jsonl(extracted_root / "table_fragments.jsonl", fragment_rows)
+        fragment_conf = {frag.fragment_id: float(frag.caption_confidence) for frag in fragments}
         canonical_rows: list[dict[str, Any]] = []
         for table in canonical_tables:
             header = table.get("header_rows", [])
@@ -1385,29 +1406,124 @@ def build_structured_exports(
                 if isinstance(r, list)
             ]
             metrics = _quality_metrics(headers, rows)
-            if table_quality_gate and _fails_quality(metrics):
+            table_id = str(table.get("table_id", ""))
+            page = min(table.get("pages", [1]))
+            escalated = False
+            quality_failed = table_quality_gate and _fails_quality(metrics)
+            if quality_failed:
                 msg = f"{table.get('table_id')}: quality gate failed"
                 summary.errors.append(msg)
-                if table_escalation in {"auto", "always"} and table_escalation_max > 0:
-                    table_escalation_max -= 1
+            should_escalate = False
+            if table_escalation == "always" and table_escalation_max > 0:
+                should_escalate = True
+            elif quality_failed and table_escalation in {"auto", "always"} and table_escalation_max > 0:
+                should_escalate = True
+            if should_escalate:
+                    page_ocr_tables = ocr_tables_by_page.get(int(page), [])
+                    if not page_ocr_tables:
+                        qa_flags.append(
+                            QAFlag(
+                                flag_id=_stable_id("qa", table_id, "escalation_missing_ocr"),
+                                severity="warn",
+                                type="escalation_missing_ocr",
+                                page=int(page),
+                                table_ref=table_id or "*",
+                                details="No OCR table candidates found for escalation",
+                            )
+                        )
+                        table_escalation_max -= 1
+                    else:
+                        marker_rows = [
+                            {
+                                "table_id": table_id,
+                                "headers": headers,
+                                "rows": rows,
+                            }
+                        ]
+                        matches, _, _ = _match_tables_for_page(marker_rows, page_ocr_tables)
+                        if not matches:
+                            qa_flags.append(
+                                QAFlag(
+                                    flag_id=_stable_id("qa", table_id, "escalation_missing_ocr"),
+                                    severity="warn",
+                                    type="escalation_missing_ocr",
+                                    page=int(page),
+                                    table_ref=table_id or "*",
+                                    details="No OCR table match exceeded merge threshold for escalation",
+                                )
+                            )
+                            table_escalation_max -= 1
+                        else:
+                            _, o_idx, _ = matches[0]
+                            ocr_table = page_ocr_tables[o_idx]
+                            esc_headers, esc_rows, _, _ = _patch_table_grid(
+                                marker_headers=headers,
+                                marker_rows=rows,
+                                ocr_headers=[str(x) for x in ocr_table.get("headers", [])],
+                                ocr_rows=[[str(x) for x in row] for row in ocr_table.get("rows", []) if isinstance(row, list)],
+                                merge_scope="full",
+                            )
+                            esc_metrics = _quality_metrics(esc_headers, esc_rows)
+                            if _escalation_improves_quality(metrics, esc_metrics):
+                                headers = esc_headers
+                                rows = esc_rows
+                                metrics = esc_metrics
+                                escalated = True
+                                table["source_format"] = "hybrid"
+                                qa_flags.append(
+                                    QAFlag(
+                                        flag_id=_stable_id("qa", table_id, "escalation_applied"),
+                                        severity="info",
+                                        type="escalation_applied",
+                                        page=int(page),
+                                        table_ref=table_id or "*",
+                                        details="Applied full-grid OCR escalation due to quality gate failure",
+                                    )
+                                )
+                            else:
+                                qa_flags.append(
+                                    QAFlag(
+                                        flag_id=_stable_id("qa", table_id, "escalation_no_improvement"),
+                                        severity="warn",
+                                        type="escalation_no_improvement",
+                                        page=int(page),
+                                        table_ref=table_id or "*",
+                                        details="Escalation attempted but quality did not improve enough",
+                                    )
+                                )
+                            table_escalation_max -= 1
             table["quality_metrics"] = metrics
+            if escalated:
+                table["escalated"] = True
             canonical_rows.append(table)
-            csv_path = tables_dir / f"{table['table_id']}.csv"
+            csv_path = tables_dir / f"{table_id}.csv"
             _write_table_csv(csv_path, headers, rows)
-            json_path = tables_dir / f"{table['table_id']}.json"
+            json_path = tables_dir / f"{table_id}.json"
             json_payload = dict(table)
             json_payload["csv_path"] = _portable_path(csv_path, doc_dir)
             json_path.write_text(json.dumps(json_payload, indent=2, ensure_ascii=True))
             table_rows.append(
                 {
-                    "table_id": table["table_id"],
-                    "page": min(table.get("pages", [1])),
+                    "table_id": table_id,
+                    "page": page,
                     "caption": table.get("caption_text", ""),
                     "headers": headers,
                     "rows": rows,
                     "csv_path": _portable_path(csv_path, doc_dir),
                 }
             )
+            confs = [fragment_conf.get(str(fid), 1.0) for fid in table.get("fragment_ids", [])]
+            if confs and min(confs) < 0.75:
+                qa_flags.append(
+                    QAFlag(
+                        flag_id=_stable_id("qa", table_id, "caption_low_confidence"),
+                        severity="warn",
+                        type="caption_low_confidence",
+                        page=int(page),
+                        table_ref=table_id or "*",
+                        details=f"min_caption_confidence={round(min(confs), 3)}",
+                    )
+                )
             summary.table_count += 1
         _write_jsonl(tables_dir / "canonical.jsonl", canonical_rows)
 

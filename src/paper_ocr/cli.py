@@ -22,18 +22,19 @@ from .bibliography import (
     bibliography_prompt,
     citation_from_bibliography,
     extract_json_object,
-    folder_name_from_bibliography,
-    markdown_filename_from_title,
     normalize_bibliography,
 )
 from .client import call_olmocr, call_text_model
 from .data_audit import format_audit_report, run_data_audit
 from .discoverability import (
     abstract_extraction_prompt,
+    discoverability_aggregate_prompt,
+    discoverability_chunk_prompt,
     first_pages_excerpt,
     is_useful_discovery,
     normalize_discovery,
     render_group_readme,
+    split_markdown_for_discovery,
 )
 from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_dir_name, output_group_name
 from .inspect import compute_text_heuristics, decide_route, is_text_only_candidate
@@ -429,31 +430,37 @@ async def _ensure_header_ocr_artifacts(
     ocr_out.mkdir(parents=True, exist_ok=True)
     ocr_crops.mkdir(parents=True, exist_ok=True)
 
-    existing = sorted(ocr_out.glob("table_*_page_*.md"))
-    if existing:
-        return {"generated": 0, "skipped_existing": len(existing), "status": "already_present"}
     if not marker_tables_path.exists():
-        return {"generated": 0, "skipped_existing": 0, "status": "missing_tables_raw"}
+        return {"expected": 0, "generated": 0, "skipped_existing": 0, "failed": 0, "status": "missing_tables_raw"}
 
     manifest_path = doc_dir / "metadata" / "manifest.json"
     if not manifest_path.exists():
-        return {"generated": 0, "skipped_existing": 0, "status": "missing_manifest"}
+        return {"expected": 0, "generated": 0, "skipped_existing": 0, "failed": 0, "status": "missing_manifest"}
     try:
         manifest = json.loads(manifest_path.read_text())
     except Exception:
         manifest = {}
     source_path_raw = str(manifest.get("source_path", "")).strip()
     if not source_path_raw:
-        return {"generated": 0, "skipped_existing": 0, "status": "missing_source_path"}
+        return {"expected": 0, "generated": 0, "skipped_existing": 0, "failed": 0, "status": "missing_source_path"}
     source_path = Path(source_path_raw)
     if not source_path.exists():
-        return {"generated": 0, "skipped_existing": 0, "status": f"missing_source_pdf:{source_path}"}
+        return {
+            "expected": 0,
+            "generated": 0,
+            "skipped_existing": 0,
+            "failed": 0,
+            "status": f"missing_source_pdf:{source_path}",
+        }
 
     table_rows = _load_jsonl_dicts(marker_tables_path)
     if not table_rows:
-        return {"generated": 0, "skipped_existing": 0, "status": "empty_tables_raw"}
+        return {"expected": 0, "generated": 0, "skipped_existing": 0, "failed": 0, "status": "empty_tables_raw"}
 
+    expected = 0
     generated = 0
+    skipped_existing = 0
+    failed = 0
     with fitz.open(source_path) as pdf:
         by_page_counter: dict[int, int] = {}
         for row in table_rows:
@@ -469,12 +476,15 @@ async def _ensure_header_ocr_artifacts(
 
             by_page_counter[page] = by_page_counter.get(page, 0) + 1
             ordinal = by_page_counter[page]
+            expected += 1
             out_md = ocr_out / f"table_{ordinal:02d}_page_{page:04d}.md"
             if out_md.exists():
+                skipped_existing += 1
                 continue
 
             x0, y0, x1, y1 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
             if x1 <= x0 or y1 <= y0:
+                failed += 1
                 continue
             header_h = max(72.0, min(180.0, (y1 - y0) * 0.33))
             clip = fitz.Rect(x0, y0, x1, min(y1, y0 + header_h))
@@ -502,11 +512,19 @@ async def _ensure_header_ocr_artifacts(
                 )
             except Exception as exc:  # noqa: BLE001
                 out_md.write_text(f"<!-- header_ocr_error: {exc} -->")
+                failed += 1
                 continue
             out_md.write_text(str(response.content or "").strip())
             generated += 1
 
-    return {"generated": generated, "skipped_existing": len(existing), "status": "ok"}
+    status = "ok" if failed == 0 else "partial"
+    return {
+        "expected": expected,
+        "generated": generated,
+        "skipped_existing": skipped_existing,
+        "failed": failed,
+        "status": status,
+    }
 
 
 async def _extract_bibliography(
@@ -549,30 +567,8 @@ async def _extract_bibliography(
 
 def _final_doc_dir(args: argparse.Namespace, pdf_path: Path, bibliography: dict[str, Any]) -> Path:
     group_dir = args.out_dir / output_group_name(pdf_path)
-    author_year = folder_name_from_bibliography(normalize_bibliography(bibliography))
-    if author_year in {"unknown_paper", "unknown_author_unknown_year"}:
-        author_year = output_dir_name(pdf_path)
-    candidate = group_dir / author_year
-    current_sha = file_sha256(pdf_path)
-    manifest_path = candidate / "metadata" / "manifest.json"
-    if manifest_path.exists():
-        try:
-            existing = json.loads(manifest_path.read_text())
-            existing_sha = str(existing.get("sha256", "")).strip()
-            if existing_sha and existing_sha != current_sha:
-                return group_dir / f"{author_year}_{doc_id_from_sha(current_sha)}"
-        except Exception:
-            pass
-    elif candidate.exists():
-        # If folder exists without a manifest (e.g. interrupted prior run), avoid
-        # merging unrelated PDFs into a shared author/year path.
-        try:
-            has_files = any(candidate.iterdir())
-        except Exception:
-            has_files = True
-        if has_files:
-            return group_dir / f"{author_year}_{doc_id_from_sha(current_sha)}"
-    return candidate
+    doc_id = doc_id_from_sha(file_sha256(pdf_path))
+    return group_dir / f"doc_{doc_id}"
 
 
 async def _extract_discovery(
@@ -626,12 +622,7 @@ async def _extract_discovery(
                 continue
         return {}
 
-    abstract_schema = (
-        '{'
-        '"abstract":"...",'
-        '"key_topics":["..."],'
-        '}'
-    )
+    abstract_schema = '{' '"abstract":"...",' '"key_topics":["..."],' '}'
     excerpt = first_pages_excerpt(consolidated_markdown, max_pages=5)
     abstract_prompt = abstract_extraction_prompt(
         title=str(bibliography.get("title", "")),
@@ -640,8 +631,9 @@ async def _extract_discovery(
         first_pages_markdown=excerpt,
     )
     abstract_raw = await _json_call(abstract_prompt, max_tokens=700, schema=abstract_schema)
+    base_discovery = {"paper_summary": "", "key_topics": [], "sections": []}
     if abstract_raw:
-        discovery = normalize_discovery(
+        base_discovery = normalize_discovery(
             {
                 "paper_summary": str(abstract_raw.get("abstract", "")).strip(),
                 "key_topics": abstract_raw.get("key_topics", []),
@@ -649,8 +641,54 @@ async def _extract_discovery(
             },
             page_count=page_count,
         )
-        if is_useful_discovery(discovery):
-            return discovery
+    chunks = split_markdown_for_discovery(consolidated_markdown, max_chars=32000)
+    chunk_payloads: list[dict[str, Any]] = []
+    if chunks:
+        chunk_schema = (
+            '{'
+            '"chunk_summary":"...",'
+            '"key_topics":["..."],'
+            '"sections":[{"title":"...","start_page":1,"end_page":1,"summary":"..."}]'
+            '}'
+        )
+        for idx, chunk in enumerate(chunks, start=1):
+            prompt = discoverability_chunk_prompt(
+                title=str(bibliography.get("title", "")),
+                citation=str(bibliography.get("citation", "")),
+                page_count=page_count,
+                chunk_index=idx,
+                chunk_count=len(chunks),
+                markdown_chunk=chunk,
+            )
+            raw = await _json_call(prompt, max_tokens=1000, schema=chunk_schema)
+            if isinstance(raw, dict) and raw:
+                chunk_payloads.append(raw)
+
+    if chunk_payloads:
+        agg_schema = (
+            '{'
+            '"paper_summary":"...",'
+            '"key_topics":["..."],'
+            '"sections":[{"title":"...","start_page":1,"end_page":1,"summary":"..."}]'
+            '}'
+        )
+        agg_prompt = discoverability_aggregate_prompt(
+            title=str(bibliography.get("title", "")),
+            citation=str(bibliography.get("citation", "")),
+            page_count=page_count,
+            chunk_outputs=chunk_payloads,
+        )
+        agg_raw = await _json_call(agg_prompt, max_tokens=1200, schema=agg_schema)
+        agg_discovery = normalize_discovery(agg_raw, page_count=page_count) if agg_raw else {"paper_summary": "", "key_topics": [], "sections": []}
+        if agg_discovery.get("sections"):
+            if not agg_discovery.get("paper_summary"):
+                agg_discovery["paper_summary"] = str(base_discovery.get("paper_summary", ""))
+            if not agg_discovery.get("key_topics"):
+                agg_discovery["key_topics"] = list(base_discovery.get("key_topics", []))
+            return agg_discovery
+
+    if is_useful_discovery(base_discovery):
+        return base_discovery
     return {"paper_summary": "", "key_topics": [], "sections": []}
 
 
@@ -1014,6 +1052,37 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
     sha = file_sha256(pdf_path)
     doc_id = doc_id_from_sha(sha)
     group_dir = args.out_dir / output_group_name(pdf_path)
+    doc_dir = group_dir / f"doc_{doc_id}"
+    existing_manifest_path = doc_dir / "metadata" / "manifest.json"
+    if existing_manifest_path.exists() and not bool(getattr(args, "force", False)):
+        try:
+            existing_manifest = json.loads(existing_manifest_path.read_text())
+        except Exception:
+            existing_manifest = {}
+        existing_sha = str(existing_manifest.get("sha256", "")).strip()
+        if existing_sha and existing_sha == sha:
+            bib_path = doc_dir / "metadata" / "bibliography.json"
+            disc_path = doc_dir / "metadata" / "discovery.json"
+            try:
+                bibliography = json.loads(bib_path.read_text()) if bib_path.exists() else existing_manifest.get("bibliography", {})
+            except Exception:
+                bibliography = existing_manifest.get("bibliography", {})
+            try:
+                discovery = json.loads(disc_path.read_text()) if disc_path.exists() else existing_manifest.get("discovery", {})
+            except Exception:
+                discovery = existing_manifest.get("discovery", {})
+            return {
+                "group_dir": str(group_dir),
+                "doc_dir": str(doc_dir),
+                "folder_name": doc_dir.name,
+                "consolidated_markdown": "document.md",
+                "page_count": int(existing_manifest.get("page_count", 0) or 0),
+                "bibliography": bibliography if isinstance(bibliography, dict) else {},
+                "discovery": discovery if isinstance(discovery, dict) else {"paper_summary": "", "key_topics": [], "sections": []},
+                "status": "skipped",
+                "strict_failure": False,
+                "errors": [],
+            }
     staging_dir = group_dir / f".staging_{doc_id}"
     dirs = ensure_dirs(staging_dir)
 
@@ -1131,7 +1200,6 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                     bibliography = _merge_bibliography_with_patch(bibliography, grobid_result.bibliography_patch)
                 else:
                     grobid_error = grobid_result.error
-            doc_dir = _final_doc_dir(args, pdf_path, bibliography)
             final_dirs = ensure_dirs(doc_dir)
             marker_localization = {"enabled": bool(getattr(args, "marker_localize", True))}
             if bool(getattr(args, "marker_localize", True)) and page_count > 0:
@@ -1177,7 +1245,6 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                 "doi": "",
                 "citation": "",
             }
-            doc_dir = _final_doc_dir(args, pdf_path, bibliography)
             final_dirs = ensure_dirs(doc_dir)
             marker_localization = {"enabled": bool(getattr(args, "marker_localize", True))}
             if bool(getattr(args, "marker_localize", True)):
@@ -1232,6 +1299,9 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                 "marker_version": str(marker_localization.get("artifacts", {}).get("raw_json", "")),
                 "marker_config_hash": marker_cfg_hash,
                 "grobid_version": "unknown",
+                "deterministic_params": {"temperature": 0},
+                "source_sha_match": True,
+                "rerun_policy": "skip_if_manifest_sha_match_unless_force",
             }
         )
         manifest["runtime"] = runtime
@@ -1260,7 +1330,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                 )
             )
 
-        consolidated_name = markdown_filename_from_title(bibliography.get("title", ""))
+        consolidated_name = "document.md"
         consolidated_text = "".join(md_out).strip() + "\n"
         write_text(doc_dir / consolidated_name, consolidated_text)
         write_text(final_dirs["metadata"] / "document.jsonl", "\n".join(jsonl_out) + "\n")
@@ -1299,6 +1369,8 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "ocr_merge": {},
             "ocr_html_comparison": {},
         }
+        strict_failure = False
+        doc_errors: list[str] = []
         if structured_data_enabled:
             try:
                 if bool(getattr(args, "table_ocr_merge", True)) and bool(getattr(args, "table_header_ocr_auto", True)):
@@ -1344,6 +1416,9 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             except Exception as exc:  # noqa: BLE001
                 structured_data_manifest["errors"] = [str(exc)]
                 structured_data_manifest["ocr_merge"] = {}
+                if "Strict table artifact mode failed" in str(exc):
+                    strict_failure = True
+                doc_errors.append(str(exc))
         manifest["structured_data_extraction"] = structured_data_manifest
         qa_flags_path = final_dirs["assets"] / "structured" / "extracted" / "qa" / "table_flags.jsonl"
         if not qa_flags_path.exists():
@@ -1362,6 +1437,11 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "status": "ok" if qa_flag_count == 0 else "flags",
             "qa_skipped_reason": "" if grobid_used else ("grobid_error" if grobid_error else "grobid_not_run"),
         }
+        manifest["processing_status"] = {
+            "status": "failed" if strict_failure else "ok",
+            "errors": doc_errors,
+            "strict_failure": strict_failure,
+        }
         manifest["discovery"] = discovery
         write_json(final_dirs["metadata"] / "manifest.json", manifest)
 
@@ -1375,6 +1455,9 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         "page_count": page_count,
         "bibliography": bibliography,
         "discovery": discovery,
+        "status": "failed" if strict_failure else "ok",
+        "strict_failure": strict_failure,
+        "errors": doc_errors,
     }
 
 
@@ -1403,9 +1486,29 @@ async def _run(args: argparse.Namespace) -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[dict[str, Any]] = []
+    failed_docs = 0
     for pdf in pdfs:
-        records.append(await _process_pdf(args, pdf))
+        try:
+            rec = await _process_pdf(args, pdf)
+        except Exception as exc:  # noqa: BLE001
+            rec = {
+                "group_dir": str(args.out_dir / output_group_name(pdf)),
+                "doc_dir": "",
+                "folder_name": "",
+                "consolidated_markdown": "",
+                "page_count": 0,
+                "bibliography": {},
+                "discovery": {},
+                "status": "failed",
+                "strict_failure": True,
+                "errors": [str(exc)],
+            }
+        records.append(rec)
+        if str(rec.get("status", "ok")) == "failed":
+            failed_docs += 1
     _write_group_readmes(records)
+    if failed_docs > 0:
+        raise SystemExit(f"Run completed with failed_docs={failed_docs}")
 
 
 async def _run_fetch_telegram(args: argparse.Namespace) -> None:
@@ -1473,6 +1576,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
         "figure_count": 0,
         "deplot_count": 0,
     }
+    failed_docs = 0
 
     for doc_dir in docs:
         metadata_dir = doc_dir / "metadata"
@@ -1561,7 +1665,14 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "ocr_merge": {},
                 "ocr_html_comparison": {},
             }
+            if "Strict table artifact mode failed" in str(exc):
+                failed_docs += 1
         manifest["structured_data_extraction"] = structured_data_manifest
+        manifest["processing_status"] = {
+            "status": "failed" if structured_data_manifest.get("errors") else "ok",
+            "errors": list(structured_data_manifest.get("errors", [])),
+            "strict_failure": any("Strict table artifact mode failed" in str(e) for e in structured_data_manifest.get("errors", [])),
+        }
         write_json(manifest_path, manifest)
 
         totals["docs_processed"] += 1
@@ -1584,6 +1695,8 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
         f"figures={totals['figure_count']} "
         f"deplot={totals['deplot_count']}"
     )
+    if failed_docs > 0:
+        raise SystemExit(f"Structured export completed with failed_docs={failed_docs}")
     return totals
 
 

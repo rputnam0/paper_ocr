@@ -52,6 +52,7 @@ async def call_olmocr(
             response = await client.chat.completions.create(
                 model=model,
                 max_tokens=max_tokens,
+                temperature=0,
                 messages=[
                     {
                         "role": "user",
@@ -101,6 +102,7 @@ async def call_text_model(
             response = await client.chat.completions.create(
                 model=model,
                 max_tokens=max_tokens,
+                temperature=0,
                 messages=[{"role": "user", "content": prompt}],
             )
             message = response.choices[0].message
