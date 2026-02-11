@@ -14,10 +14,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .table_context import resolve_table_context_mappings
 
 FIGURE_MD_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 OCR_TABLE_FILE_RE = re.compile(r"table_(\d+)_page_(\d+)\.md$", re.IGNORECASE)
 SYMBOL_CHAR_RE = re.compile(r"[^\x00-\x7F]|[±≤≥≈×÷°µμδΔητσγβαΩω]")
+UNIT_TOKEN_RE = re.compile(r"(?:\bpa\b|\bwt\b|mol|g|kg|mg|ml|dl|l|%|°c|°k|ppm|\bm\b|\bs\b)", flags=re.IGNORECASE)
 LATEX_GREEK_MAP = {
     "alpha": "α",
     "beta": "β",
@@ -554,11 +556,21 @@ def _merge_table_fragments(fragments: list[TableFragment]) -> list[dict[str, Any
         frags_sorted = sorted(frags, key=lambda f: (f.page, f.fragment_id))
         header_rows = frags_sorted[0].header_rows
         merged_rows: list[list[str]] = []
+        row_lineage: list[dict[str, Any]] = []
         for frag in frags_sorted:
-            for row in frag.data_rows:
+            for source_row_index, row in enumerate(frag.data_rows):
                 if merged_rows and row == merged_rows[-1]:
                     continue
                 merged_rows.append(row)
+                row_lineage.append(
+                    {
+                        "row_index": len(merged_rows) - 1,
+                        "fragment_id": frag.fragment_id,
+                        "page": frag.page,
+                        "source_row_index": source_row_index,
+                        "source_kind": "data_row",
+                    }
+                )
         out.append(
             {
                 "table_id": _stable_id(key, ",".join(f.fragment_id for f in frags_sorted)),
@@ -568,6 +580,7 @@ def _merge_table_fragments(fragments: list[TableFragment]) -> list[dict[str, Any
                 "caption_text": next((f.caption_text for f in frags_sorted if f.caption_text), ""),
                 "header_rows": header_rows,
                 "data_rows": merged_rows,
+                "row_lineage": row_lineage,
                 "source_format": frags_sorted[0].source_format,
                 "merge_confidence": 0.9 if len(frags_sorted) > 1 else 1.0,
             }
@@ -623,21 +636,71 @@ def _row_signature(row: list[str]) -> tuple[str, ...]:
     return tuple(_normalize_cell_text(cell) for cell in row)
 
 
-def _coerce_rows_from_header_only_table(table: dict[str, Any], *, first_header_row: list[str] | None = None) -> list[list[str]]:
+def _coerce_rows_with_lineage(
+    table: dict[str, Any],
+    *,
+    first_header_row: list[str] | None = None,
+) -> list[tuple[list[str], dict[str, Any]]]:
     rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
+    table_fragment_ids = [str(x) for x in table.get("fragment_ids", []) if str(x)]
+    fragment_id = table_fragment_ids[0] if table_fragment_ids else ""
+    table_pages = [int(p) for p in table.get("pages", []) if isinstance(p, int) or str(p).isdigit()]
+    page = min(table_pages) if table_pages else 0
     if rows:
-        return rows
+        out: list[tuple[list[str], dict[str, Any]]] = []
+        for row_idx, row in enumerate(rows):
+            out.append(
+                (
+                    row,
+                    {
+                        "row_index": row_idx,
+                        "fragment_id": fragment_id,
+                        "page": page,
+                        "source_row_index": row_idx,
+                        "source_kind": "data_row",
+                    },
+                )
+            )
+        return out
     header_rows = [list(r) for r in table.get("header_rows", []) if isinstance(r, list)]
     if not header_rows:
         return []
     if not first_header_row:
-        return header_rows
+        return [
+            (
+                row,
+                {
+                    "row_index": row_idx,
+                    "fragment_id": fragment_id,
+                    "page": page,
+                    "source_row_index": row_idx,
+                    "source_kind": "header_derived_row",
+                },
+            )
+            for row_idx, row in enumerate(header_rows)
+        ]
 
     first_sig = tuple(_normalize_cell_text(x) for x in first_header_row)
     candidate = _normalize_header_row_for_target_cols(header_rows[0], len(first_sig))
     if _row_signature(candidate) == first_sig:
-        return header_rows[1:]
-    return header_rows
+        start_idx = 1
+    else:
+        start_idx = 0
+    out = []
+    for row_idx, row in enumerate(header_rows[start_idx:], start=start_idx):
+        out.append(
+            (
+                row,
+                {
+                    "row_index": row_idx - start_idx,
+                    "fragment_id": fragment_id,
+                    "page": page,
+                    "source_row_index": row_idx,
+                    "source_kind": "header_derived_row",
+                },
+            )
+        )
+    return out
 
 
 def _try_merge_cross_page_continuation(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any] | None:
@@ -666,7 +729,8 @@ def _try_merge_cross_page_continuation(first: dict[str, Any], second: dict[str, 
     first_header_rows = [list(r) for r in first.get("header_rows", []) if isinstance(r, list)]
     second_header_rows = [list(r) for r in second.get("header_rows", []) if isinstance(r, list)]
     first_primary_header: list[str] | None = first_header_rows[0] if first_header_rows else None
-    second_rows = _coerce_rows_from_header_only_table(second, first_header_row=first_primary_header)
+    second_rows_with_lineage = _coerce_rows_with_lineage(second, first_header_row=first_primary_header)
+    second_rows = [list(row) for row, _ in second_rows_with_lineage]
     if not _has_nonempty_cells(second_rows):
         return None
 
@@ -710,10 +774,16 @@ def _try_merge_cross_page_continuation(first: dict[str, Any], second: dict[str, 
         return None
 
     merged_rows = [_normalize_data_row_for_target_cols(row, target_cols) for row in second_rows]
+    merged_lineage: list[dict[str, Any]] = []
+    for out_idx, (_, lineage) in enumerate(second_rows_with_lineage):
+        lineage_row = dict(lineage)
+        lineage_row["row_index"] = out_idx
+        merged_lineage.append(lineage_row)
 
     merged = dict(first)
     merged["header_rows"] = merged_header_rows
     merged["data_rows"] = merged_rows
+    merged["row_lineage"] = merged_lineage
     merged["pages"] = sorted(set(first_pages + second_pages))
     merged["fragment_ids"] = list(dict.fromkeys([str(x) for x in first.get("fragment_ids", []) + second.get("fragment_ids", [])]))
     merged["merge_confidence"] = min(float(first.get("merge_confidence", 1.0) or 1.0), 0.85)
@@ -806,6 +876,182 @@ def _escalation_improves_quality(before: dict[str, Any], after: dict[str, Any]) 
         if (after_v - before_v) > 0.05:
             return False
     return improved
+
+
+def _is_numericish(value: str) -> bool:
+    text = _normalize_cell_text(value)
+    if not text:
+        return False
+    text = text.replace(",", "")
+    return bool(re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?", text, flags=re.IGNORECASE))
+
+
+def _row_column_orientation_score(headers: list[str], rows: list[list[str]]) -> float:
+    if not headers:
+        return 0.0
+    clean_headers = [_normalize_cell_text(h) for h in headers]
+    header_nonempty = sum(1 for h in clean_headers if h)
+    header_textual = sum(1 for h in clean_headers if h and not _is_numericish(h))
+    header_score = 0.0
+    if clean_headers:
+        header_score = (0.6 * (header_textual / max(len(clean_headers), 1))) + (
+            0.4 * (header_nonempty / max(len(clean_headers), 1))
+        )
+
+    if not rows:
+        return header_score
+    flat = [cell for row in rows for cell in row]
+    numeric_ratio = sum(1 for cell in flat if _is_numericish(cell)) / max(len(flat), 1)
+    first_col = [row[0] for row in rows if row]
+    first_col_text_ratio = sum(1 for cell in first_col if _normalize_cell_text(cell) and not _is_numericish(cell)) / max(
+        len(first_col), 1
+    )
+    return (0.45 * header_score) + (0.30 * numeric_ratio) + (0.25 * first_col_text_ratio)
+
+
+def _transpose_table(headers: list[str], rows: list[list[str]]) -> tuple[list[str], list[list[str]]]:
+    if not rows:
+        return headers, rows
+    max_cols = max([len(headers)] + [len(r) for r in rows])
+    norm_headers = list(headers) + [""] * (max_cols - len(headers))
+    norm_rows = [list(r) + [""] * (max_cols - len(r)) for r in rows]
+    grid = [norm_headers] + norm_rows
+    t_grid = [list(col) for col in zip(*grid)]
+    new_headers = t_grid[0] if t_grid else []
+    new_rows = t_grid[1:] if len(t_grid) > 1 else []
+    return new_headers, new_rows
+
+
+def _correct_row_column_topology(headers: list[str], rows: list[list[str]]) -> tuple[list[str], list[list[str]], dict[str, Any]]:
+    if not rows:
+        return headers, rows, {"changed": False, "reasons": []}
+
+    out_headers = list(headers)
+    out_rows = [list(r) for r in rows]
+    reasons: list[str] = []
+    target_cols = len(out_headers)
+    if target_cols > 0:
+        leading_empty_shift = sum(1 for row in out_rows if len(row) == target_cols + 1 and not _normalize_cell_text(row[0]))
+        trailing_empty_shift = sum(
+            1 for row in out_rows if len(row) == target_cols + 1 and not _normalize_cell_text(row[-1])
+        )
+        if leading_empty_shift >= max(1, int(0.7 * len(out_rows))):
+            out_rows = [row[1:] if len(row) >= target_cols + 1 else row for row in out_rows]
+            reasons.append("leading_empty_column_shift")
+        elif trailing_empty_shift >= max(1, int(0.7 * len(out_rows))):
+            out_rows = [row[:-1] if len(row) >= target_cols + 1 else row for row in out_rows]
+            reasons.append("trailing_empty_column_shift")
+
+    if out_headers and out_rows:
+        current_score = _row_column_orientation_score(out_headers, out_rows)
+        th, tr = _transpose_table(out_headers, out_rows)
+        transposed_score = _row_column_orientation_score(th, tr)
+        header_numeric_ratio = sum(1 for h in out_headers if _is_numericish(h)) / max(len(out_headers), 1)
+        if (
+            len(out_headers) >= 4
+            and len(out_rows) >= 2
+            and header_numeric_ratio >= 0.75
+            and (transposed_score - current_score) >= 0.35
+        ):
+            out_headers, out_rows = th, tr
+            reasons.append("transpose_recovery")
+
+    if out_headers:
+        normalized_rows: list[list[str]] = []
+        for row in out_rows:
+            if len(row) < len(out_headers):
+                normalized_rows.append(list(row) + [""] * (len(out_headers) - len(row)))
+                reasons.append("row_padding")
+            elif len(row) > len(out_headers):
+                normalized_rows.append(list(row)[: len(out_headers)])
+                reasons.append("row_trimming")
+            else:
+                normalized_rows.append(list(row))
+        out_rows = normalized_rows
+
+    return out_headers, out_rows, {"changed": bool(reasons), "reasons": sorted(set(reasons))}
+
+
+def _apply_completeness_guardrails(
+    *,
+    headers: list[str],
+    rows: list[list[str]],
+    row_lineage: list[dict[str, Any]],
+) -> tuple[list[list[str]], list[dict[str, Any]], dict[str, Any]]:
+    out_rows: list[list[str]] = []
+    out_lineage: list[dict[str, Any]] = []
+    details: list[str] = []
+    seen_signatures: set[tuple[str, ...]] = set()
+    for idx, row in enumerate(rows):
+        if not _has_nonempty_cells([row]):
+            details.append("dropped_empty_row")
+            continue
+        sig = tuple(_normalize_cell_text(cell) for cell in row)
+        if sig in seen_signatures:
+            details.append("dropped_duplicate_row")
+            continue
+        seen_signatures.add(sig)
+        out_rows.append(list(row))
+        if idx < len(row_lineage):
+            lineage_row = dict(row_lineage[idx])
+        else:
+            lineage_row = {}
+        lineage_row["row_index"] = len(out_rows) - 1
+        out_lineage.append(lineage_row)
+
+    if not out_rows and rows:
+        out_rows = [list(r) for r in rows]
+        out_lineage = [dict(row) for row in row_lineage]
+
+    # Completeness baseline: if a majority of rows have a non-empty first column, require it.
+    if headers and out_rows:
+        nonempty_first = sum(1 for row in out_rows if row and _normalize_cell_text(row[0]))
+        if nonempty_first < max(1, int(0.6 * len(out_rows))):
+            details.append("sparse_identifier_column")
+
+    return out_rows, out_lineage, {"triggered": bool(details), "details": sorted(set(details))}
+
+
+def _infer_required_fields_missing(
+    *,
+    headers: list[str],
+    caption_text: str,
+    context_mappings: list[dict[str, Any]],
+    unresolved_codes: list[str],
+    completeness_details: list[str],
+) -> list[str]:
+    missing: list[str] = []
+    header_text = " ".join(_normalize_cell_text(h) for h in headers)
+    caption = _normalize_cell_text(caption_text)
+    caption_has_units = bool(UNIT_TOKEN_RE.search(caption))
+    header_has_units = bool(UNIT_TOKEN_RE.search(header_text))
+    if caption_has_units and not header_has_units:
+        missing.append("units_not_propagated_from_caption")
+    if unresolved_codes:
+        missing.append("unresolved_code_mappings:" + ",".join(sorted(unresolved_codes)))
+    if not headers or sum(1 for h in headers if _normalize_cell_text(h)) <= 1:
+        missing.append("missing_required_columns")
+    if "sparse_identifier_column" in completeness_details:
+        missing.append("incomplete_identifier_column")
+    if context_mappings == [] and "code" in header_text.lower():
+        missing.append("missing_context_mappings")
+    return sorted(set(missing))
+
+
+def _default_row_lineage(rows: list[list[str]], *, page: int, fragment_ids: list[str]) -> list[dict[str, Any]]:
+    fragment_id = fragment_ids[0] if fragment_ids else ""
+    out: list[dict[str, Any]] = []
+    for idx, _ in enumerate(rows):
+        out.append(
+            {
+                "row_index": idx,
+                "fragment_id": fragment_id,
+                "page": int(page),
+                "source_row_index": idx,
+                "source_kind": "derived",
+            }
+        )
+    return out
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1681,6 +1927,7 @@ def build_structured_exports(
                 for r in table.get("data_rows", [])
                 if isinstance(r, list)
             ]
+            row_lineage = [dict(r) for r in table.get("row_lineage", []) if isinstance(r, dict)]
             metrics = _quality_metrics(headers, rows)
             table_id = str(table.get("table_id", ""))
             page = min(table.get("pages", [1]))
@@ -1871,6 +2118,75 @@ def build_structured_exports(
                             )
                         )
                         continue
+            topo_headers, topo_rows, topo_meta = _correct_row_column_topology(headers, rows)
+            if topo_meta.get("changed"):
+                headers = [_normalize_cell_text(x) for x in topo_headers]
+                rows = [[_normalize_cell_text(x) for x in r] for r in topo_rows]
+                metrics = _quality_metrics(headers, rows)
+                row_lineage = _default_row_lineage(
+                    rows,
+                    page=int(page),
+                    fragment_ids=[str(x) for x in table.get("fragment_ids", []) if str(x)],
+                )
+                qa_flags.append(
+                    QAFlag(
+                        flag_id=_stable_id("qa", table_id, "row_column_topology_corrected"),
+                        severity="info",
+                        type="row_column_topology_corrected",
+                        page=int(page),
+                        table_ref=table_id or "*",
+                        details=",".join([str(x) for x in topo_meta.get("reasons", [])]),
+                    )
+                )
+
+            rows, row_lineage, completeness_meta = _apply_completeness_guardrails(
+                headers=headers,
+                rows=rows,
+                row_lineage=row_lineage if row_lineage else _default_row_lineage(
+                    rows,
+                    page=int(page),
+                    fragment_ids=[str(x) for x in table.get("fragment_ids", []) if str(x)],
+                ),
+            )
+            if completeness_meta.get("triggered"):
+                qa_flags.append(
+                    QAFlag(
+                        flag_id=_stable_id("qa", table_id, "completeness_guardrail_triggered"),
+                        severity="info",
+                        type="completeness_guardrail_triggered",
+                        page=int(page),
+                        table_ref=table_id or "*",
+                        details=",".join([str(x) for x in completeness_meta.get("details", [])]),
+                    )
+                )
+
+            context_payload = resolve_table_context_mappings(
+                doc_dir=doc_dir,
+                page=int(page),
+                table={"headers": headers, "rows": rows},
+            )
+            context_mappings = [dict(x) for x in context_payload.get("mappings", []) if isinstance(x, dict)]
+            unresolved_codes = [str(x) for x in context_payload.get("unresolved_codes", []) if str(x)]
+            if context_mappings:
+                qa_flags.append(
+                    QAFlag(
+                        flag_id=_stable_id("qa", table_id, "legend_code_resolved"),
+                        severity="info",
+                        type="legend_code_resolved",
+                        page=int(page),
+                        table_ref=table_id or "*",
+                        details=f"resolved={len(context_mappings)} unresolved={len(unresolved_codes)}",
+                    )
+                )
+
+            required_fields_missing = _infer_required_fields_missing(
+                headers=headers,
+                caption_text=str(table.get("caption_text", "")),
+                context_mappings=context_mappings,
+                unresolved_codes=unresolved_codes,
+                completeness_details=[str(x) for x in completeness_meta.get("details", [])],
+            )
+
             header_rows_full: list[list[str]] = []
             target_cols = max(len(headers), max((len(r) for r in raw_header_rows), default=0))
             for raw in raw_header_rows:
@@ -1880,11 +2196,25 @@ def build_structured_exports(
                 header_rows_full.append(normalized)
             if not header_rows_full and headers:
                 header_rows_full = [list(headers)]
+            if len(header_rows_full) >= 2:
+                qa_flags.append(
+                    QAFlag(
+                        flag_id=_stable_id("qa", table_id, "multi_level_header_recovered"),
+                        severity="info",
+                        type="multi_level_header_recovered",
+                        page=int(page),
+                        table_ref=table_id or "*",
+                        details=f"header_levels={len(header_rows_full)}",
+                    )
+                )
 
             table["header_rows"] = [list(headers)]
             table["header_rows_full"] = header_rows_full
             table["header_hierarchy"] = [{"level": idx + 1, "cells": row} for idx, row in enumerate(header_rows_full)]
             table["data_rows"] = [list(r) for r in rows]
+            table["row_lineage"] = row_lineage
+            table["context_mappings"] = context_mappings
+            table["required_fields_missing"] = required_fields_missing
             table["quality_metrics"] = metrics
             canonical_rows.append(table)
             csv_path = tables_dir / f"{table_id}.csv"

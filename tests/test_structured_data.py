@@ -1138,3 +1138,78 @@ def test_build_structured_exports_excludes_sparse_headers_marker_table(tmp_path:
     qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
     flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
     assert any(flag["type"] == "excluded_low_quality" and "sparse_headers" in flag["details"] for flag in flags)
+
+
+def test_build_structured_exports_emits_lineage_context_and_required_fields(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text(
+        "\n".join(
+            [
+                "Legend",
+                "A1 = poly(styrene)",
+            ]
+        )
+    )
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["Sample", "Value"]],
+        "data_rows": [["A1", "1.2"], ["B2", "1.9"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    table_json = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / f"{first['table_id']}.json"
+    payload = json.loads(table_json.read_text())
+
+    assert len(payload["row_lineage"]) == 2
+    assert payload["row_lineage"][0]["fragment_id"]
+    assert payload["context_mappings"][0]["code"] == "A1"
+    assert payload["context_mappings"][0]["resolved_text"] == "poly(styrene)"
+    assert any(item.startswith("unresolved_code_mappings:") for item in payload["required_fields_missing"])
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "legend_code_resolved" for flag in flags)
+
+
+def test_build_structured_exports_corrects_simple_column_shift_and_flags_it(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["Sample", "A", "B"]],
+        "data_rows": [["", "S1", "1", "2"], ["", "S2", "3", "4"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    assert first["rows"] == [["S1", "1", "2"], ["S2", "3", "4"]]
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "row_column_topology_corrected" for flag in flags)
