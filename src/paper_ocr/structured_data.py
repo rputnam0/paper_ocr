@@ -726,7 +726,7 @@ def _table_token_set(headers: list[str], rows: list[list[str]]) -> set[str]:
     return tokens
 
 
-def _header_similarity(lhs_headers: list[str], lhs_rows: list[list[str]], rhs_headers: list[str], rhs_rows: list[list[str]]) -> float:
+def _header_similarity_by_tokens(lhs_headers: list[str], lhs_rows: list[list[str]], rhs_headers: list[str], rhs_rows: list[list[str]]) -> float:
     lhs = _table_token_set(lhs_headers, lhs_rows)
     rhs = _table_token_set(rhs_headers, rhs_rows)
     if not lhs and not rhs:
@@ -734,6 +734,7 @@ def _header_similarity(lhs_headers: list[str], lhs_rows: list[list[str]], rhs_he
     if not lhs or not rhs:
         return 0.0
     return len(lhs.intersection(rhs)) / max(len(lhs.union(rhs)), 1)
+
 
 
 def _match_tables_for_page(
