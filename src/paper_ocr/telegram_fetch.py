@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import parse_qs, unquote, urlparse
 
 try:
     from telethon import TelegramClient
@@ -27,8 +28,10 @@ except Exception:  # pragma: no cover - exercised only when dependency missing
 
 
 DOI_PREFIX_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", re.IGNORECASE)
+DOI_MATCH_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>]+", re.IGNORECASE)
 SAFE_CHAR_RE = re.compile(r"[^A-Za-z0-9._-]+")
 LEADING_SYMBOLS_RE = re.compile(r"^[^A-Za-z0-9]+")
+DOI_TRAILING_CHARS = ".,;:)]}>\"'"
 
 FAILURE_MARKERS = (
     "not found",
@@ -37,7 +40,7 @@ FAILURE_MARKERS = (
     "points exhausted",
     "no points",
 )
-SEARCHING_MARKERS = ("searching", "processing", "queued")
+SEARCHING_MARKERS = ("searching", "processing", "queued", "looking at")
 
 REPORT_COLUMNS = [
     "doi_original",
@@ -51,6 +54,7 @@ REPORT_COLUMNS = [
     "elapsed_s",
 ]
 MAX_FILENAME_STEM = 180
+MAX_DOI_REQUERY_ATTEMPTS = 3
 
 
 @dataclass
@@ -85,8 +89,57 @@ class FetchTelegramConfig:
 
 
 def normalize_doi(raw: str) -> str:
+    resolved = resolve_doi_from_raw(raw)
+    if resolved:
+        return resolved
     doi = DOI_PREFIX_RE.sub("", (raw or "").strip())
     return doi.lower()
+
+
+def _clean_doi_candidate(raw: str) -> str:
+    candidate = DOI_PREFIX_RE.sub("", (raw or "").strip())
+    candidate = candidate.strip().strip("<>{}[]()")
+    while candidate and candidate[-1] in DOI_TRAILING_CHARS:
+        candidate = candidate[:-1]
+    return candidate.strip().lower()
+
+
+def _looks_like_doi(value: str) -> bool:
+    return bool(DOI_MATCH_RE.fullmatch(value))
+
+
+def _extract_dois_from_text(raw: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _record(value: str) -> None:
+        cleaned = _clean_doi_candidate(value)
+        if cleaned and _looks_like_doi(cleaned) and cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+
+    text = (raw or "").strip()
+    if not text:
+        return out
+
+    _record(text)
+
+    decoded = unquote(text)
+    for source in {text, decoded}:
+        for match in DOI_MATCH_RE.findall(source):
+            _record(match)
+        parsed = urlparse(source)
+        if parsed.scheme and parsed.netloc:
+            for value in parse_qs(parsed.query).get("doi", []):
+                _record(value)
+            if "doi.org" in parsed.netloc.lower() and parsed.path:
+                _record(parsed.path.lstrip("/"))
+    return out
+
+
+def resolve_doi_from_raw(raw: str) -> str:
+    candidates = _extract_dois_from_text(raw)
+    return candidates[0] if candidates else ""
 
 
 def doi_filename(doi: str) -> str:
@@ -221,6 +274,49 @@ def _button_labels(message: Any) -> list[str]:
     return labels
 
 
+def _button_urls(message: Any) -> list[str]:
+    buttons = getattr(message, "buttons", None)
+    if not buttons:
+        return []
+    urls: list[str] = []
+    for row in buttons:
+        for button in row:
+            url = getattr(button, "url", None)
+            if isinstance(url, str) and url.strip():
+                urls.append(url.strip())
+    return urls
+
+
+def _link_button_index(message: Any) -> int | None:
+    buttons = getattr(message, "buttons", None)
+    if not buttons:
+        return None
+    idx = 0
+    for row in buttons:
+        for button in row:
+            label = str(getattr(button, "text", "") or "")
+            url = getattr(button, "url", None)
+            label_low = label.lower()
+            if isinstance(url, str) and url.strip():
+                return idx
+            if "🔗" in label or "link" in label_low:
+                return idx
+            idx += 1
+    return None
+
+
+def _message_doi_candidates(message: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    raw_values = [_message_text(message), *_button_urls(message)]
+    for raw in raw_values:
+        for doi in _extract_dois_from_text(raw):
+            if doi not in seen:
+                seen.add(doi)
+                out.append(doi)
+    return out
+
+
 def _request_button_index(message: Any) -> int | None:
     labels = _button_labels(message)
     for idx, label in enumerate(labels):
@@ -302,6 +398,9 @@ async def process_doi(
     excerpt = ""
     saw_searching = False
     search_deadline: float | None = None
+    attempted_queries: set[str] = {doi_normalized}
+    requery_attempts = 0
+    clicked_link_buttons: set[tuple[int, int]] = set()
 
     async def _next_response(conv: Any, *, edit_from: Any | None = None) -> Any:
         while True:
@@ -395,6 +494,27 @@ async def process_doi(
                     saw_searching = True
                     if search_deadline is None:
                         search_deadline = time.monotonic() + max(search_timeout, response_timeout)
+                    response = await _next_response(conv, edit_from=sent_message)
+                    continue
+
+                doi_candidates = _message_doi_candidates(response)
+                if requery_attempts < MAX_DOI_REQUERY_ATTEMPTS:
+                    next_doi = next((doi for doi in doi_candidates if doi not in attempted_queries), "")
+                    if next_doi:
+                        attempted_queries.add(next_doi)
+                        requery_attempts += 1
+                        sent_message = await _with_floodwait(lambda: conv.send_message(next_doi))
+                        response = await _next_response(conv)
+                        continue
+
+                link_button_idx = _link_button_index(response)
+                response_key = int(getattr(response, "id", 0) or id(response))
+                if (
+                    link_button_idx is not None
+                    and (response_key, link_button_idx) not in clicked_link_buttons
+                ):
+                    clicked_link_buttons.add((response_key, link_button_idx))
+                    await _with_floodwait(lambda: response.click(link_button_idx))
                     response = await _next_response(conv, edit_from=sent_message)
                     continue
 

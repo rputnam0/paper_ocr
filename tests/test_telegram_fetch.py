@@ -12,8 +12,9 @@ class _FakeFloodWaitError(Exception):
 
 
 class _FakeButton:
-    def __init__(self, text: str):
+    def __init__(self, text: str, url: str | None = None):
         self.text = text
+        self.url = url
 
 
 class _FakeMessage:
@@ -83,6 +84,12 @@ def _factory(conv):
 def test_normalize_doi():
     assert telegram_fetch.normalize_doi(" https://doi.org/10.1000/ABC ") == "10.1000/abc"
     assert telegram_fetch.normalize_doi("DOI:10.5555/xyz") == "10.5555/xyz"
+    assert (
+        telegram_fetch.normalize_doi(
+            "https://example.org/redirect?target=https%3A%2F%2Fdoi.org%2F10.1016%2Fj.carbpol.2020.117012"
+        )
+        == "10.1016/j.carbpol.2020.117012"
+    )
 
 
 def test_doi_filename_sanitizes():
@@ -279,6 +286,57 @@ def test_process_doi_searching_then_timeout_then_success(tmp_path: Path):
             conversation_factory=_factory(conv),
             doi_original="10.1000/abc",
             doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+
+
+def test_process_doi_link_button_resolves_doi_and_requeries(tmp_path: Path):
+    card = _FakeMessage(
+        text="🔬 Result card",
+        buttons=[
+            [_FakeButton("🔗 6", url="https://doi.org/10.1208/PT0802032")],
+            [_FakeButton("✖️")],
+        ],
+    )
+    conv = _FakeConversation([card, _FakeMessage(has_file=True)])
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="https://example.org/landing/paper",
+            doi_normalized="https://example.org/landing/paper",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+    assert conv.sent == [
+        "https://example.org/landing/paper",
+        "10.1208/pt0802032",
+    ]
+
+
+def test_process_doi_looking_at_marker_then_timeout_then_success(tmp_path: Path):
+    conv = _FakeConversation(
+        [
+            _FakeMessage(text="⬇️ ankur-j-shah.pdf\nlooking at Stargate LLC..."),
+            asyncio.TimeoutError(),
+            _FakeMessage(has_file=True),
+        ]
+    )
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1208/pt0802032",
+            doi_normalized="10.1208/pt0802032",
             in_dir=tmp_path,
             response_timeout=1,
             search_timeout=10,
