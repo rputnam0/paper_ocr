@@ -607,10 +607,6 @@ def _coerce_rows_from_header_only_table(table: dict[str, Any]) -> list[list[str]
     return []
 
 
-def _table_caption_has_number(caption: str) -> bool:
-    return bool(_extract_table_number(caption or ""))
-
-
 def _try_merge_cross_page_continuation(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any] | None:
     first_pages = sorted({int(p) for p in first.get("pages", []) if isinstance(p, int) or str(p).isdigit()})
     second_pages = sorted({int(p) for p in second.get("pages", []) if isinstance(p, int) or str(p).isdigit()})
