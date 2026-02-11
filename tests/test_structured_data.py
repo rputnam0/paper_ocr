@@ -973,12 +973,74 @@ def test_build_structured_exports_merges_cross_page_table_continuation(tmp_path:
     first = json.loads(table_manifest.read_text().splitlines()[0])
     assert first["page"] == 1
     assert first["headers"] == ["Temperature", "800 °C", "900 °C", "1000 °C"]
-    assert first["rows"] == [["KCl", "14.6", "23.2", "34.2"]]
+    assert first["rows"] == [
+        ["K2Si4O9", "85.4", "76.8", "65.8"],
+        ["KCl", "14.6", "23.2", "34.2"],
+    ]
 
     qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
     flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
     assert any(flag["type"] == "cross_page_continuation_merged" for flag in flags)
     assert not any(flag["type"] == "excluded_low_quality" for flag in flags)
+
+
+def test_build_structured_exports_merges_cross_page_continuation_keeps_secondary_header_rows(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text("Table on page 1\n")
+    (pages_dir / "0002.md").write_text("Continuation on page 2\n")
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_rows = [
+        {
+            "table_group_id": "page_0001_table_01",
+            "table_block_ids": ["b1"],
+            "caption_block_id": "c1",
+            "page": 1,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["Case\n1\n2\n3\n4"]],
+            "data_rows": [],
+            "caption_text": "Table 1. Materials and their amounts used in the experiments",
+        },
+        {
+            "table_group_id": "page_0002_table_01",
+            "table_block_ids": ["b2"],
+            "caption_block_id": "",
+            "page": 2,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["", "", "", "", ""], ["Materials", "K2CO3", "K2CO3-SiO2", "KCl", "KCl-SiO2"]],
+            "data_rows": [["K/Si (mg/mg)", "-", "1:2", "-", "1:2"]],
+            "caption_text": "",
+        },
+    ]
+    (marker_root / "tables_raw.jsonl").write_text("\n".join(json.dumps(r) for r in marker_rows) + "\n")
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=False,
+    )
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    assert first["headers"] == [
+        "Case (Materials)",
+        "1 (K2CO3)",
+        "2 (K2CO3-SiO2)",
+        "3 (KCl)",
+        "4 (KCl-SiO2)",
+    ]
+    assert first["rows"] == [["K/Si (mg/mg)", "-", "1:2", "-", "1:2"]]
+
+    table_json = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / f"{first['table_id']}.json"
+    payload = json.loads(table_json.read_text())
+    assert payload["header_rows_full"] == [
+        ["Case", "1", "2", "3", "4"],
+        ["Materials", "K2CO3", "K2CO3-SiO2", "KCl", "KCl-SiO2"],
+    ]
 
 
 def test_build_structured_exports_does_not_merge_distinct_adjacent_tables(tmp_path: Path):

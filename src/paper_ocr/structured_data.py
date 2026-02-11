@@ -597,14 +597,47 @@ def _expand_header_row_for_target_cols(header_row: list[str], target_cols: int) 
     return row
 
 
-def _coerce_rows_from_header_only_table(table: dict[str, Any]) -> list[list[str]]:
+def _row_split_expansion_width(row: list[str]) -> int:
+    width = 0
+    for cell in row:
+        parts = [part.strip() for part in str(cell or "").splitlines() if part.strip()]
+        width += len(parts) if len(parts) >= 2 else 1
+    return max(width, len(row))
+
+
+def _normalize_header_row_for_target_cols(header_row: list[str], target_cols: int) -> list[str]:
+    row = _expand_header_row_for_target_cols(header_row, target_cols)
+    if len(row) < target_cols:
+        row = row + [""] * (target_cols - len(row))
+    return [str(cell or "") for cell in row]
+
+
+def _normalize_data_row_for_target_cols(data_row: list[str], target_cols: int) -> list[str]:
+    row = [str(cell or "") for cell in data_row]
+    if len(row) < target_cols:
+        row = row + [""] * (target_cols - len(row))
+    return row
+
+
+def _row_signature(row: list[str]) -> tuple[str, ...]:
+    return tuple(_normalize_cell_text(cell) for cell in row)
+
+
+def _coerce_rows_from_header_only_table(table: dict[str, Any], *, first_header_row: list[str] | None = None) -> list[list[str]]:
     rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
     if rows:
         return rows
     header_rows = [list(r) for r in table.get("header_rows", []) if isinstance(r, list)]
-    if len(header_rows) >= 2:
+    if not header_rows:
+        return []
+    if not first_header_row:
+        return header_rows
+
+    first_sig = tuple(_normalize_cell_text(x) for x in first_header_row)
+    candidate = _normalize_header_row_for_target_cols(header_rows[0], len(first_sig))
+    if _row_signature(candidate) == first_sig:
         return header_rows[1:]
-    return []
+    return header_rows
 
 
 def _try_merge_cross_page_continuation(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any] | None:
@@ -630,30 +663,57 @@ def _try_merge_cross_page_continuation(first: dict[str, Any], second: dict[str, 
     if second_caption.strip() and second_caption.strip().lower().startswith("table "):
         return None
 
-    second_rows = _coerce_rows_from_header_only_table(second)
+    first_header_rows = [list(r) for r in first.get("header_rows", []) if isinstance(r, list)]
+    second_header_rows = [list(r) for r in second.get("header_rows", []) if isinstance(r, list)]
+    first_primary_header: list[str] | None = first_header_rows[0] if first_header_rows else None
+    second_rows = _coerce_rows_from_header_only_table(second, first_header_row=first_primary_header)
     if not _has_nonempty_cells(second_rows):
         return None
 
-    first_header_rows = [list(r) for r in first.get("header_rows", []) if isinstance(r, list)]
-    second_header_rows = [list(r) for r in second.get("header_rows", []) if isinstance(r, list)]
-    target_cols = max((len(r) for r in second_rows), default=0)
+    width_hints: list[int] = []
+    for row in second_rows:
+        width_hints.append(len(row))
+    for row in second_header_rows:
+        width_hints.append(len(row))
+    for row in first_header_rows:
+        width_hints.append(_row_split_expansion_width(row))
+
+    target_cols = max(width_hints, default=0)
     if target_cols <= 0:
         return None
 
-    merged_header_row: list[str]
+    merged_header_rows: list[list[str]] = []
+    seen_header_signatures: set[tuple[str, ...]] = set()
+
+    def _append_header_row(candidate: list[str]) -> None:
+        normalized = _normalize_header_row_for_target_cols(candidate, target_cols)
+        if not _has_nonempty_cells([normalized]):
+            return
+        sig = _row_signature(normalized)
+        if sig in seen_header_signatures:
+            return
+        seen_header_signatures.add(sig)
+        merged_header_rows.append(normalized)
+
     if first_header_rows:
-        merged_header_row = _expand_header_row_for_target_cols(first_header_rows[0], target_cols)
+        for row in first_header_rows:
+            _append_header_row(row)
     elif second_header_rows:
-        merged_header_row = list(second_header_rows[0])
-    else:
+        _append_header_row(second_header_rows[0])
+
+    # Preserve non-empty secondary header rows from continuation fragments when
+    # page 2 already carries explicit data rows.
+    if second.get("data_rows") and second_header_rows:
+        for row in second_header_rows:
+            _append_header_row(row)
+    if not merged_header_rows:
         return None
 
-    if len(merged_header_row) != target_cols:
-        return None
+    merged_rows = [_normalize_data_row_for_target_cols(row, target_cols) for row in second_rows]
 
     merged = dict(first)
-    merged["header_rows"] = [merged_header_row]
-    merged["data_rows"] = second_rows
+    merged["header_rows"] = merged_header_rows
+    merged["data_rows"] = merged_rows
     merged["pages"] = sorted(set(first_pages + second_pages))
     merged["fragment_ids"] = list(dict.fromkeys([str(x) for x in first.get("fragment_ids", []) + second.get("fragment_ids", [])]))
     merged["merge_confidence"] = min(float(first.get("merge_confidence", 1.0) or 1.0), 0.85)
@@ -1608,6 +1668,7 @@ def build_structured_exports(
         excluded_low_quality = 0
         for table in canonical_tables:
             header = table.get("header_rows", [])
+            raw_header_rows = [list(r) for r in header if isinstance(r, list)] if isinstance(header, list) else []
             headers = _collapse_header_rows(header) if isinstance(header, list) else []
             headers = [_normalize_cell_text(x) for x in headers]
             rows = [
@@ -1805,7 +1866,19 @@ def build_structured_exports(
                             )
                         )
                         continue
+            header_rows_full: list[list[str]] = []
+            target_cols = max(len(headers), max((len(r) for r in raw_header_rows), default=0))
+            for raw in raw_header_rows:
+                normalized = [_normalize_cell_text(x) for x in _normalize_header_row_for_target_cols(raw, target_cols)]
+                if not _has_nonempty_cells([normalized]):
+                    continue
+                header_rows_full.append(normalized)
+            if not header_rows_full and headers:
+                header_rows_full = [list(headers)]
+
             table["header_rows"] = [list(headers)]
+            table["header_rows_full"] = header_rows_full
+            table["header_hierarchy"] = [{"level": idx + 1, "cells": row} for idx, row in enumerate(header_rows_full)]
             table["data_rows"] = [list(r) for r in rows]
             table["quality_metrics"] = metrics
             canonical_rows.append(table)
