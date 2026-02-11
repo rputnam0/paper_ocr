@@ -462,7 +462,8 @@ def _crossref_head_exists(doi: str, config: DoiResolutionConfig, state: _Resolve
 
 def _crossref_work(doi: str, config: DoiResolutionConfig, state: _ResolverState) -> dict[str, Any]:
     path = f"/works/{quote(doi, safe='')}"
-    url = _crossref_url(path, {"select": WORK_SELECT_FIELDS}, config.crossref_mailto)
+    # Crossref singleton work route does not support select parameter.
+    url = _crossref_url(path, {}, config.crossref_mailto)
     result = _http_request(
         method="GET",
         url=url,

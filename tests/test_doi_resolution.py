@@ -46,7 +46,8 @@ def test_resolve_dois_autodetects_lowercase_columns_and_canonicalizes(tmp_path: 
             )
         if method == "HEAD" and "/works/" in url:
             return _Resp(200, body="")
-        if "select=DOI" in url:
+        if method == "GET" and "/works/" in url and "/agency" not in url:
+            assert "select=" not in url
             return _Resp(
                 200,
                 body=json.dumps(
@@ -79,6 +80,42 @@ def test_resolve_dois_autodetects_lowercase_columns_and_canonicalizes(tmp_path: 
     assert rows[0]["doi_canonical"] == "10.1208/pt0802032"
     fetch_rows = _read_csv(Path(summary["fetch_ready_csv"]))
     assert fetch_rows == [{"DOI": "10.1208/pt0802032"}]
+
+
+def test_crossref_singleton_work_request_excludes_select_param(tmp_path: Path):
+    in_csv = tmp_path / "in.csv"
+    in_csv.write_text("doi\n10.1208/pt0802032\n")
+    out_dir = tmp_path / "reports" / "doi_resolution"
+    seen_urls: list[tuple[str, str]] = []
+
+    def _fake_urlopen(req, timeout):  # noqa: ANN001,ARG001
+        url = req.full_url
+        method = req.get_method()
+        seen_urls.append((method, url))
+        if "/agency" in url:
+            return _Resp(
+                200,
+                body=json.dumps(
+                    {"status": "ok", "message": {"DOI": "10.1208/PT0802032", "agency": {"id": "crossref"}}}
+                ),
+            )
+        if method == "HEAD" and "/works/" in url:
+            return _Resp(200, body="")
+        if method == "GET" and "/works/" in url and "/agency" not in url:
+            return _Resp(200, body=json.dumps({"status": "ok", "message": {"DOI": "10.1208/PT0802032"}}))
+        raise AssertionError(f"unexpected url {method} {url}")
+
+    doi_resolution.resolve_dois(
+        doi_resolution.DoiResolutionConfig(
+            input_csv=in_csv,
+            output_dir=out_dir,
+            urlopen=_fake_urlopen,
+        )
+    )
+
+    singleton_gets = [url for method, url in seen_urls if method == "GET" and "/works/" in url and "/agency" not in url]
+    assert singleton_gets
+    assert all("select=" not in url for url in singleton_gets)
 
 
 def test_resolve_dois_non_crossref_uses_doi_resolver_fallback(tmp_path: Path):
@@ -168,7 +205,8 @@ def test_resolve_dois_search_scoring_accepts_clear_winner(tmp_path: Path):
             )
         if method == "HEAD" and "/works/" in url:
             return _Resp(200, body="")
-        if "select=DOI" in url:
+        if method == "GET" and "/works/" in url and "/agency" not in url:
+            assert "select=" not in url
             return _Resp(
                 200,
                 body=json.dumps(
@@ -287,7 +325,8 @@ def test_resolve_dois_cache_hit_avoids_network(tmp_path: Path):
             )
         if method == "HEAD":
             return _Resp(200, body="")
-        if "select=DOI" in url:
+        if method == "GET" and "/works/" in url and "/agency" not in url:
+            assert "select=" not in url
             return _Resp(
                 200,
                 body=json.dumps({"status": "ok", "message": {"DOI": "10.1208/PT0802032"}}),
@@ -333,7 +372,8 @@ def test_resolve_dois_row_count_matches_input_and_summary(tmp_path: Path):
             )
         if method == "HEAD":
             return _Resp(200, body="")
-        if "select=DOI" in url:
+        if method == "GET" and "/works/" in url and "/agency" not in url:
+            assert "select=" not in url
             return _Resp(200, body=json.dumps({"status": "ok", "message": {"DOI": "10.1000/ABC"}}))
         raise AssertionError(f"unexpected {method} {url}")
 
