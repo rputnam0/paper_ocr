@@ -128,7 +128,7 @@ def evaluate_table_pipeline(gold_dir: Path, pred_dir: Path) -> dict[str, Any]:
     row_count_match_rate = row_count_matches / max(pair_count, 1)
     column_count_match_rate = col_count_matches / max(pair_count, 1)
     key_cell_accuracy = key_cell_match / max(key_cell_total, 1)
-    numeric_parse_success = numeric_match / max(numeric_total, 1)
+    numeric_parse_success = 1.0 if numeric_total == 0 else (numeric_match / numeric_total)
 
     return {
         "gold_table_count": len(gold_rows),
@@ -141,4 +141,5 @@ def evaluate_table_pipeline(gold_dir: Path, pred_dir: Path) -> dict[str, Any]:
         "column_count_match_rate": column_count_match_rate,
         "key_cell_accuracy": key_cell_accuracy,
         "numeric_parse_success": numeric_parse_success,
+        "numeric_cell_count": numeric_total,
     }

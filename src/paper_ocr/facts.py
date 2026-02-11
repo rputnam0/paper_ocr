@@ -83,14 +83,17 @@ def _table_records(doc_id: str, table_rows: list[dict[str, Any]]) -> list[dict[s
     for table in table_rows:
         table_id = str(table.get("table_id", ""))
         page = int(table.get("page", 0) or 0)
-        headers = [str(h) for h in table.get("headers", []) if isinstance(h, str) or isinstance(h, (int, float))]
+        raw_headers = table.get("headers", [])
+        headers = raw_headers if isinstance(raw_headers, list) else []
         rows = [list(r) for r in table.get("rows", []) if isinstance(r, list)]
         if len(headers) < 2:
             continue
         for row_idx, row in enumerate(rows):
             material = str(row[0]).strip() if len(row) > 0 else ""
             for col_idx in range(1, min(len(headers), len(row))):
-                prop = str(headers[col_idx]).strip()
+                prop = str(headers[col_idx] if headers[col_idx] is not None else "").strip()
+                if not prop:
+                    continue
                 value_raw = str(row[col_idx]).strip()
                 unit = _extract_unit(prop)
                 value_num = _extract_numeric(value_raw)

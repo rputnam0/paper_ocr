@@ -75,3 +75,29 @@ def test_export_facts_updates_document_manifest(tmp_path: Path):
     assert facts["enabled"] is True
     assert facts["record_count"] >= 1
     assert facts["records_path"].endswith("property_records.jsonl")
+
+
+def test_export_facts_preserves_column_indices_with_non_string_headers(tmp_path: Path):
+    doc_dir = tmp_path / "group" / "doc_abc"
+    metadata = doc_dir / "metadata"
+    metadata.mkdir(parents=True, exist_ok=True)
+    (metadata / "manifest.json").write_text(json.dumps({"doc_id": "abc"}))
+    _write_jsonl(
+        metadata / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl",
+        [
+            {
+                "table_id": "p0001_t01",
+                "page": 1,
+                "caption": "Table 1",
+                "headers": ["Material", None, "Value"],
+                "rows": [["A", "skip", "10"]],
+                "csv_path": "metadata/assets/structured/extracted/tables/p0001_t01.csv",
+            }
+        ],
+    )
+    export_facts_for_doc(doc_dir)
+    records_path = doc_dir / "metadata" / "assets" / "structured" / "facts" / "property_records.jsonl"
+    records = [json.loads(line) for line in records_path.read_text().splitlines() if line.strip()]
+    value_records = [r for r in records if r.get("property_name_raw") == "Value"]
+    assert value_records
+    assert value_records[0]["source"]["col_index"] == 2

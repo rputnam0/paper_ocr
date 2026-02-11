@@ -330,6 +330,39 @@ def test_run_eval_table_pipeline_strict_regression_raises(tmp_path: Path):
         cli._run_eval_table_pipeline(args)
 
 
+def test_run_eval_table_pipeline_no_numeric_cells_does_not_fail_numeric_gate(tmp_path: Path):
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "table_detection_precision": 1.0,
+                "table_detection_recall": 1.0,
+                "numeric_parse_success": 0.95,
+            }
+        )
+    )
+    args = argparse.Namespace(
+        gold_dir=tmp_path / "gold",
+        pred_dir=tmp_path / "pred",
+        baseline=baseline,
+        strict_regression=True,
+        max_precision_drop=0.03,
+        max_recall_drop=0.03,
+        min_numeric_parse=0.8,
+    )
+    args.gold_dir.mkdir(parents=True, exist_ok=True)
+    args.pred_dir.mkdir(parents=True, exist_ok=True)
+    (args.gold_dir / "tables.jsonl").write_text(
+        json.dumps({"table_id": "t1", "page": 1, "headers": ["name"], "rows": [["A"]]}) + "\n"
+    )
+    (args.pred_dir / "tables.jsonl").write_text(
+        json.dumps({"table_id": "t1", "page": 1, "headers": ["name"], "rows": [["A"]]}) + "\n"
+    )
+    out = cli._run_eval_table_pipeline(args)
+    assert out["numeric_cell_count"] == 0
+    assert out["regression"]["violations"] == []
+
+
 def test_run_data_audit_strict_raises(tmp_path: Path):
     data_dir = tmp_path / "data"
     (data_dir / "unexpected").mkdir(parents=True)
@@ -407,6 +440,51 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
     assert seen_kwargs["table_artifact_mode"] == "permissive"
     assert seen_kwargs["ocr_html_dir"] is None
     assert seen_kwargs["grobid_status"] == "unknown"
+    assert payload["processing_status"]["status"] == "ok"
+    assert payload["processing_status"]["strict_failure"] is False
+
+
+def test_run_export_structured_data_non_strict_errors_do_not_mark_failed(monkeypatch, tmp_path: Path):
+    root = tmp_path / "out"
+    doc_dir = root / "group" / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    (doc_dir / "metadata").mkdir(parents=True)
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    manifest_path.write_text(json.dumps({"doc_id": "abc"}))
+
+    def _fake_build(**kwargs):  # noqa: ANN001
+        return StructuredExportSummary(
+            table_count=1,
+            figure_count=0,
+            deplot_count=0,
+            unresolved_figure_count=0,
+            errors=["p0001_t01: quality gate failed"],
+        )
+
+    monkeypatch.setattr(cli, "build_structured_exports", _fake_build)
+
+    args = argparse.Namespace(
+        ocr_out_dir=root,
+        deplot_command="",
+        deplot_timeout=30,
+        table_source="marker-first",
+        table_ocr_merge=True,
+        table_ocr_merge_scope="header",
+        table_header_ocr_auto=False,
+        table_header_ocr_model="m",
+        table_header_ocr_max_tokens=500,
+        table_artifact_mode="permissive",
+        ocr_html_dir=None,
+        table_quality_gate=True,
+        table_escalation="auto",
+        table_escalation_max=20,
+        table_qa_mode="warn",
+        compare_ocr_html=False,
+    )
+    cli._run_export_structured_data(args)
+    payload = json.loads(manifest_path.read_text())
+    assert payload["processing_status"]["status"] == "ok"
+    assert payload["processing_status"]["strict_failure"] is False
 
 
 def test_run_export_structured_data_passes_grobid_ok_when_manifest_records_usage(monkeypatch, tmp_path: Path):

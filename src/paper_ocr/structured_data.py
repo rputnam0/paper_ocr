@@ -802,6 +802,7 @@ def _patch_table_grid(
     ocr_rows: list[list[str]],
     *,
     merge_scope: str,
+    row_fill_similarity_threshold: float = 0.90,
 ) -> tuple[list[str], list[list[str]], int, dict[str, int]]:
     headers = list(marker_headers)
     rows = [list(row) for row in marker_rows]
@@ -822,7 +823,7 @@ def _patch_table_grid(
             marker_row_sig = _alnum_signature(" ".join(str(cell) for cell in rows[row_idx]))
             ocr_row_sig = _alnum_signature(" ".join(str(cell) for cell in ocr_rows[row_idx]))
             row_similarity = SequenceMatcher(None, marker_row_sig, ocr_row_sig).ratio() if (marker_row_sig or ocr_row_sig) else 1.0
-            allow_empty_fill = row_similarity >= 0.50
+            allow_empty_fill = row_similarity >= row_fill_similarity_threshold
             max_cols = min(len(rows[row_idx]), len(ocr_rows[row_idx]))
             for col_idx in range(max_cols):
                 merged, reason = _cell_patch_decision(
@@ -1462,6 +1463,7 @@ def build_structured_exports(
                                 ocr_headers=[str(x) for x in ocr_table.get("headers", [])],
                                 ocr_rows=[[str(x) for x in row] for row in ocr_table.get("rows", []) if isinstance(row, list)],
                                 merge_scope="full",
+                                row_fill_similarity_threshold=0.50,
                             )
                             esc_metrics = _quality_metrics(esc_headers, esc_rows)
                             if _escalation_improves_quality(metrics, esc_metrics):
@@ -1481,10 +1483,11 @@ def build_structured_exports(
                                     )
                                 )
                             else:
+                                no_improve_severity = "warn" if quality_failed else "info"
                                 qa_flags.append(
                                     QAFlag(
                                         flag_id=_stable_id("qa", table_id, "escalation_no_improvement"),
-                                        severity="warn",
+                                        severity=no_improve_severity,
                                         type="escalation_no_improvement",
                                         page=int(page),
                                         table_ref=table_id or "*",

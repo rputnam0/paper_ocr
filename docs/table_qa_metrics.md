@@ -38,6 +38,7 @@ Core metrics:
 - `column_count_match_rate`
 - `key_cell_accuracy`
 - `numeric_parse_success`
+- `numeric_cell_count`
 
 Pipeline-level metrics (from manifests/flags):
 
@@ -72,5 +73,6 @@ Policy in CI:
 - fail when precision or recall drops by more than `0.03` from baseline
 - fail when QA disagreement rate increases by more than `0.05` without approved baseline update
 - fail when numeric parse success drops below project threshold
+- numeric parse threshold applies only when `numeric_cell_count > 0`
 
 Track baseline metrics per pipeline version in source control.

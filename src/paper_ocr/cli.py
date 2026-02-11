@@ -1690,10 +1690,11 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
             if "Strict table artifact mode failed" in str(exc):
                 failed_docs += 1
         manifest["structured_data_extraction"] = structured_data_manifest
+        strict_failure = any("Strict table artifact mode failed" in str(e) for e in structured_data_manifest.get("errors", []))
         manifest["processing_status"] = {
-            "status": "failed" if structured_data_manifest.get("errors") else "ok",
+            "status": "failed" if strict_failure else "ok",
             "errors": list(structured_data_manifest.get("errors", [])),
-            "strict_failure": any("Strict table artifact mode failed" in str(e) for e in structured_data_manifest.get("errors", [])),
+            "strict_failure": strict_failure,
         }
         write_json(manifest_path, manifest)
 
@@ -1756,6 +1757,7 @@ def _run_eval_table_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         precision_drop = float(baseline.get("table_detection_precision", 0.0)) - float(metrics.get("table_detection_precision", 0.0))
         recall_drop = float(baseline.get("table_detection_recall", 0.0)) - float(metrics.get("table_detection_recall", 0.0))
         numeric_parse_success = float(metrics.get("numeric_parse_success", 0.0))
+        numeric_cell_count = int(metrics.get("numeric_cell_count", 0) or 0)
         max_precision_drop = float(getattr(args, "max_precision_drop", 0.03))
         max_recall_drop = float(getattr(args, "max_recall_drop", 0.03))
         min_numeric_parse = float(getattr(args, "min_numeric_parse", 0.8))
@@ -1764,6 +1766,7 @@ def _run_eval_table_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "precision_drop": precision_drop,
             "recall_drop": recall_drop,
             "numeric_parse_success": numeric_parse_success,
+            "numeric_cell_count": numeric_cell_count,
             "max_precision_drop": max_precision_drop,
             "max_recall_drop": max_recall_drop,
             "min_numeric_parse": min_numeric_parse,
@@ -1773,7 +1776,7 @@ def _run_eval_table_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             regression["violations"].append(f"precision_drop={precision_drop:.4f} > {max_precision_drop:.4f}")
         if recall_drop > max_recall_drop:
             regression["violations"].append(f"recall_drop={recall_drop:.4f} > {max_recall_drop:.4f}")
-        if numeric_parse_success < min_numeric_parse:
+        if numeric_cell_count > 0 and numeric_parse_success < min_numeric_parse:
             regression["violations"].append(f"numeric_parse_success={numeric_parse_success:.4f} < {min_numeric_parse:.4f}")
         metrics["regression"] = regression
         if strict_regression and regression["violations"]:
