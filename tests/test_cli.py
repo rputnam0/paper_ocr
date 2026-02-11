@@ -10,6 +10,7 @@ from paper_ocr import cli
 from paper_ocr.inspect import TextHeuristics
 from paper_ocr.structured_data import StructuredExportSummary
 from paper_ocr.structured_extract import StructuredPageResult
+from paper_ocr.table_rectifier import RectifierResult
 
 
 class _FakeDoc:
@@ -267,6 +268,12 @@ def test_parse_run_table_pipeline_defaults(monkeypatch):
     assert args.table_source == "marker-first"
     assert args.table_ocr_merge is True
     assert args.table_ocr_merge_scope == "header"
+    assert args.table_llm_rectify is True
+    assert args.table_llm_model == "openai/gpt-oss-120b"
+    assert args.table_llm_max_tokens == 2000
+    assert args.table_llm_risk_threshold == 0.45
+    assert args.table_llm_max_tables_per_doc == 12
+    assert args.table_llm_target == "risk"
     assert args.table_header_ocr_auto is True
     assert args.table_artifact_mode == "permissive"
     assert args.table_quality_gate is True
@@ -345,6 +352,17 @@ def test_parse_export_table_pipeline_options(monkeypatch):
             "--no-table-ocr-merge",
             "--table-ocr-merge-scope",
             "full",
+            "--no-table-llm-rectify",
+            "--table-llm-model",
+            "openai/gpt-oss-20b",
+            "--table-llm-max-tokens",
+            "1500",
+            "--table-llm-risk-threshold",
+            "0.7",
+            "--table-llm-max-tables-per-doc",
+            "4",
+            "--table-llm-target",
+            "nonaccept",
             "--no-table-header-ocr-auto",
             "--table-artifact-mode",
             "strict",
@@ -357,6 +375,12 @@ def test_parse_export_table_pipeline_options(monkeypatch):
     assert args.table_escalation_max == 3
     assert args.table_ocr_merge is False
     assert args.table_ocr_merge_scope == "full"
+    assert args.table_llm_rectify is False
+    assert args.table_llm_model == "openai/gpt-oss-20b"
+    assert args.table_llm_max_tokens == 1500
+    assert args.table_llm_risk_threshold == 0.7
+    assert args.table_llm_max_tables_per_doc == 4
+    assert args.table_llm_target == "nonaccept"
     assert args.table_header_ocr_auto is False
     assert args.table_artifact_mode == "strict"
     assert args.compare_ocr_html is False
@@ -682,6 +706,27 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
             "report_path": "metadata/assets/structured/qa/table_ocr_html_compare.json",
         },
     )
+    rectifier_calls: list[dict[str, object]] = []
+
+    async def _fake_rectify(**kwargs):  # noqa: ANN001
+        rectifier_calls.append(kwargs)
+        return RectifierResult(
+            enabled=True,
+            model="openai/gpt-oss-120b",
+            target="risk",
+            considered=2,
+            selected=1,
+            applied=1,
+            skipped_low_risk=1,
+            fallbacked=0,
+            invalid_schema=0,
+            evidence_violations=0,
+            errors=0,
+            report_path="metadata/assets/structured/qa/table_llm_rectification.json",
+            table_results=[],
+        )
+
+    monkeypatch.setattr(cli, "run_table_rectification_for_doc", _fake_rectify)
 
     args = argparse.Namespace(
         ocr_out_dir=root,
@@ -690,6 +735,12 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
         table_source="marker-first",
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=True,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,
@@ -712,6 +763,8 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
     assert seen_kwargs["table_artifact_mode"] == "permissive"
     assert seen_kwargs["ocr_html_dir"] is None
     assert seen_kwargs["grobid_status"] == "unknown"
+    assert payload["structured_data_extraction"]["table_llm_rectification"]["applied"] == 1
+    assert rectifier_calls
     assert payload["processing_status"]["status"] == "ok"
     assert payload["processing_status"]["strict_failure"] is False
 
@@ -742,6 +795,12 @@ def test_run_export_structured_data_non_strict_errors_do_not_mark_failed(monkeyp
         table_source="marker-first",
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=False,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,
@@ -781,6 +840,12 @@ def test_run_export_structured_data_passes_grobid_ok_when_manifest_records_usage
         table_source="marker-first",
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=False,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,
@@ -802,6 +867,12 @@ def test_run_export_structured_data_requires_docs(tmp_path: Path):
         deplot_timeout=90,
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=False,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,
@@ -1413,6 +1484,12 @@ def test_run_export_structured_data_raises_when_strict_doc_fails(monkeypatch, tm
         table_source="marker-first",
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=False,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,

@@ -56,6 +56,7 @@ from .structured_extract import (
     run_marker_page,
 )
 from .table_eval import evaluate_table_pipeline
+from .table_rectifier import RectifierConfig, RectifierResult, run_table_rectification_for_doc
 from .table_validation import GeminiValidationConfig, run_gemini_table_validation, summarize_gemini_failures
 from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
@@ -75,6 +76,11 @@ GROBID_TIMEOUT_DEFAULT = "60"
 DEPLOT_TIMEOUT_DEFAULT = "90"
 TABLE_HEADER_OCR_MODEL_DEFAULT = "allenai/olmOCR-2-7B-1025"
 TABLE_HEADER_OCR_MAX_TOKENS_DEFAULT = 1400
+TABLE_LLM_RECTIFIER_MODEL_DEFAULT = "openai/gpt-oss-120b"
+TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT = 2000
+TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT = 0.45
+TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT = 12
+TABLE_LLM_RECTIFIER_TARGET_DEFAULT = "risk"
 DEFAULT_FETCH_OUTPUT_ROOT = Path("data/jobs")
 LEGACY_FETCH_OUTPUT_ROOT = Path("data/telegram_jobs")
 RESOURCE_GUARD_MIN_MEM_GB_DEFAULT = 24.0
@@ -196,6 +202,42 @@ def _parse_args() -> argparse.Namespace:
         choices=["header", "full"],
         default="header",
         help="Merge OCR data into table headers only (default) or full table grid.",
+    )
+    run.add_argument(
+        "--table-llm-rectify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run risk-gated LLM table rectification after deterministic extraction (default: enabled).",
+    )
+    run.add_argument(
+        "--table-llm-model",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_LLM_MODEL", TABLE_LLM_RECTIFIER_MODEL_DEFAULT),
+    )
+    run.add_argument(
+        "--table-llm-max-tokens",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_LLM_MAX_TOKENS", str(TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT))),
+    )
+    run.add_argument(
+        "--table-llm-risk-threshold",
+        type=float,
+        default=float(os.getenv("PAPER_OCR_TABLE_LLM_RISK_THRESHOLD", str(TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT))),
+    )
+    run.add_argument(
+        "--table-llm-max-tables-per-doc",
+        type=int,
+        default=int(
+            os.getenv(
+                "PAPER_OCR_TABLE_LLM_MAX_TABLES_PER_DOC",
+                str(TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT),
+            )
+        ),
+    )
+    run.add_argument(
+        "--table-llm-target",
+        choices=["risk", "all", "nonaccept"],
+        default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
     )
     run.add_argument(
         "--table-header-ocr-auto",
@@ -361,6 +403,42 @@ def _parse_args() -> argparse.Namespace:
         choices=["header", "full"],
         default="header",
         help="Merge OCR data into table headers only (default) or full table grid.",
+    )
+    export.add_argument(
+        "--table-llm-rectify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run risk-gated LLM table rectification after deterministic extraction (default: enabled).",
+    )
+    export.add_argument(
+        "--table-llm-model",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_LLM_MODEL", TABLE_LLM_RECTIFIER_MODEL_DEFAULT),
+    )
+    export.add_argument(
+        "--table-llm-max-tokens",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_LLM_MAX_TOKENS", str(TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT))),
+    )
+    export.add_argument(
+        "--table-llm-risk-threshold",
+        type=float,
+        default=float(os.getenv("PAPER_OCR_TABLE_LLM_RISK_THRESHOLD", str(TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT))),
+    )
+    export.add_argument(
+        "--table-llm-max-tables-per-doc",
+        type=int,
+        default=int(
+            os.getenv(
+                "PAPER_OCR_TABLE_LLM_MAX_TABLES_PER_DOC",
+                str(TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT),
+            )
+        ),
+    )
+    export.add_argument(
+        "--table-llm-target",
+        choices=["risk", "all", "nonaccept"],
+        default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
     )
     export.add_argument(
         "--table-header-ocr-auto",
@@ -641,6 +719,20 @@ def _load_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
         if isinstance(parsed, dict):
             rows.append(parsed)
     return rows
+
+
+def _disabled_table_rectifier_summary(
+    *,
+    model: str,
+    target: str,
+) -> dict[str, Any]:
+    return asdict(
+        RectifierResult(
+            enabled=False,
+            model=model,
+            target=target,
+        )
+    )
 
 
 async def _ensure_header_ocr_artifacts(
@@ -1612,6 +1704,10 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "header_ocr": {},
             "ocr_merge": {},
             "ocr_html_comparison": {},
+            "table_llm_rectification": _disabled_table_rectifier_summary(
+                model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+            ),
         }
         strict_failure = False
         doc_errors: list[str] = []
@@ -1657,6 +1753,23 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                         ocr_html_dir=ocr_html_dir,
                     )
                     structured_data_manifest["ocr_html_comparison"] = compare_summary
+                if bool(getattr(args, "table_llm_rectify", True)):
+                    rectifier_result = await run_table_rectification_for_doc(
+                        doc_dir=doc_dir,
+                        client=client,
+                        config=RectifierConfig(
+                            model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                            max_tokens=int(getattr(args, "table_llm_max_tokens", TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT)),
+                            risk_threshold=float(
+                                getattr(args, "table_llm_risk_threshold", TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT)
+                            ),
+                            max_tables_per_doc=int(
+                                getattr(args, "table_llm_max_tables_per_doc", TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT)
+                            ),
+                            target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                        ),
+                    )
+                    structured_data_manifest["table_llm_rectification"] = asdict(rectifier_result)
             except Exception as exc:  # noqa: BLE001
                 structured_data_manifest["errors"] = [str(exc)]
                 structured_data_manifest["ocr_merge"] = {}
@@ -1957,6 +2070,48 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 table_qa_mode=str(getattr(args, "table_qa_mode", "warn")),
                 grobid_status=grobid_status,
             )
+            table_llm_rectification = _disabled_table_rectifier_summary(
+                model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+            )
+            if bool(getattr(args, "table_llm_rectify", True)):
+                api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
+                if api_key:
+                    base_url = str(manifest.get("base_url", "") or "https://api.deepinfra.com/v1/openai")
+                    llm_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+                    llm_result = asyncio.run(
+                        run_table_rectification_for_doc(
+                            doc_dir=doc_dir,
+                            client=llm_client,
+                            config=RectifierConfig(
+                                model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                                max_tokens=int(
+                                    getattr(args, "table_llm_max_tokens", TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT)
+                                ),
+                                risk_threshold=float(
+                                    getattr(args, "table_llm_risk_threshold", TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT)
+                                ),
+                                max_tables_per_doc=int(
+                                    getattr(
+                                        args,
+                                        "table_llm_max_tables_per_doc",
+                                        TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT,
+                                    )
+                                ),
+                                target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                            ),
+                        )
+                    )
+                    table_llm_rectification = asdict(llm_result)
+                else:
+                    table_llm_rectification = asdict(
+                        RectifierResult(
+                            enabled=True,
+                            model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                            target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                            errors=1,
+                        )
+                    )
             structured_data_manifest: dict[str, Any] = {
                 "enabled": True,
                 "table_count": summary.table_count,
@@ -1967,6 +2122,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "header_ocr": header_ocr_summary,
                 "ocr_merge": summary.ocr_merge,
                 "ocr_html_comparison": {},
+                "table_llm_rectification": table_llm_rectification,
             }
             if bool(getattr(args, "compare_ocr_html", False)):
                 compare_summary = compare_marker_tables_with_ocr_html(
@@ -1985,6 +2141,10 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "header_ocr": {},
                 "ocr_merge": {},
                 "ocr_html_comparison": {},
+                "table_llm_rectification": _disabled_table_rectifier_summary(
+                    model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                    target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                ),
             }
             if "Strict table artifact mode failed" in str(exc):
                 failed_docs += 1

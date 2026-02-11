@@ -1,0 +1,877 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from openai import AsyncOpenAI
+
+from .client import call_text_model
+
+SYMBOL_CHAR_RE = re.compile(r"[^\x00-\x7F]|[±≤≥≈×÷°µμδΔητσγβαΩω]")
+UNIT_TOKEN_RE = re.compile(r"(?:\bpa\b|\bwt\b|mol|g|kg|mg|ml|dl|l|%|°c|°k|ppm|\bm\b|\bs\b)", flags=re.IGNORECASE)
+TOKEN_RE = re.compile(r"[a-z0-9]+")
+PROVENANCE_SOURCES = {"marker", "ocr", "context"}
+
+
+@dataclass
+class RectifierConfig:
+    model: str = "openai/gpt-oss-120b"
+    max_tokens: int = 2000
+    risk_threshold: float = 0.45
+    max_tables_per_doc: int = 12
+    target: str = "risk"
+
+
+@dataclass
+class RectifierResult:
+    enabled: bool
+    model: str
+    target: str
+    considered: int = 0
+    selected: int = 0
+    applied: int = 0
+    skipped_low_risk: int = 0
+    fallbacked: int = 0
+    invalid_schema: int = 0
+    evidence_violations: int = 0
+    errors: int = 0
+    report_path: str = ""
+    table_results: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    for line in path.read_text().splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("")
+        return
+    path.write_text("\n".join(json.dumps(row, ensure_ascii=True) for row in rows) + "\n")
+
+
+def _portable_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except Exception:
+        return str(path)
+
+
+def _normalize_cell_text(value: Any) -> str:
+    return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+
+
+def _collapse_header_rows(header_rows: list[list[str]]) -> list[str]:
+    if not header_rows:
+        return []
+    max_cols = max((len(row) for row in header_rows), default=0)
+    if max_cols <= 0:
+        return []
+    normalized = [list(row) + [""] * (max_cols - len(row)) for row in header_rows]
+    out: list[str] = []
+    for col in range(max_cols):
+        tokens: list[str] = []
+        for row in normalized:
+            token = _normalize_cell_text(row[col])
+            if not token:
+                continue
+            if not tokens or tokens[-1] != token:
+                tokens.append(token)
+        if not tokens:
+            out.append("")
+        elif len(tokens) == 1:
+            out.append(tokens[0])
+        else:
+            out.append(f"{tokens[0]} ({' / '.join(tokens[1:])})")
+    return out
+
+
+def _extract_symbols(text: str) -> str:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for ch in SYMBOL_CHAR_RE.findall(str(text or "")):
+        if ch in seen:
+            continue
+        seen.add(ch)
+        ordered.append(ch)
+    return "".join(ordered)
+
+
+def _quality_metrics(headers: list[str], rows: list[list[str]]) -> dict[str, Any]:
+    total_cells = max(len(headers), 1) * max(len(rows), 1)
+    flattened = [cell for row in rows for cell in row]
+    empty_cells = sum(1 for cell in flattened if not str(cell).strip())
+    repeated = 0
+    if flattened:
+        repeated = max((flattened.count(v) for v in set(flattened)))
+    row_lengths = [len(row) for row in rows] if rows else [len(headers)]
+    unstable = sum(1 for n in row_lengths if n != len(headers))
+    return {
+        "empty_cell_ratio": empty_cells / max(total_cells, 1),
+        "repeated_text_ratio": repeated / max(len(flattened), 1),
+        "column_instability_ratio": unstable / max(len(row_lengths), 1),
+    }
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        parsed = json.loads(raw[start : end + 1])
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _make_flag_id(table_id: str, flag_type: str, details: str) -> str:
+    src = f"llm_rectifier|{table_id}|{flag_type}|{details}"
+    return hashlib.sha1(src.encode("utf-8")).hexdigest()[:16]
+
+
+def _append_flag(
+    *,
+    qa_rows: list[dict[str, Any]],
+    existing_flag_ids: set[str],
+    table_id: str,
+    page: int,
+    flag_type: str,
+    severity: str,
+    details: str,
+) -> None:
+    flag_id = _make_flag_id(table_id, flag_type, details)
+    if flag_id in existing_flag_ids:
+        return
+    qa_rows.append(
+        {
+            "flag_id": flag_id,
+            "severity": severity,
+            "type": flag_type,
+            "page": int(page),
+            "table_ref": table_id or "*",
+            "details": details,
+        }
+    )
+    existing_flag_ids.add(flag_id)
+
+
+def _compute_risk_score(table_payload: dict[str, Any], qa_rows: list[dict[str, Any]]) -> float:
+    metrics = table_payload.get("quality_metrics", {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+    quality_component = max(
+        float(metrics.get("empty_cell_ratio", 0.0) or 0.0),
+        float(metrics.get("repeated_text_ratio", 0.0) or 0.0),
+        float(metrics.get("column_instability_ratio", 0.0) or 0.0),
+    )
+    required_missing = table_payload.get("required_fields_missing", [])
+    missing_component = min(float(len(required_missing if isinstance(required_missing, list) else [])) / 3.0, 1.0)
+    header_rows_full = table_payload.get("header_rows_full", [])
+    header_depth = len(header_rows_full if isinstance(header_rows_full, list) else [])
+    if header_depth >= 3:
+        header_complexity = 1.0
+    elif header_depth == 2:
+        header_complexity = 0.6
+    else:
+        header_complexity = 0.0
+
+    table_id = str(table_payload.get("table_id", ""))
+    table_flags = [
+        row
+        for row in qa_rows
+        if str(row.get("table_ref", "")) == table_id and str(row.get("severity", "")).lower() in {"warn", "error"}
+    ]
+    disagreement_component = min(float(len(table_flags)) / 3.0, 1.0)
+    risk = (0.45 * quality_component) + (0.20 * missing_component) + (0.15 * header_complexity) + (0.20 * disagreement_component)
+    return round(max(0.0, min(1.0, risk)), 4)
+
+
+def _collect_nonaccept_table_ids(validation_path: Path) -> set[str]:
+    out: set[str] = set()
+    for row in _load_jsonl(validation_path):
+        table_id = str(row.get("table_id", "")).strip()
+        review = row.get("model_review", {})
+        if not isinstance(review, dict):
+            continue
+        action = str(review.get("recommended_action", "")).strip().lower()
+        if table_id and action in {"review", "reject"}:
+            out.add(table_id)
+    return out
+
+
+def _read_ocr_evidence(doc_dir: Path, table_payload: dict[str, Any], page: int) -> str:
+    ocr_merge = table_payload.get("ocr_merge", {})
+    if isinstance(ocr_merge, dict):
+        rel_path = str(ocr_merge.get("ocr_html_path", "")).strip()
+        if rel_path:
+            candidate = doc_dir / rel_path
+            if candidate.exists():
+                return candidate.read_text()
+    qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    if qa_root.exists():
+        for path in sorted(qa_root.glob(f"table_*_page_{int(page):04d}.md")):
+            try:
+                return path.read_text()
+            except Exception:
+                continue
+    return ""
+
+
+def _collect_evidence_bundle(doc_dir: Path, table_payload: dict[str, Any], page: int) -> dict[str, str]:
+    snippets: list[str] = []
+    pages_dir = doc_dir / "pages"
+    for candidate_page in (page - 1, page, page + 1):
+        if candidate_page <= 0:
+            continue
+        page_path = pages_dir / f"{int(candidate_page):04d}.md"
+        if page_path.exists():
+            snippets.append(page_path.read_text())
+    context_text = "\n\n".join(snippets)
+    headers = [str(x) for row in table_payload.get("header_rows_full", []) if isinstance(row, list) for x in row]
+    rows = [str(x) for row in table_payload.get("data_rows", []) if isinstance(row, list) for x in row]
+    marker_text = "\n".join(headers + rows + [str(table_payload.get("caption_text", ""))])
+    ocr_text = _read_ocr_evidence(doc_dir, table_payload, page)
+    return {
+        "context_text": context_text,
+        "marker_text": marker_text,
+        "ocr_text": ocr_text,
+        "combined_text": "\n".join([marker_text, ocr_text, context_text]),
+    }
+
+
+def _build_prompt(*, table_payload: dict[str, Any], manifest_row: dict[str, Any], risk_score: float, evidence: dict[str, str]) -> str:
+    request = {
+        "table_id": str(table_payload.get("table_id", manifest_row.get("table_id", ""))),
+        "page": int(manifest_row.get("page", 0) or 0),
+        "risk_score": risk_score,
+        "canonical_table": {
+            "caption": str(table_payload.get("caption_text", manifest_row.get("caption", ""))),
+            "header_rows_full": table_payload.get("header_rows_full", []),
+            "data_rows": table_payload.get("data_rows", []),
+            "row_lineage": table_payload.get("row_lineage", []),
+            "context_mappings": table_payload.get("context_mappings", []),
+            "required_fields_missing": table_payload.get("required_fields_missing", []),
+            "quality_metrics": table_payload.get("quality_metrics", {}),
+        },
+        "ocr_table_raw": evidence["ocr_text"][:12000],
+        "evidence": {
+            "marker_and_caption": evidence["marker_text"][:8000],
+            "nearby_pages_text": evidence["context_text"][:12000],
+        },
+    }
+    return (
+        "You are a table rectification model.\n"
+        "Return JSON only.\n"
+        "Rules:\n"
+        "- Evidence-bounded: do not invent values not supported by marker, OCR, or nearby context evidence.\n"
+        "- Preserve units/symbols and table semantics.\n"
+        "- Keep output rectangular.\n"
+        "- Every non-empty changed cell must include provenance.\n"
+        "Output schema keys (all required):\n"
+        "rectified_header_rows_full, rectified_rows, edits, cell_provenance, rectifier_confidence, needs_review.\n\n"
+        f"Input:\n{json.dumps(request, ensure_ascii=True)}"
+    )
+
+
+def _build_repair_prompt(raw_text: str) -> str:
+    return (
+        "Repair this malformed model output into one strict JSON object.\n"
+        "Output JSON only.\n"
+        "Required keys: rectified_header_rows_full, rectified_rows, edits, cell_provenance, rectifier_confidence, needs_review.\n\n"
+        f"Malformed output:\n{raw_text[:14000]}"
+    )
+
+
+def _normalize_rectified_payload(payload: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    header_rows_raw = payload.get("rectified_header_rows_full")
+    rows_raw = payload.get("rectified_rows")
+    edits_raw = payload.get("edits")
+    provenance_raw = payload.get("cell_provenance")
+    if not isinstance(header_rows_raw, list) or not isinstance(rows_raw, list):
+        return False, "invalid_schema:missing_grid", {}
+    if not isinstance(edits_raw, list):
+        return False, "invalid_schema:missing_edits", {}
+    if not isinstance(provenance_raw, (list, dict)):
+        return False, "invalid_schema:missing_cell_provenance", {}
+
+    header_rows: list[list[str]] = []
+    for row in header_rows_raw:
+        if not isinstance(row, list):
+            return False, "invalid_schema:header_row_not_list", {}
+        header_rows.append([_normalize_cell_text(cell) for cell in row])
+
+    rectified_rows: list[list[str]] = []
+    for row in rows_raw:
+        if not isinstance(row, list):
+            return False, "invalid_schema:data_row_not_list", {}
+        rectified_rows.append([_normalize_cell_text(cell) for cell in row])
+
+    target_cols = max(
+        max((len(row) for row in header_rows), default=0),
+        max((len(row) for row in rectified_rows), default=0),
+    )
+    if target_cols <= 0:
+        return False, "invalid_schema:empty_grid", {}
+    normalized_headers = [list(row) + [""] * (target_cols - len(row)) for row in header_rows]
+    normalized_rows = [list(row) + [""] * (target_cols - len(row)) for row in rectified_rows]
+    normalized_rows = [row[:target_cols] for row in normalized_rows]
+    normalized_headers = [row[:target_cols] for row in normalized_headers]
+
+    rectifier_confidence = payload.get("rectifier_confidence", 0.0)
+    try:
+        confidence = float(rectifier_confidence)
+    except Exception:
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    needs_review = bool(payload.get("needs_review", True))
+    edits = [dict(item) for item in edits_raw if isinstance(item, dict)]
+    return (
+        True,
+        "",
+        {
+            "header_rows_full": normalized_headers,
+            "rows": normalized_rows,
+            "headers": _collapse_header_rows(normalized_headers),
+            "edits": edits,
+            "cell_provenance_raw": provenance_raw,
+            "rectifier_confidence": confidence,
+            "needs_review": needs_review,
+        },
+    )
+
+
+def _normalize_provenance(raw: Any) -> dict[tuple[int, int], dict[str, Any]]:
+    out: dict[tuple[int, int], dict[str, Any]] = {}
+    if isinstance(raw, list):
+        candidates = raw
+    elif isinstance(raw, dict):
+        candidates = []
+        for key, value in raw.items():
+            if not isinstance(value, dict):
+                continue
+            m = re.match(r"^\s*(\d+)\s*[:,]\s*(\d+)\s*$", str(key))
+            if not m:
+                continue
+            item = dict(value)
+            item["row"] = int(m.group(1))
+            item["col"] = int(m.group(2))
+            candidates.append(item)
+    else:
+        candidates = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        try:
+            row = int(item.get("row"))
+            col = int(item.get("col"))
+        except Exception:
+            continue
+        source = str(item.get("source", "")).strip().lower()
+        evidence_text = _normalize_cell_text(item.get("evidence_text", ""))
+        try:
+            confidence = float(item.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+        out[(row, col)] = {
+            "row": row,
+            "col": col,
+            "source": source,
+            "evidence_text": evidence_text,
+            "confidence": max(0.0, min(1.0, confidence)),
+        }
+    return out
+
+
+def _tokenize(text: str) -> set[str]:
+    return {token for token in TOKEN_RE.findall(str(text or "").lower()) if token}
+
+
+def _validate_evidence(
+    *,
+    table_payload: dict[str, Any],
+    normalized: dict[str, Any],
+    evidence: dict[str, str],
+) -> tuple[bool, str, list[dict[str, Any]]]:
+    headers = [str(x) for x in normalized.get("headers", [])]
+    rows = [[str(x) for x in row] for row in normalized.get("rows", []) if isinstance(row, list)]
+    if not rows:
+        return False, "evidence_violation:no_rows", []
+    target_cols = len(headers)
+    if target_cols <= 0:
+        return False, "invalid_schema:no_headers", []
+    if any(len(row) != target_cols for row in rows):
+        return False, "invalid_schema:non_rectangular_rows", []
+
+    orig_header_rows = table_payload.get("header_rows_full", [])
+    orig_headers = _collapse_header_rows(
+        [[_normalize_cell_text(cell) for cell in row] for row in orig_header_rows if isinstance(row, list)]
+    )
+    orig_rows = [
+        [_normalize_cell_text(cell) for cell in row]
+        for row in table_payload.get("data_rows", [])
+        if isinstance(row, list)
+    ]
+    orig_nonempty_headers = sum(1 for h in orig_headers if _normalize_cell_text(h))
+    new_nonempty_headers = sum(1 for h in headers if _normalize_cell_text(h))
+    if orig_nonempty_headers > 0 and new_nonempty_headers < max(1, int(0.6 * orig_nonempty_headers)):
+        return False, "evidence_violation:header_loss", []
+    if orig_rows and len(rows) < max(1, int(0.5 * len(orig_rows))):
+        return False, "evidence_violation:row_loss", []
+
+    provenance_by_cell = _normalize_provenance(normalized.get("cell_provenance_raw"))
+    normalized_provenance = sorted(provenance_by_cell.values(), key=lambda row: (int(row["row"]), int(row["col"])))
+    marker_lower = evidence.get("marker_text", "").lower()
+    ocr_lower = evidence.get("ocr_text", "").lower()
+    context_lower = evidence.get("context_text", "").lower()
+    for row_idx, row in enumerate(rows):
+        for col_idx, cell in enumerate(row):
+            new_value = _normalize_cell_text(cell)
+            old_value = ""
+            if row_idx < len(orig_rows) and col_idx < len(orig_rows[row_idx]):
+                old_value = _normalize_cell_text(orig_rows[row_idx][col_idx])
+            if new_value and new_value != old_value:
+                provenance = provenance_by_cell.get((row_idx, col_idx))
+                if provenance is None:
+                    return False, f"evidence_violation:missing_provenance:{row_idx}:{col_idx}", []
+    for key, provenance in provenance_by_cell.items():
+        source = str(provenance.get("source", "")).lower()
+        evidence_text = str(provenance.get("evidence_text", "")).strip()
+        confidence = float(provenance.get("confidence", 0.0) or 0.0)
+        if source not in PROVENANCE_SOURCES:
+            return False, f"evidence_violation:bad_source:{key[0]}:{key[1]}", []
+        if not evidence_text:
+            return False, f"evidence_violation:missing_evidence_text:{key[0]}:{key[1]}", []
+        if confidence <= 0.0:
+            return False, f"evidence_violation:bad_confidence:{key[0]}:{key[1]}", []
+        evidence_text_lower = evidence_text.lower()
+        source_blob = marker_lower if source == "marker" else (ocr_lower if source == "ocr" else context_lower)
+        if source_blob and evidence_text_lower not in source_blob:
+            return False, f"evidence_violation:provenance_mismatch:{key[0]}:{key[1]}", []
+
+    original_union_symbols = _extract_symbols(
+        "\n".join(
+            [
+                " | ".join(orig_headers),
+                "\n".join(" | ".join(row) for row in orig_rows),
+                evidence.get("ocr_text", ""),
+            ]
+        )
+    )
+    rectified_symbols = _extract_symbols(
+        "\n".join([" | ".join(headers), "\n".join(" | ".join(row) for row in rows)])
+    )
+    missing_symbols = "".join(sym for sym in original_union_symbols if sym not in rectified_symbols)
+    if missing_symbols:
+        return False, f"evidence_violation:symbol_loss:{missing_symbols}", []
+
+    header_text = " ".join(headers)
+    original_units = bool(UNIT_TOKEN_RE.search(" ".join(orig_headers + [_normalize_cell_text(table_payload.get("caption_text", ""))])))
+    rectified_units = bool(UNIT_TOKEN_RE.search(header_text))
+    if original_units and not rectified_units:
+        return False, "evidence_violation:unit_loss", []
+
+    evidence_tokens = _tokenize(evidence.get("combined_text", ""))
+    rectified_tokens = _tokenize(" ".join(headers + [cell for row in rows for cell in row]))
+    novel_tokens = rectified_tokens.difference(evidence_tokens)
+    if novel_tokens and len(novel_tokens) > max(3, int(0.2 * max(len(rectified_tokens), 1))):
+        return False, "evidence_violation:hallucinated_tokens", []
+
+    return True, "", normalized_provenance
+
+
+def _write_table_csv(path: Path, headers: list[str], rows: list[list[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([_normalize_cell_text(h) for h in headers])
+        for row in rows:
+            writer.writerow([_normalize_cell_text(cell) for cell in row])
+
+
+def _apply_rectification(
+    *,
+    doc_dir: Path,
+    table_payload: dict[str, Any],
+    normalized: dict[str, Any],
+    risk_score: float,
+    config: RectifierConfig,
+) -> tuple[dict[str, Any], list[str], list[list[str]]]:
+    headers = [str(x) for x in normalized.get("headers", [])]
+    rows = [[str(x) for x in row] for row in normalized.get("rows", []) if isinstance(row, list)]
+    header_rows_full = [[str(x) for x in row] for row in normalized.get("header_rows_full", []) if isinstance(row, list)]
+    table_id = str(table_payload.get("table_id", ""))
+
+    snapshot = {
+        "header_rows_full": table_payload.get("header_rows_full", []),
+        "data_rows": table_payload.get("data_rows", []),
+        "header_hierarchy": table_payload.get("header_hierarchy", []),
+        "row_lineage": table_payload.get("row_lineage", []),
+        "context_mappings": table_payload.get("context_mappings", []),
+        "required_fields_missing": table_payload.get("required_fields_missing", []),
+        "quality_metrics": table_payload.get("quality_metrics", {}),
+    }
+
+    updated = dict(table_payload)
+    updated["header_rows"] = [headers]
+    updated["header_rows_full"] = header_rows_full
+    updated["header_hierarchy"] = [{"level": idx + 1, "cells": row} for idx, row in enumerate(header_rows_full)]
+    updated["data_rows"] = rows
+    updated["quality_metrics"] = _quality_metrics(headers, rows)
+    updated["cell_provenance"] = normalized.get("cell_provenance", [])
+    updated["rectifier_confidence"] = float(normalized.get("rectifier_confidence", 0.0) or 0.0)
+    updated["rectifier_needs_review"] = bool(normalized.get("needs_review", True))
+    updated["llm_rectification"] = {
+        "applied": True,
+        "model": config.model,
+        "target": config.target,
+        "risk_score": risk_score,
+        "edits": [dict(item) for item in normalized.get("edits", []) if isinstance(item, dict)],
+        "original_snapshot": snapshot,
+        "applied_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+    csv_rel = str(table_payload.get("csv_path", "")).strip()
+    if not csv_rel:
+        csv_rel = f"metadata/assets/structured/extracted/tables/{table_id}.csv"
+        updated["csv_path"] = csv_rel
+    csv_path = doc_dir / csv_rel
+    _write_table_csv(csv_path, headers, rows)
+    return updated, headers, rows
+
+
+async def run_table_rectification_for_doc(
+    *,
+    doc_dir: Path,
+    client: AsyncOpenAI,
+    config: RectifierConfig,
+    call_model: Callable[..., Awaitable[Any]] = call_text_model,
+) -> RectifierResult:
+    qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa"
+    qa_root.mkdir(parents=True, exist_ok=True)
+    report_path = qa_root / "table_llm_rectification.json"
+    result = RectifierResult(
+        enabled=True,
+        model=config.model,
+        target=config.target,
+        report_path=_portable_path(report_path, doc_dir),
+    )
+
+    tables_dir = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables"
+    tables_manifest_path = tables_dir / "manifest.jsonl"
+    manifest_rows = _load_jsonl(tables_manifest_path)
+    result.considered = len(manifest_rows)
+
+    qa_flags_path = qa_root / "table_flags.jsonl"
+    qa_rows = _load_jsonl(qa_flags_path)
+    existing_flag_ids = {str(row.get("flag_id", "")) for row in qa_rows if str(row.get("flag_id", ""))}
+
+    validation_path = doc_dir / "metadata" / "assets" / "structured" / "validation" / "gemini_table_review.jsonl"
+    nonaccept_table_ids = _collect_nonaccept_table_ids(validation_path)
+
+    table_payloads: dict[str, dict[str, Any]] = {}
+    for row in manifest_rows:
+        table_id = str(row.get("table_id", "")).strip()
+        if not table_id:
+            continue
+        table_path = tables_dir / f"{table_id}.json"
+        payload = _load_json(table_path)
+        if not payload:
+            payload = {
+                "table_id": table_id,
+                "caption_text": str(row.get("caption", "")),
+                "header_rows_full": [list(row.get("headers", []))],
+                "data_rows": [list(r) for r in row.get("rows", []) if isinstance(r, list)],
+                "quality_metrics": _quality_metrics(
+                    [str(x) for x in row.get("headers", [])],
+                    [[str(x) for x in r] for r in row.get("rows", []) if isinstance(r, list)],
+                ),
+                "required_fields_missing": [],
+                "row_lineage": [],
+                "context_mappings": [],
+            }
+        table_payloads[table_id] = payload
+
+    candidates: list[dict[str, Any]] = []
+    for manifest_row in manifest_rows:
+        table_id = str(manifest_row.get("table_id", "")).strip()
+        if not table_id:
+            continue
+        payload = table_payloads.get(table_id, {})
+        risk_score = _compute_risk_score(payload, qa_rows)
+        base_row = {"table_id": table_id, "page": int(manifest_row.get("page", 0) or 0), "risk_score": risk_score}
+        if config.target == "all":
+            candidates.append({**base_row, "manifest_row": manifest_row, "table_payload": payload})
+            continue
+        if config.target == "nonaccept":
+            if table_id in nonaccept_table_ids:
+                candidates.append({**base_row, "manifest_row": manifest_row, "table_payload": payload})
+                continue
+            result.table_results.append({**base_row, "status": "skipped_target_filter"})
+            continue
+        if risk_score >= float(config.risk_threshold):
+            candidates.append({**base_row, "manifest_row": manifest_row, "table_payload": payload})
+            continue
+        result.skipped_low_risk += 1
+        _append_flag(
+            qa_rows=qa_rows,
+            existing_flag_ids=existing_flag_ids,
+            table_id=table_id,
+            page=int(manifest_row.get("page", 0) or 0),
+            flag_type="llm_rectification_skipped_low_risk",
+            severity="info",
+            details=f"risk={risk_score:.4f} threshold={float(config.risk_threshold):.4f}",
+        )
+        result.table_results.append({**base_row, "status": "skipped_low_risk"})
+
+    candidates = sorted(candidates, key=lambda row: float(row.get("risk_score", 0.0)), reverse=True)
+    if config.max_tables_per_doc > 0:
+        candidates = candidates[: int(config.max_tables_per_doc)]
+    result.selected = len(candidates)
+
+    if not manifest_rows:
+        report_path.write_text(json.dumps(result.__dict__, indent=2, ensure_ascii=True))
+        _write_jsonl(qa_flags_path, qa_rows)
+        return result
+
+    manifest_by_id = {str(row.get("table_id", "")): dict(row) for row in manifest_rows}
+    canonical_path = tables_dir / "canonical.jsonl"
+    canonical_rows = _load_jsonl(canonical_path)
+    canonical_by_id = {str(row.get("table_id", "")): dict(row) for row in canonical_rows}
+
+    for candidate in candidates:
+        table_id = str(candidate["table_id"])
+        page = int(candidate.get("page", 0) or 0)
+        risk_score = float(candidate.get("risk_score", 0.0) or 0.0)
+        manifest_row = dict(candidate.get("manifest_row", {}))
+        table_payload = dict(candidate.get("table_payload", {}))
+        evidence = _collect_evidence_bundle(doc_dir, table_payload, page)
+        prompt = _build_prompt(table_payload=table_payload, manifest_row=manifest_row, risk_score=risk_score, evidence=evidence)
+        parsed: dict[str, Any] = {}
+        parse_status = "ok"
+        try:
+            response = await call_model(
+                client=client,
+                model=config.model,
+                prompt=prompt,
+                max_tokens=int(config.max_tokens),
+            )
+            parsed = _extract_json_object(getattr(response, "content", ""))
+            if not parsed:
+                repair = await call_model(
+                    client=client,
+                    model=config.model,
+                    prompt=_build_repair_prompt(getattr(response, "content", "")),
+                    max_tokens=int(config.max_tokens),
+                )
+                parsed = _extract_json_object(getattr(repair, "content", ""))
+        except Exception as exc:  # noqa: BLE001
+            result.fallbacked += 1
+            result.errors += 1
+            _append_flag(
+                qa_rows=qa_rows,
+                existing_flag_ids=existing_flag_ids,
+                table_id=table_id,
+                page=page,
+                flag_type="llm_rectification_failed_fallback",
+                severity="warn",
+                details=str(exc),
+            )
+            result.table_results.append(
+                {
+                    "table_id": table_id,
+                    "page": page,
+                    "risk_score": risk_score,
+                    "status": "failed_fallback",
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        ok_schema, schema_reason, normalized = _normalize_rectified_payload(parsed)
+        if not ok_schema:
+            result.fallbacked += 1
+            result.invalid_schema += 1
+            _append_flag(
+                qa_rows=qa_rows,
+                existing_flag_ids=existing_flag_ids,
+                table_id=table_id,
+                page=page,
+                flag_type="llm_rectification_invalid_schema",
+                severity="warn",
+                details=schema_reason,
+            )
+            result.table_results.append(
+                {
+                    "table_id": table_id,
+                    "page": page,
+                    "risk_score": risk_score,
+                    "status": "invalid_schema",
+                    "reason": schema_reason,
+                }
+            )
+            continue
+
+        ok_evidence, evidence_reason, normalized_provenance = _validate_evidence(
+            table_payload=table_payload,
+            normalized=normalized,
+            evidence=evidence,
+        )
+        if not ok_evidence:
+            result.fallbacked += 1
+            if evidence_reason.startswith("evidence_violation:"):
+                result.evidence_violations += 1
+                parse_status = "evidence_violation"
+                _append_flag(
+                    qa_rows=qa_rows,
+                    existing_flag_ids=existing_flag_ids,
+                    table_id=table_id,
+                    page=page,
+                    flag_type="llm_rectification_evidence_violation",
+                    severity="warn",
+                    details=evidence_reason,
+                )
+            else:
+                result.invalid_schema += 1
+                parse_status = "invalid_schema"
+                _append_flag(
+                    qa_rows=qa_rows,
+                    existing_flag_ids=existing_flag_ids,
+                    table_id=table_id,
+                    page=page,
+                    flag_type="llm_rectification_invalid_schema",
+                    severity="warn",
+                    details=evidence_reason,
+                )
+            result.table_results.append(
+                {
+                    "table_id": table_id,
+                    "page": page,
+                    "risk_score": risk_score,
+                    "status": parse_status,
+                    "reason": evidence_reason,
+                }
+            )
+            continue
+
+        normalized["cell_provenance"] = normalized_provenance
+        updated_payload, headers, rows = _apply_rectification(
+            doc_dir=doc_dir,
+            table_payload=table_payload,
+            normalized=normalized,
+            risk_score=risk_score,
+            config=config,
+        )
+        table_json_path = tables_dir / f"{table_id}.json"
+        table_json_path.write_text(json.dumps(updated_payload, indent=2, ensure_ascii=True))
+
+        if table_id in manifest_by_id:
+            row = dict(manifest_by_id[table_id])
+            row["headers"] = headers
+            row["rows"] = rows
+            manifest_by_id[table_id] = row
+        if table_id in canonical_by_id:
+            crow = dict(canonical_by_id[table_id])
+            crow["header_rows"] = [headers]
+            crow["header_rows_full"] = updated_payload.get("header_rows_full", [headers])
+            crow["header_hierarchy"] = updated_payload.get("header_hierarchy", [])
+            crow["data_rows"] = rows
+            crow["quality_metrics"] = updated_payload.get("quality_metrics", {})
+            crow["cell_provenance"] = updated_payload.get("cell_provenance", [])
+            crow["rectifier_confidence"] = updated_payload.get("rectifier_confidence", 0.0)
+            crow["rectifier_needs_review"] = updated_payload.get("rectifier_needs_review", True)
+            crow["llm_rectification"] = updated_payload.get("llm_rectification", {})
+            canonical_by_id[table_id] = crow
+
+        result.applied += 1
+        _append_flag(
+            qa_rows=qa_rows,
+            existing_flag_ids=existing_flag_ids,
+            table_id=table_id,
+            page=page,
+            flag_type="llm_rectification_applied",
+            severity="info",
+            details=f"risk={risk_score:.4f}",
+        )
+        result.table_results.append(
+            {
+                "table_id": table_id,
+                "page": page,
+                "risk_score": risk_score,
+                "status": "applied",
+                "rectifier_confidence": float(updated_payload.get("rectifier_confidence", 0.0) or 0.0),
+                "needs_review": bool(updated_payload.get("rectifier_needs_review", False)),
+            }
+        )
+
+    # Persist updates after processing all candidates.
+    updated_manifest_rows: list[dict[str, Any]] = []
+    for row in manifest_rows:
+        table_id = str(row.get("table_id", ""))
+        updated_manifest_rows.append(dict(manifest_by_id.get(table_id, row)))
+    _write_jsonl(tables_manifest_path, updated_manifest_rows)
+
+    if canonical_rows:
+        updated_canonical_rows: list[dict[str, Any]] = []
+        for row in canonical_rows:
+            table_id = str(row.get("table_id", ""))
+            updated_canonical_rows.append(dict(canonical_by_id.get(table_id, row)))
+        _write_jsonl(canonical_path, updated_canonical_rows)
+
+    _write_jsonl(qa_flags_path, qa_rows)
+    report_payload = {
+        "enabled": result.enabled,
+        "model": result.model,
+        "target": result.target,
+        "considered": result.considered,
+        "selected": result.selected,
+        "applied": result.applied,
+        "skipped_low_risk": result.skipped_low_risk,
+        "fallbacked": result.fallbacked,
+        "invalid_schema": result.invalid_schema,
+        "evidence_violations": result.evidence_violations,
+        "errors": result.errors,
+        "report_path": result.report_path,
+        "table_results": result.table_results,
+    }
+    report_path.write_text(json.dumps(report_payload, indent=2, ensure_ascii=True))
+    return result
