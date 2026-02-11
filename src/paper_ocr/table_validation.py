@@ -234,6 +234,38 @@ def _short(value: Any, *, limit: int = 80) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def _resolve_validation_pages(table_row: dict[str, Any], doc_dir: Path) -> list[int]:
+    primary = int(table_row.get("page", 0) or 0)
+    pages: list[int] = [primary] if primary > 0 else []
+    table_id = str(table_row.get("table_id", "")).strip()
+    if not table_id:
+        return pages
+    table_detail_path = (
+        doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / f"{table_id}.json"
+    )
+    detail = _load_json(table_detail_path)
+    raw_pages = detail.get("pages", [])
+    if isinstance(raw_pages, list):
+        parsed: list[int] = []
+        for item in raw_pages:
+            try:
+                page = int(item)
+            except Exception:
+                continue
+            if page > 0:
+                parsed.append(page)
+        if parsed:
+            pages = parsed
+    deduped: list[int] = []
+    seen: set[int] = set()
+    for page in pages:
+        if page in seen:
+            continue
+        seen.add(page)
+        deduped.append(page)
+    return deduped
+
+
 def _build_review_prompt(table_row: dict[str, Any]) -> str:
     raw_headers = table_row.get("headers", [])
     headers = [_short(x, limit=56) for x in raw_headers[:8]] if isinstance(raw_headers, list) else []
@@ -243,7 +275,8 @@ def _build_review_prompt(table_row: dict[str, Any]) -> str:
         first_row = [_short(cell, limit=56) for cell in raw_rows[0][:8]]
 
     return (
-        "Task: Validate one extracted table candidate against the page image.\n"
+        "Task: Validate one extracted table candidate against the provided page image(s).\n"
+        "Important: If multiple images are provided, they represent continuation pages of the same table.\n"
         "Return JSON only (no markdown) with keys exactly:\n"
         'table_present_on_page ("yes"|"no"|"uncertain"),\n'
         "extraction_quality (0..1),\n"
@@ -257,6 +290,7 @@ def _build_review_prompt(table_row: dict[str, Any]) -> str:
         "Candidate summary:\n"
         f"table_id={_short(table_row.get('table_id', ''), limit=32)}\n"
         f"page={int(table_row.get('page', 0) or 0)}\n"
+        f"validation_pages={table_row.get('validation_pages', [])}\n"
         f"caption={_short(table_row.get('caption', ''), limit=180)}\n"
         f"headers={' | '.join(headers)}\n"
         f"first_row={' | '.join(first_row)}"
@@ -277,7 +311,8 @@ async def _review_table_with_gemini(
     *,
     client: Any,
     config: GeminiValidationConfig,
-    image_bytes: bytes,
+    image_bytes_list: list[bytes],
+    page_numbers: list[int],
     table_row: dict[str, Any],
 ) -> dict[str, Any]:
     model = _canonical_model_id(config.model)
@@ -288,7 +323,9 @@ async def _review_table_with_gemini(
         raw_response = await client.generate_table_review(
             model=model,
             prompt=prompt,
-            image_bytes=image_bytes,
+            image_bytes=image_bytes_list[0] if image_bytes_list else b"",
+            image_bytes_list=image_bytes_list,
+            page_numbers=page_numbers,
             generation_config=_generate_config(config),
         )
         parsed = _extract_json_object(str(raw_response))
@@ -296,12 +333,13 @@ async def _review_table_with_gemini(
         review["model_used"] = model
         return review
 
+    content_parts: list[types.Part] = [types.Part.from_text(text=prompt)]
+    for image_bytes in image_bytes_list:
+        content_parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/png"))
+
     response = await client.aio.models.generate_content(
         model=model,
-        contents=[
-            types.Part.from_text(text=prompt),
-            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-        ],
+        contents=content_parts,
         config=_generate_config(config),
     )
     content = str(getattr(response, "text", "") or "")
@@ -395,19 +433,33 @@ async def run_gemini_table_validation(
                     page = int(table.get("page", 0) or 0)
                     if page < 1 or page > int(pdf.page_count):
                         continue
-                    if page not in page_cache:
-                        page_cache[page] = _render_page_png(pdf, page, int(config.render_dpi))
+                    validation_pages = _resolve_validation_pages(table, doc_dir)
+                    pages: list[int] = []
+                    for p in validation_pages or [page]:
+                        if 1 <= int(p) <= int(pdf.page_count):
+                            pages.append(int(p))
+                    if not pages:
+                        continue
+                    image_bytes_list: list[bytes] = []
+                    for p in pages:
+                        if p not in page_cache:
+                            page_cache[p] = _render_page_png(pdf, p, int(config.render_dpi))
+                        image_bytes_list.append(page_cache[p])
+                    table_for_prompt = dict(table)
+                    table_for_prompt["validation_pages"] = pages
                     review = await _review_table_with_gemini(
                         client=review_client,
                         config=config,
-                        image_bytes=page_cache[page],
-                        table_row=table,
+                        image_bytes_list=image_bytes_list,
+                        page_numbers=pages,
+                        table_row=table_for_prompt,
                     )
                     doc_rows.append(
                         {
                             "doc_dir": str(doc_dir),
                             "table_id": str(table.get("table_id", "")),
                             "page": page,
+                            "validation_pages": pages,
                             "caption": str(table.get("caption", "")),
                             "headers": table.get("headers", []),
                             "rows": table.get("rows", []),

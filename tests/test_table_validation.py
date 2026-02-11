@@ -13,13 +13,15 @@ class _FakeClient:
     def __init__(self, content: str) -> None:
         self._content = content
         self.calls = 0
+        self.last_kwargs: dict[str, object] = {}
 
     async def generate_table_review(self, **kwargs):  # noqa: ANN003
         self.calls += 1
+        self.last_kwargs = dict(kwargs)
         return self._content
 
 
-def _make_doc(tmp_path: Path, *, status: str = "warnings") -> Path:
+def _make_doc(tmp_path: Path, *, status: str = "warnings", continuation_pages: list[int] | None = None) -> Path:
     doc_dir = tmp_path / "out" / "group" / "doc_abc"
     (doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables").mkdir(parents=True, exist_ok=True)
     (doc_dir / "metadata" / "assets" / "structured" / "qa").mkdir(parents=True, exist_ok=True)
@@ -27,6 +29,9 @@ def _make_doc(tmp_path: Path, *, status: str = "warnings") -> Path:
     with fitz.open() as pdf:
         page = pdf.new_page(width=400, height=600)
         page.insert_text((72, 72), "Table 1: Polymer data")
+        if continuation_pages and 2 in continuation_pages:
+            page2 = pdf.new_page(width=400, height=600)
+            page2.insert_text((72, 72), "Table 1 continued")
         pdf.save(source_pdf)
     (doc_dir / "metadata" / "manifest.json").write_text(json.dumps({"source_path": str(source_pdf)}))
     (doc_dir / "metadata" / "assets" / "structured" / "qa" / "pipeline_status.json").write_text(
@@ -43,6 +48,17 @@ def _make_doc(tmp_path: Path, *, status: str = "warnings") -> Path:
     (doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl").write_text(
         json.dumps(table_row) + "\n"
     )
+    if continuation_pages:
+        table_detail = {
+            "table_id": table_row["table_id"],
+            "pages": continuation_pages,
+            "caption_text": table_row["caption"],
+            "header_rows": [table_row["headers"]],
+            "data_rows": table_row["rows"],
+        }
+        (doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / f"{table_row['table_id']}.json").write_text(
+            json.dumps(table_detail)
+        )
     return doc_dir
 
 
@@ -119,3 +135,36 @@ def test_run_gemini_table_validation_parses_partial_json(tmp_path: Path):
     )
     assert summary["tables_reviewed"] == 1
     assert summary["table_present_yes"] == 1
+
+
+def test_run_gemini_table_validation_uses_continuation_pages_when_available(tmp_path: Path):
+    _make_doc(tmp_path, status="warnings", continuation_pages=[1, 2])
+    fake_client = _FakeClient(
+        json.dumps(
+            {
+                "table_present_on_page": "yes",
+                "extraction_quality": 0.9,
+                "false_positive_risk": 0.05,
+                "recommended_action": "accept",
+                "issues": [],
+            }
+        )
+    )
+    cfg = GeminiValidationConfig(model="gemini-3-flash", api_key="x")
+
+    summary = asyncio.run(
+        run_gemini_table_validation(
+            ocr_out_dir=tmp_path / "out",
+            config=cfg,
+            client=fake_client,
+            only_problem_docs=True,
+            max_docs=0,
+            max_tables_per_doc=0,
+        )
+    )
+    assert summary["tables_reviewed"] == 1
+    image_list = fake_client.last_kwargs.get("image_bytes_list")
+    assert isinstance(image_list, list)
+    assert len(image_list) == 2
+    page_numbers = fake_client.last_kwargs.get("page_numbers")
+    assert page_numbers == [1, 2]
