@@ -941,9 +941,11 @@ def run_marker_doc(
                         (marker_root / "tables_raw.jsonl").write_text(
                             "\n".join(json.dumps(r, ensure_ascii=True) for r in tables_raw) + "\n"
                         )
-                if block_rows:
+                if block_rows and not (marker_root / "blocks.jsonl").exists():
                     (marker_root / "blocks.jsonl").write_text(
                         "\n".join(json.dumps(r, ensure_ascii=True) for r in block_rows) + "\n"
+                    )
+
                     )
                 status = _collect_localization_status(block_rows, page_count=page_count)
                 artifacts = {
