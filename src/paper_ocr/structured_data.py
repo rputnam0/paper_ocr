@@ -575,6 +575,123 @@ def _merge_table_fragments(fragments: list[TableFragment]) -> list[dict[str, Any
     return out
 
 
+def _has_nonempty_cells(rows: list[list[str]]) -> bool:
+    for row in rows:
+        for cell in row:
+            if str(cell or "").strip():
+                return True
+    return False
+
+
+def _expand_header_row_for_target_cols(header_row: list[str], target_cols: int) -> list[str]:
+    row = [str(cell or "") for cell in header_row]
+    if target_cols <= 0 or len(row) >= target_cols:
+        return row
+    i = 0
+    while len(row) < target_cols and i < len(row):
+        parts = [part.strip() for part in str(row[i]).splitlines() if part.strip()]
+        if len(parts) >= 2:
+            row = row[:i] + parts + row[i + 1 :]
+            continue
+        i += 1
+    return row
+
+
+def _coerce_rows_from_header_only_table(table: dict[str, Any]) -> list[list[str]]:
+    rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
+    if rows:
+        return rows
+    header_rows = [list(r) for r in table.get("header_rows", []) if isinstance(r, list)]
+    if len(header_rows) >= 2:
+        return header_rows[1:]
+    return []
+
+
+def _table_caption_has_number(caption: str) -> bool:
+    return bool(_extract_table_number(caption or ""))
+
+
+def _try_merge_cross_page_continuation(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any] | None:
+    first_pages = sorted({int(p) for p in first.get("pages", []) if isinstance(p, int) or str(p).isdigit()})
+    second_pages = sorted({int(p) for p in second.get("pages", []) if isinstance(p, int) or str(p).isdigit()})
+    if not first_pages or not second_pages:
+        return None
+    if second_pages[0] - first_pages[-1] != 1:
+        return None
+
+    first_rows = [list(r) for r in first.get("data_rows", []) if isinstance(r, list)]
+    if _has_nonempty_cells(first_rows):
+        return None
+
+    first_caption = str(first.get("caption_text", "") or "")
+    second_caption = str(second.get("caption_text", "") or "")
+    first_table_num = _extract_table_number(first_caption)
+    second_table_num = _extract_table_number(second_caption)
+    if not first_table_num:
+        return None
+    if second_table_num and second_table_num != first_table_num:
+        return None
+    if second_caption.strip() and second_caption.strip().lower().startswith("table "):
+        return None
+
+    second_rows = _coerce_rows_from_header_only_table(second)
+    if not _has_nonempty_cells(second_rows):
+        return None
+
+    first_header_rows = [list(r) for r in first.get("header_rows", []) if isinstance(r, list)]
+    second_header_rows = [list(r) for r in second.get("header_rows", []) if isinstance(r, list)]
+    target_cols = max((len(r) for r in second_rows), default=0)
+    if target_cols <= 0:
+        return None
+
+    merged_header_row: list[str]
+    if first_header_rows:
+        merged_header_row = _expand_header_row_for_target_cols(first_header_rows[0], target_cols)
+    elif second_header_rows:
+        merged_header_row = list(second_header_rows[0])
+    else:
+        return None
+
+    if len(merged_header_row) != target_cols:
+        return None
+
+    merged = dict(first)
+    merged["header_rows"] = [merged_header_row]
+    merged["data_rows"] = second_rows
+    merged["pages"] = sorted(set(first_pages + second_pages))
+    merged["fragment_ids"] = list(dict.fromkeys([str(x) for x in first.get("fragment_ids", []) + second.get("fragment_ids", [])]))
+    merged["merge_confidence"] = min(float(first.get("merge_confidence", 1.0) or 1.0), 0.85)
+    merged["cross_page_merged"] = True
+    if not str(merged.get("caption_text", "") or "").strip():
+        merged["caption_text"] = second_caption
+    return merged
+
+
+def _merge_cross_page_continuations(canonical_tables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(canonical_tables) <= 1:
+        return canonical_tables
+    ordered = sorted(
+        canonical_tables,
+        key=lambda t: (
+            min((int(p) for p in t.get("pages", []) if isinstance(p, int) or str(p).isdigit()), default=1),
+            str(t.get("table_id", "")),
+        ),
+    )
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(ordered):
+        current = ordered[i]
+        if i + 1 < len(ordered):
+            merged = _try_merge_cross_page_continuation(current, ordered[i + 1])
+            if merged is not None:
+                out.append(merged)
+                i += 2
+                continue
+        out.append(current)
+        i += 1
+    return out
+
+
 def _quality_metrics(headers: list[str], rows: list[list[str]]) -> dict[str, Any]:
     total_cells = max(len(headers), 1) * max(len(rows), 1)
     flattened = [cell for row in rows for cell in row]
@@ -1338,6 +1455,7 @@ def build_structured_exports(
         for idx, row in enumerate(marker_rows, start=1):
             fragments.append(_normalize_fragment_from_marker(row, idx))
         canonical_tables = _merge_table_fragments(fragments)
+        canonical_tables = _merge_cross_page_continuations(canonical_tables)
         if table_ocr_merge:
             canonical_tables, merge_summary = _merge_marker_tables_with_ocr_html(
                 canonical_tables=canonical_tables,
@@ -1593,6 +1711,17 @@ def build_structured_exports(
             table["quality_metrics"] = metrics
             if escalated:
                 table["escalated"] = True
+            if bool(table.get("cross_page_merged", False)):
+                qa_flags.append(
+                    QAFlag(
+                        flag_id=_stable_id("qa", table_id, "cross_page_continuation_merged"),
+                        severity="info",
+                        type="cross_page_continuation_merged",
+                        page=int(page),
+                        table_ref=table_id or "*",
+                        details="merged_with_next_page_fragment",
+                    )
+                )
             catastrophic, catastrophic_reason = _catastrophic_quality(headers, rows, metrics)
             if catastrophic:
                 page_ocr_tables = ocr_tables_by_page.get(int(page), [])

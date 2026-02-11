@@ -929,6 +929,103 @@ def test_build_structured_exports_uses_ocr_fallback_for_catastrophic_marker_tabl
     assert any(flag["type"] == "fallback_ocr_applied" for flag in flags)
 
 
+def test_build_structured_exports_merges_cross_page_table_continuation(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text("Table on page 1\n")
+    (pages_dir / "0002.md").write_text("Continuation on page 2\n")
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_rows = [
+        {
+            "table_group_id": "page_0001_table_01",
+            "table_block_ids": ["b1"],
+            "caption_block_id": "c1",
+            "page": 1,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["Temperature\n800 °C", "900 °C", "1000 °C"]],
+            "data_rows": [],
+            "caption_text": "Table 2. Calculated K partition ratio (%)",
+        },
+        {
+            "table_group_id": "page_0002_table_01",
+            "table_block_ids": ["b2"],
+            "caption_block_id": "",
+            "page": 2,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["K2Si4O9", "85.4", "76.8", "65.8"], ["KCl", "14.6", "23.2", "34.2"]],
+            "data_rows": [],
+            "caption_text": "",
+        },
+    ]
+    (marker_root / "tables_raw.jsonl").write_text("\n".join(json.dumps(r) for r in marker_rows) + "\n")
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=False,
+    )
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    assert first["page"] == 1
+    assert first["headers"] == ["Temperature", "800 °C", "900 °C", "1000 °C"]
+    assert first["rows"] == [["KCl", "14.6", "23.2", "34.2"]]
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "cross_page_continuation_merged" for flag in flags)
+    assert not any(flag["type"] == "excluded_low_quality" for flag in flags)
+
+
+def test_build_structured_exports_does_not_merge_distinct_adjacent_tables(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text("Table on page 1\n")
+    (pages_dir / "0002.md").write_text("Different table on page 2\n")
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_rows = [
+        {
+            "table_group_id": "page_0001_table_01",
+            "table_block_ids": ["b1"],
+            "caption_block_id": "c1",
+            "page": 1,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["A", "B"]],
+            "data_rows": [["1", "2"]],
+            "caption_text": "Table 1. First",
+        },
+        {
+            "table_group_id": "page_0002_table_01",
+            "table_block_ids": ["b2"],
+            "caption_block_id": "c2",
+            "page": 2,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["X", "Y"]],
+            "data_rows": [["7", "8"]],
+            "caption_text": "Table 2. Second",
+        },
+    ]
+    (marker_root / "tables_raw.jsonl").write_text("\n".join(json.dumps(r) for r in marker_rows) + "\n")
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=False,
+    )
+    assert summary.table_count == 2
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert not any(flag["type"] == "cross_page_continuation_merged" for flag in flags)
+
+
 def test_build_structured_exports_excludes_duplicate_headers_marker_table(tmp_path: Path):
     doc_dir = tmp_path / "Doe_2024"
     (doc_dir / "pages").mkdir(parents=True)
