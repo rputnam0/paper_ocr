@@ -329,7 +329,8 @@ def _resolve_row(row: dict[str, str], config: DoiResolutionConfig, state: _Resol
                 and (not best_row["first_author"] or top["author_match"] > 0.0)
             )
             confirmed_triplet = _is_confirmed_bibliographic_match(best_row, top)
-            if auto_accept or confirmed_triplet:
+            balanced_match = _is_balanced_bibliographic_match(best_row, top, gap)
+            if auto_accept or confirmed_triplet or balanced_match:
                 out = _canonicalize_candidate(
                     candidate=top["doi"],
                     row=best_row,
@@ -883,6 +884,34 @@ def _is_confirmed_bibliographic_match(row: dict[str, str], candidate: dict[str, 
         if float(candidate.get("container_similarity", 0.0)) < 0.6:
             return False
     return True
+
+
+def _is_balanced_bibliographic_match(row: dict[str, str], candidate: dict[str, Any], gap: float) -> bool:
+    score = float(candidate.get("score", 0.0))
+    title_similarity = float(candidate.get("title_similarity", 0.0))
+    author_match = float(candidate.get("author_match", 0.0))
+    year_match = float(candidate.get("year_match", 0.0))
+    container_similarity = float(candidate.get("container_similarity", 0.0))
+    has_author = bool((row.get("first_author", "") or "").strip())
+
+    # Track A: author present, rely on author/year confirmation with moderate title threshold.
+    if has_author:
+        return (
+            score >= 0.62
+            and title_similarity >= 0.38
+            and author_match >= 1.0
+            and year_match >= 1.0
+            and gap >= 0.03
+        )
+
+    # Track B: author missing/unknown, require stronger title+container evidence.
+    return (
+        score >= 0.50
+        and title_similarity >= 0.46
+        and year_match >= 1.0
+        and container_similarity >= 0.30
+        and gap >= 0.04
+    )
 
 
 def _author_family(author: Any) -> str:
