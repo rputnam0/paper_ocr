@@ -15,7 +15,7 @@ The pipeline is optimized for technical papers and produces per-paper Markdown, 
 - Renders pages with OCR-safe sizing constraints.
 - Parses model YAML front matter and writes normalized page outputs.
 - Extracts bibliography metadata from first-page content.
-- Names output folders/files from extracted paper metadata when possible.
+- Uses stable `doc_<doc_id>` output folders for deterministic reruns.
 - Extracts discovery metadata (`paper_summary`, `key_topics`, `sections`) from early pages.
 - Generates group-level `README.md` indexes for discoverability.
 
@@ -196,12 +196,24 @@ This command scans existing OCR document folders, regenerates:
 
 and updates each document manifest with `structured_data_extraction`.
 
+### 4) Export dataset-grade fact records
+
+```bash
+uv run paper-ocr export-facts <ocr_out_dir>
+```
+
+This command scans OCR document folders and writes:
+- `metadata/assets/structured/facts/property_records.jsonl`
+- `metadata/assets/structured/facts/manifest.json`
+
+and updates each document manifest with `facts_extraction`.
+
 Default table stack:
 - Marker-first table extraction (`--table-source marker-first`)
 - OCR-assisted header merge (`--table-ocr-merge --table-ocr-merge-scope header`)
 - This recovers missing symbols in headers (for example `δ`, `η`, `γ`) while avoiding OCR body-row corruption.
 
-### 4) Audit data layout contract
+### 5) Audit data layout contract
 
 ```bash
 uv run paper-ocr data-audit [data_dir] [--strict] [--json]
@@ -213,13 +225,25 @@ Behavior:
 - flags misplaced PDFs
 - `--strict` returns non-zero on errors
 
-### 5) Evaluate table pipeline against gold set
+### 6) Evaluate table pipeline against gold set
 
 ```bash
 uv run paper-ocr eval-table-pipeline <gold_dir> <pred_dir>
 ```
 
-This command reports baseline table detection metrics (precision/recall) using page-level matching.
+This command reports detection and extraction metrics including:
+- table detection precision/recall
+- row/column count match rates
+- key-cell accuracy
+- numeric parse success
+
+Optional regression gate:
+
+```bash
+uv run paper-ocr eval-table-pipeline <gold_dir> <pred_dir> \
+  --baseline <baseline.json> \
+  --strict-regression
+```
 
 ## Recommended Workflows
 
@@ -370,8 +394,8 @@ For each processed PDF:
 ```text
 out/<input_parent_folder>/
   README.md
-out/<input_parent_folder>/<author_year>/
-  <paper_title>.md
+out/<input_parent_folder>/doc_<doc_id>/
+  document.md
   pages/
     0001.md
     0002.md
@@ -404,8 +428,8 @@ out/<input_parent_folder>/<author_year>/
 ```
 
 Behavior notes:
-- Folder naming prefers extracted author/year metadata; falls back safely when missing.
-- Consolidated markdown filename is derived from extracted title.
+- Folder naming is deterministic by source hash (`doc_<doc_id>`).
+- Consolidated markdown filename is stable (`document.md`).
 - Group-level readmes are generated for folder-level discoverability.
 - `manifest.json` includes a `structured_extraction` block with `enabled`, `backend`, `grobid_used`, `fallback_count`, and `structured_page_count`.
 - `metadata/assets/structured/grobid/figures_tables.jsonl` provides a GROBID-derived figure/table index with labels, captions, page, and coords for QA/fallback targeting.

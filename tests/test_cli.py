@@ -3,6 +3,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import fitz
 import pytest
 
 from paper_ocr import cli
@@ -137,6 +138,20 @@ def test_parse_export_structured_data_args(monkeypatch):
     assert args.deplot_timeout == 45
 
 
+def test_parse_export_facts_args(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "export-facts",
+            "out",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "export-facts"
+    assert args.ocr_out_dir == Path("out")
+
+
 def test_parse_run_table_pipeline_defaults(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -235,6 +250,38 @@ def test_parse_eval_table_pipeline_args(monkeypatch):
     assert args.command == "eval-table-pipeline"
     assert args.gold_dir == Path("gold")
     assert args.pred_dir == Path("pred")
+    assert args.baseline is None
+    assert args.strict_regression is False
+    assert args.max_precision_drop == 0.03
+    assert args.max_recall_drop == 0.03
+    assert args.min_numeric_parse == 0.8
+
+
+def test_parse_eval_table_pipeline_regression_options(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "eval-table-pipeline",
+            "gold",
+            "pred",
+            "--baseline",
+            "baseline.json",
+            "--strict-regression",
+            "--max-precision-drop",
+            "0.05",
+            "--max-recall-drop",
+            "0.04",
+            "--min-numeric-parse",
+            "0.9",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.baseline == Path("baseline.json")
+    assert args.strict_regression is True
+    assert args.max_precision_drop == 0.05
+    assert args.max_recall_drop == 0.04
+    assert args.min_numeric_parse == 0.9
 
 
 def test_parse_data_audit_args(monkeypatch):
@@ -253,6 +300,67 @@ def test_parse_data_audit_args(monkeypatch):
     assert args.data_dir == Path("data")
     assert args.strict is True
     assert args.json is True
+
+
+def test_run_eval_table_pipeline_strict_regression_raises(tmp_path: Path):
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "table_detection_precision": 0.95,
+                "table_detection_recall": 0.95,
+                "numeric_parse_success": 0.95,
+            }
+        )
+    )
+    args = argparse.Namespace(
+        gold_dir=tmp_path / "gold",
+        pred_dir=tmp_path / "pred",
+        baseline=baseline,
+        strict_regression=True,
+        max_precision_drop=0.03,
+        max_recall_drop=0.03,
+        min_numeric_parse=0.8,
+    )
+    (args.gold_dir).mkdir(parents=True, exist_ok=True)
+    (args.pred_dir).mkdir(parents=True, exist_ok=True)
+    (args.gold_dir / "tables.jsonl").write_text(json.dumps({"page": 1}) + "\n")
+    (args.pred_dir / "tables.jsonl").write_text("")
+    with pytest.raises(SystemExit, match="Regression checks failed"):
+        cli._run_eval_table_pipeline(args)
+
+
+def test_run_eval_table_pipeline_no_numeric_cells_does_not_fail_numeric_gate(tmp_path: Path):
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "table_detection_precision": 1.0,
+                "table_detection_recall": 1.0,
+                "numeric_parse_success": 0.95,
+            }
+        )
+    )
+    args = argparse.Namespace(
+        gold_dir=tmp_path / "gold",
+        pred_dir=tmp_path / "pred",
+        baseline=baseline,
+        strict_regression=True,
+        max_precision_drop=0.03,
+        max_recall_drop=0.03,
+        min_numeric_parse=0.8,
+    )
+    args.gold_dir.mkdir(parents=True, exist_ok=True)
+    args.pred_dir.mkdir(parents=True, exist_ok=True)
+    (args.gold_dir / "tables.jsonl").write_text(
+        json.dumps({"table_id": "t1", "page": 1, "headers": ["name"], "rows": [["A"]]}) + "\n"
+    )
+    (args.pred_dir / "tables.jsonl").write_text(
+        json.dumps({"table_id": "t1", "page": 1, "headers": ["name"], "rows": [["A"]]}) + "\n"
+    )
+    out = cli._run_eval_table_pipeline(args)
+    assert out["numeric_cell_count"] == 0
+    assert out["regression"]["violations"] == []
 
 
 def test_run_data_audit_strict_raises(tmp_path: Path):
@@ -332,6 +440,51 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
     assert seen_kwargs["table_artifact_mode"] == "permissive"
     assert seen_kwargs["ocr_html_dir"] is None
     assert seen_kwargs["grobid_status"] == "unknown"
+    assert payload["processing_status"]["status"] == "ok"
+    assert payload["processing_status"]["strict_failure"] is False
+
+
+def test_run_export_structured_data_non_strict_errors_do_not_mark_failed(monkeypatch, tmp_path: Path):
+    root = tmp_path / "out"
+    doc_dir = root / "group" / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    (doc_dir / "metadata").mkdir(parents=True)
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    manifest_path.write_text(json.dumps({"doc_id": "abc"}))
+
+    def _fake_build(**kwargs):  # noqa: ANN001
+        return StructuredExportSummary(
+            table_count=1,
+            figure_count=0,
+            deplot_count=0,
+            unresolved_figure_count=0,
+            errors=["p0001_t01: quality gate failed"],
+        )
+
+    monkeypatch.setattr(cli, "build_structured_exports", _fake_build)
+
+    args = argparse.Namespace(
+        ocr_out_dir=root,
+        deplot_command="",
+        deplot_timeout=30,
+        table_source="marker-first",
+        table_ocr_merge=True,
+        table_ocr_merge_scope="header",
+        table_header_ocr_auto=False,
+        table_header_ocr_model="m",
+        table_header_ocr_max_tokens=500,
+        table_artifact_mode="permissive",
+        ocr_html_dir=None,
+        table_quality_gate=True,
+        table_escalation="auto",
+        table_escalation_max=20,
+        table_qa_mode="warn",
+        compare_ocr_html=False,
+    )
+    cli._run_export_structured_data(args)
+    payload = json.loads(manifest_path.read_text())
+    assert payload["processing_status"]["status"] == "ok"
+    assert payload["processing_status"]["strict_failure"] is False
 
 
 def test_run_export_structured_data_passes_grobid_ok_when_manifest_records_usage(monkeypatch, tmp_path: Path):
@@ -386,6 +539,13 @@ def test_run_export_structured_data_requires_docs(tmp_path: Path):
     args.ocr_out_dir.mkdir(parents=True, exist_ok=True)
     with pytest.raises(SystemExit, match="No OCR document folders found"):
         cli._run_export_structured_data(args)
+
+
+def test_run_export_facts_requires_docs(tmp_path: Path):
+    args = argparse.Namespace(ocr_out_dir=tmp_path / "empty")
+    args.ocr_out_dir.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(SystemExit, match="No OCR document folders found"):
+        cli._run_export_facts(args)
 
 
 def test_run_text_only_enabled_by_default(monkeypatch):
@@ -653,18 +813,9 @@ def test_final_doc_dir_avoids_collision_on_different_sha(monkeypatch, tmp_path: 
     pdf_parent.mkdir()
     pdf_path = pdf_parent / "paper.pdf"
     pdf_path.write_bytes(b"pdf")
-    bibliography = {"authors": ["Doe, Jane"], "year": "2024", "title": "T"}
-
-    group_dir = args.out_dir / "in"
-    candidate = group_dir / "Doe_Jane_2024"
-    (candidate / "metadata").mkdir(parents=True)
-    (candidate / "metadata" / "manifest.json").write_text(json.dumps({"sha256": "different"}))
-
     monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
-
-    out = cli._final_doc_dir(args, pdf_path, bibliography)
-
-    assert out.name == "Doe_Jane_2024_abc123def456"
+    out = cli._final_doc_dir(args, pdf_path, {"authors": ["Doe, Jane"], "year": "2024", "title": "T"})
+    assert out.name == "doc_abc123def456"
 
 
 def test_final_doc_dir_avoids_non_manifest_existing_folder(monkeypatch, tmp_path: Path):
@@ -673,18 +824,154 @@ def test_final_doc_dir_avoids_non_manifest_existing_folder(monkeypatch, tmp_path
     pdf_parent.mkdir()
     pdf_path = pdf_parent / "paper.pdf"
     pdf_path.write_bytes(b"pdf")
-    bibliography = {"authors": ["Doe, Jane"], "year": "2024", "title": "T"}
-
     group_dir = args.out_dir / "in"
-    candidate = group_dir / "Doe_Jane_2024"
+    candidate = group_dir / "doc_abc123def456"
     candidate.mkdir(parents=True)
     (candidate / "orphan.txt").write_text("orphan")
 
     monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
 
-    out = cli._final_doc_dir(args, pdf_path, bibliography)
+    out = cli._final_doc_dir(args, pdf_path, {"authors": ["Doe, Jane"], "year": "2024", "title": "T"})
+    assert out.name == "doc_abc123def456"
 
-    assert out.name == "Doe_Jane_2024_abc123def456"
+
+def test_process_pdf_skips_when_manifest_sha_matches(monkeypatch, tmp_path: Path):
+    in_dir = tmp_path / "in"
+    in_dir.mkdir()
+    pdf_path = in_dir / "paper.pdf"
+    pdf_path.write_bytes(b"pdf")
+    out_dir = tmp_path / "out"
+    args = argparse.Namespace(
+        out_dir=out_dir,
+        workers=1,
+        model="m",
+        base_url="https://example.com/v1/openai",
+        max_tokens=32,
+        force=False,
+        mode="auto",
+        debug=False,
+        scan_preprocess=False,
+        text_only=False,
+        metadata_model="meta",
+    )
+    monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
+    doc_dir = out_dir / "in" / "doc_abc123def456"
+    (doc_dir / "metadata").mkdir(parents=True)
+    (doc_dir / "metadata" / "manifest.json").write_text(
+        json.dumps({"sha256": "abc123def456zzz", "page_count": 7, "bibliography": {"title": "T"}})
+    )
+    (doc_dir / "metadata" / "discovery.json").write_text(json.dumps({"paper_summary": "x", "key_topics": [], "sections": []}))
+    monkeypatch.setattr(cli.fitz, "open", lambda p: (_ for _ in ()).throw(AssertionError("fitz.open should not run on skip")))
+    result = asyncio.run(cli._process_pdf(args, pdf_path))
+    assert result["status"] == "skipped"
+    assert result["page_count"] == 7
+    assert Path(result["doc_dir"]).name == "doc_abc123def456"
+
+
+def test_run_raises_when_any_doc_failed(monkeypatch, tmp_path: Path):
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    in_dir.mkdir(parents=True)
+    pdf_a = in_dir / "a.pdf"
+    pdf_b = in_dir / "b.pdf"
+    pdf_a.write_bytes(b"a")
+    pdf_b.write_bytes(b"b")
+    args = argparse.Namespace(in_dir=in_dir, out_dir=out_dir)
+    monkeypatch.setattr(cli, "discover_pdfs", lambda p: [pdf_a, pdf_b])
+
+    async def _fake_process(_args, pdf):  # noqa: ANN001
+        return {
+            "group_dir": str(out_dir / "in"),
+            "doc_dir": str(out_dir / "in" / pdf.stem),
+            "folder_name": pdf.stem,
+            "consolidated_markdown": "document.md",
+            "page_count": 1,
+            "bibliography": {},
+            "discovery": {},
+            "status": "failed" if pdf.name == "a.pdf" else "ok",
+            "strict_failure": pdf.name == "a.pdf",
+            "errors": ["strict"] if pdf.name == "a.pdf" else [],
+        }
+
+    monkeypatch.setattr(cli, "_process_pdf", _fake_process)
+    monkeypatch.setattr(cli, "_write_group_readmes", lambda records: None)
+    with pytest.raises(SystemExit, match="failed_docs"):
+        asyncio.run(cli._run(args))
+
+
+def test_run_export_structured_data_raises_when_strict_doc_fails(monkeypatch, tmp_path: Path):
+    root = tmp_path / "out"
+    doc_dir = root / "group" / "doc_abc"
+    (doc_dir / "pages").mkdir(parents=True)
+    (doc_dir / "metadata").mkdir(parents=True)
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    manifest_path.write_text(json.dumps({"doc_id": "abc"}))
+
+    def _fake_build(**kwargs):  # noqa: ANN001
+        raise RuntimeError("Strict table artifact mode failed: boom")
+
+    monkeypatch.setattr(cli, "build_structured_exports", _fake_build)
+    args = argparse.Namespace(
+        ocr_out_dir=root,
+        deplot_command="",
+        deplot_timeout=30,
+        table_source="marker-first",
+        table_ocr_merge=True,
+        table_ocr_merge_scope="header",
+        table_header_ocr_auto=False,
+        table_header_ocr_model="m",
+        table_header_ocr_max_tokens=500,
+        table_artifact_mode="strict",
+        ocr_html_dir=None,
+        table_quality_gate=True,
+        table_escalation="auto",
+        table_escalation_max=20,
+        table_qa_mode="warn",
+        compare_ocr_html=False,
+    )
+    with pytest.raises(SystemExit, match="failed_docs"):
+        cli._run_export_structured_data(args)
+
+
+def test_ensure_header_ocr_artifacts_generates_only_missing(monkeypatch, tmp_path: Path):
+    doc_dir = tmp_path / "doc"
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    table_rows = [
+        {"page": 1, "bbox": [10, 10, 100, 100]},
+        {"page": 1, "bbox": [110, 10, 200, 100]},
+    ]
+    (marker_root / "tables_raw.jsonl").write_text("\n".join(json.dumps(r) for r in table_rows) + "\n")
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    src_pdf = tmp_path / "source.pdf"
+    with fitz.open() as out:
+        out.new_page(width=300, height=300)
+        out.save(src_pdf)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps({"source_path": str(src_pdf)}))
+    qa_out = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    qa_out.mkdir(parents=True, exist_ok=True)
+    (qa_out / "table_01_page_0001.md").write_text("<table></table>")
+
+    class _Resp:
+        content = "<table><tr><th>A</th></tr></table>"
+
+    async def _fake_ocr(**kwargs):  # noqa: ANN001
+        return _Resp()
+
+    monkeypatch.setattr(cli, "call_olmocr", _fake_ocr)
+    summary = asyncio.run(
+        cli._ensure_header_ocr_artifacts(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            model="m",
+            max_tokens=100,
+        )
+    )
+    assert summary["expected"] == 2
+    assert summary["generated"] == 1
+    assert summary["skipped_existing"] == 1
+    assert summary["failed"] == 0
 
 
 def test_process_page_structured_success_skips_fallback(monkeypatch, tmp_path: Path):
@@ -776,3 +1063,43 @@ def test_process_page_structured_failure_uses_fallback(monkeypatch, tmp_path: Pa
 
     assert result["status"] == "structured_fallback"
     assert result["structured"]["fallback_reason"] == "marker unavailable"
+
+
+def test_extract_discovery_can_return_sections_without_grobid(monkeypatch):
+    class _Resp:
+        def __init__(self, content: str):
+            self.content = content
+            self.reasoning_content = ""
+
+    calls: list[str] = []
+
+    async def _fake_text_model(**kwargs):  # noqa: ANN001
+        prompt = str(kwargs.get("prompt", ""))
+        calls.append(prompt)
+        if "extract the paper abstract" in prompt.lower():
+            return _Resp('{"abstract":"A study of rheology.","key_topics":["rheology"]}')
+        if "one chunk of a paper markdown transcript" in prompt:
+            return _Resp(
+                '{"chunk_summary":"chunk","key_topics":["rheology"],"sections":[{"title":"Methods","start_page":2,"end_page":4,"summary":"m"}]}'
+            )
+        if "combining chunk-level paper discovery data" in prompt:
+            return _Resp(
+                '{"paper_summary":"A study of rheology.","key_topics":["rheology"],"sections":[{"title":"Methods","start_page":2,"end_page":4,"summary":"m"}]}'
+            )
+        return _Resp("{}")
+
+    monkeypatch.setattr(cli, "call_text_model", _fake_text_model)
+
+    out = asyncio.run(
+        cli._extract_discovery(
+            client=object(),  # type: ignore[arg-type]
+            metadata_model="m",
+            bibliography={"title": "T", "citation": "C"},
+            page_count=10,
+            consolidated_markdown="# Page 1\nAbstract\n\n# Page 2\nMethods\n",
+        )
+    )
+
+    assert out["paper_summary"]
+    assert out["sections"]
+    assert any("one chunk of a paper markdown transcript" in p for p in calls)

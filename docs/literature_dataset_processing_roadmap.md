@@ -119,10 +119,10 @@ Deliverables:
 - Reproducible reruns with stable output contracts
 
 ## Immediate Next Steps
-1. Create `property_record` schema and add schema validation utilities.
-2. Implement first-pass table-to-fact mapper using current extracted table artifacts.
+1. Expand `property_record` normalization and controlled vocab coverage beyond first-pass rules.
+2. Improve figure-to-fact extraction quality from deplot outputs.
 3. Add benchmark dataset scaffolding and evaluation script.
-4. Add manifest links to generated dataset records per document.
+4. Tighten schema validation to strict JSON Schema runtime enforcement in CI.
 
 ## Notes on Service-Oriented Execution
 The pipeline now supports remote structured services via URLs (`--marker-url`, `--grobid-url`).

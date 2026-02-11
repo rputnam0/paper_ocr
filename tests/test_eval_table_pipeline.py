@@ -31,3 +31,70 @@ def test_evaluate_table_pipeline_basic_metrics(tmp_path: Path):
     assert metrics["pred_table_count"] == 2
     assert 0.0 <= metrics["table_detection_recall"] <= 1.0
     assert 0.0 <= metrics["table_detection_precision"] <= 1.0
+    assert 0.0 <= metrics["row_count_match_rate"] <= 1.0
+    assert 0.0 <= metrics["column_count_match_rate"] <= 1.0
+    assert 0.0 <= metrics["key_cell_accuracy"] <= 1.0
+    assert 0.0 <= metrics["numeric_parse_success"] <= 1.0
+    assert metrics["numeric_cell_count"] >= 0
+
+
+def test_evaluate_table_pipeline_value_metrics(tmp_path: Path):
+    gold = tmp_path / "gold"
+    pred = tmp_path / "pred"
+    _write_lines(
+        gold / "tables.jsonl",
+        [
+            {
+                "table_id": "t1",
+                "page": 1,
+                "headers": ["name", "value"],
+                "rows": [["A", "1.2"], ["B", "2.4"]],
+            }
+        ],
+    )
+    _write_lines(
+        pred / "tables.jsonl",
+        [
+            {
+                "table_id": "t1",
+                "page": 1,
+                "headers": ["name", "value"],
+                "rows": [["A", "1.2"], ["B", "oops"]],
+            }
+        ],
+    )
+    metrics = evaluate_table_pipeline(gold, pred)
+    assert metrics["row_count_match_rate"] == 1.0
+    assert metrics["column_count_match_rate"] == 1.0
+    assert 0.0 < metrics["key_cell_accuracy"] < 1.0
+    assert 0.0 < metrics["numeric_parse_success"] < 1.0
+
+
+def test_evaluate_table_pipeline_no_numeric_cells_sets_success_to_one(tmp_path: Path):
+    gold = tmp_path / "gold"
+    pred = tmp_path / "pred"
+    _write_lines(
+        gold / "tables.jsonl",
+        [
+            {
+                "table_id": "t1",
+                "page": 1,
+                "headers": ["name", "status"],
+                "rows": [["A", "ok"]],
+            }
+        ],
+    )
+    _write_lines(
+        pred / "tables.jsonl",
+        [
+            {
+                "table_id": "t1",
+                "page": 1,
+                "headers": ["name", "status"],
+                "rows": [["A", "ok"]],
+            }
+        ],
+    )
+    metrics = evaluate_table_pipeline(gold, pred)
+    assert metrics["numeric_cell_count"] == 0
+    assert metrics["numeric_parse_success"] == 1.0
