@@ -138,6 +138,20 @@ def test_parse_export_structured_data_args(monkeypatch):
     assert args.deplot_timeout == 45
 
 
+def test_parse_export_facts_args(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "export-facts",
+            "out",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "export-facts"
+    assert args.ocr_out_dir == Path("out")
+
+
 def test_parse_run_table_pipeline_defaults(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -447,6 +461,13 @@ def test_run_export_structured_data_requires_docs(tmp_path: Path):
     args.ocr_out_dir.mkdir(parents=True, exist_ok=True)
     with pytest.raises(SystemExit, match="No OCR document folders found"):
         cli._run_export_structured_data(args)
+
+
+def test_run_export_facts_requires_docs(tmp_path: Path):
+    args = argparse.Namespace(ocr_out_dir=tmp_path / "empty")
+    args.ocr_out_dir.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(SystemExit, match="No OCR document folders found"):
+        cli._run_export_facts(args)
 
 
 def test_run_text_only_enabled_by_default(monkeypatch):

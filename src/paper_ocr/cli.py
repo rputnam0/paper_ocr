@@ -36,7 +36,8 @@ from .discoverability import (
     render_group_readme,
     split_markdown_for_discovery,
 )
-from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_dir_name, output_group_name
+from .facts import export_facts_for_doc
+from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_group_name
 from .inspect import compute_text_heuristics, decide_route, is_text_only_candidate
 from .postprocess import parse_yaml_front_matter
 from .render import render_page
@@ -337,6 +338,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional directory containing OCR HTML tables (default: metadata/assets/structured/qa/bbox_ocr_outputs).",
     )
+
+    export_facts = sub.add_parser(
+        "export-facts",
+        help="Export normalized property records from structured table/figure artifacts.",
+    )
+    export_facts.add_argument("ocr_out_dir", type=Path)
 
     eval_tables = sub.add_parser(
         "eval-table-pipeline",
@@ -1715,6 +1722,26 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
     return totals
 
 
+def _run_export_facts(args: argparse.Namespace) -> dict[str, int]:
+    if not args.ocr_out_dir.exists():
+        raise SystemExit(f"OCR output directory does not exist: {args.ocr_out_dir}")
+    docs = _discover_ocr_doc_dirs(args.ocr_out_dir)
+    if not docs:
+        raise SystemExit(f"No OCR document folders found under: {args.ocr_out_dir}")
+
+    totals = {
+        "docs_processed": 0,
+        "record_count": 0,
+    }
+    for doc_dir in docs:
+        summary = export_facts_for_doc(doc_dir)
+        totals["docs_processed"] += 1
+        totals["record_count"] += int(summary.get("record_count", 0) or 0)
+        print(f"[facts-export] doc={doc_dir} records={summary.get('record_count', 0)}")
+    print(f"[facts-export] done docs={totals['docs_processed']} records={totals['record_count']}")
+    return totals
+
+
 def _run_eval_table_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     metrics = evaluate_table_pipeline(args.gold_dir, args.pred_dir)
     baseline_path = getattr(args, "baseline", None)
@@ -1777,6 +1804,8 @@ def main() -> None:
         asyncio.run(_run_fetch_telegram(args))
     elif args.command == "export-structured-data":
         _run_export_structured_data(args)
+    elif args.command == "export-facts":
+        _run_export_facts(args)
     elif args.command == "data-audit":
         _run_data_audit(args)
     elif args.command == "eval-table-pipeline":

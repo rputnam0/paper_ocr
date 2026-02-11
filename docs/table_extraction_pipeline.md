@@ -106,6 +106,10 @@ Default fail thresholds:
 - `column_instability_ratio > 0.20`
 
 Escalation (`--table-escalation auto`) applies only to failing fragments up to `--table-escalation-max`.
+Escalation QA flags:
+- `escalation_missing_ocr`
+- `escalation_no_improvement`
+- `escalation_applied`
 
 ## Output Artifacts
 
