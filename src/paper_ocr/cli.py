@@ -36,6 +36,7 @@ from .discoverability import (
     render_group_readme,
     split_markdown_for_discovery,
 )
+from .doi_resolution import DoiResolutionConfig, resolve_dois
 from .facts import export_facts_for_doc
 from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_group_name
 from .inspect import compute_text_heuristics, decide_route, is_text_only_candidate
@@ -252,8 +253,49 @@ def _parse_args() -> argparse.Namespace:
     fetch.add_argument("--response-timeout", type=int, default=RESPONSE_TIMEOUT_DEFAULT)
     fetch.add_argument("--search-timeout", type=int, default=SEARCH_TIMEOUT_DEFAULT)
     fetch.add_argument("--debug", action="store_true")
+    fetch.add_argument(
+        "--resolve-dois",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resolve/canonicalize DOI rows before Telegram fetch (default: enabled).",
+    )
+    fetch.add_argument("--url-column", type=str, default=None)
+    fetch.add_argument("--title-column", type=str, default=None)
+    fetch.add_argument("--author-column", type=str, default=None)
+    fetch.add_argument("--year-column", type=str, default=None)
+    fetch.add_argument("--container-column", type=str, default=None)
+    fetch.add_argument("--crossref-mailto", type=str, default=os.getenv("CROSSREF_MAILTO", ""))
+    fetch.add_argument("--resolve-rows", type=int, default=5)
+    fetch.add_argument("--resolve-timeout", type=int, default=20)
+    fetch.add_argument("--resolve-max-retries", type=int, default=3)
+    fetch.add_argument(
+        "--resolve-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    fetch.add_argument(
+        "--resolve-refresh-cache",
+        action="store_true",
+        default=False,
+    )
     fetch.add_argument("--report-file", type=Path, default=None)
     fetch.add_argument("--failed-file", type=Path, default=None)
+
+    resolve = sub.add_parser("resolve-dois", help="Resolve/canonicalize DOI rows from mixed bibliographic CSV")
+    resolve.add_argument("input_csv", type=Path)
+    resolve.add_argument("output_root", type=Path, nargs="?", default=Path("data/jobs"))
+    resolve.add_argument("--doi-column", type=str, default=None)
+    resolve.add_argument("--url-column", type=str, default=None)
+    resolve.add_argument("--title-column", type=str, default=None)
+    resolve.add_argument("--author-column", type=str, default=None)
+    resolve.add_argument("--year-column", type=str, default=None)
+    resolve.add_argument("--container-column", type=str, default=None)
+    resolve.add_argument("--crossref-mailto", type=str, default=os.getenv("CROSSREF_MAILTO", ""))
+    resolve.add_argument("--rows", type=int, default=5)
+    resolve.add_argument("--timeout", type=int, default=20)
+    resolve.add_argument("--max-retries", type=int, default=3)
+    resolve.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
+    resolve.add_argument("--refresh-cache", action="store_true", default=False)
 
     export = sub.add_parser(
         "export-structured-data",
@@ -1544,15 +1586,56 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
     job_dir = _resolve_fetch_job_dir(args.output_root, csv_name)
     pdf_dir = job_dir / "pdfs"
     reports_dir = job_dir / "reports"
+    doi_resolution_dir = reports_dir / "doi_resolution"
     pdf_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
+    doi_resolution_dir.mkdir(parents=True, exist_ok=True)
+
+    doi_csv = args.doi_csv
+    doi_column = args.doi_column
+    if bool(getattr(args, "resolve_dois", True)):
+        resolve_paths = resolve_dois(
+            DoiResolutionConfig(
+                input_csv=args.doi_csv,
+                output_dir=doi_resolution_dir,
+                doi_column=getattr(args, "doi_column", None),
+                url_column=getattr(args, "url_column", None),
+                title_column=getattr(args, "title_column", None),
+                author_column=getattr(args, "author_column", None),
+                year_column=getattr(args, "year_column", None),
+                container_column=getattr(args, "container_column", None),
+                crossref_mailto=str(getattr(args, "crossref_mailto", "") or ""),
+                rows=int(getattr(args, "resolve_rows", 5)),
+                timeout=int(getattr(args, "resolve_timeout", 20)),
+                max_retries=int(getattr(args, "resolve_max_retries", 3)),
+                use_cache=bool(getattr(args, "resolve_cache", True)),
+                refresh_cache=bool(getattr(args, "resolve_refresh_cache", False)),
+            )
+        )
+        doi_csv = Path(str(resolve_paths["fetch_ready_csv"]))
+        doi_column = "DOI"
+        try:
+            summary_payload = json.loads(Path(str(resolve_paths["summary_json"])).read_text())
+        except Exception:
+            summary_payload = {}
+        skipped = {
+            key: value
+            for key, value in dict(summary_payload.get("status_counts", {})).items()
+            if key not in {"canonicalized_crossref", "canonicalized_non_crossref", "inferred_crossref"}
+        }
+        print(
+            "[fetch-telegram] doi preflight complete "
+            f"fetch_ready_csv={doi_csv} "
+            f"skipped_status_counts={skipped} "
+            f"report_dir={doi_resolution_dir}"
+        )
 
     config = FetchTelegramConfig(
         api_id=api_id,
         api_hash=api_hash,
-        doi_csv=args.doi_csv,
+        doi_csv=doi_csv,
         in_dir=pdf_dir,
-        doi_column=args.doi_column,
+        doi_column=doi_column,
         target_bot=args.target_bot,
         session_name=args.session_name,
         min_delay=args.min_delay,
@@ -1564,6 +1647,36 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         debug=args.debug,
     )
     await fetch_from_telegram(config)
+
+
+def _run_resolve_dois(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.input_csv.exists():
+        raise SystemExit(f"Input CSV does not exist: {args.input_csv}")
+    csv_name = _job_slug_from_csv_stem(args.input_csv.stem)
+    job_dir = _resolve_fetch_job_dir(args.output_root, csv_name)
+    out_dir = job_dir / "reports" / "doi_resolution"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = resolve_dois(
+        DoiResolutionConfig(
+            input_csv=args.input_csv,
+            output_dir=out_dir,
+            doi_column=getattr(args, "doi_column", None),
+            url_column=getattr(args, "url_column", None),
+            title_column=getattr(args, "title_column", None),
+            author_column=getattr(args, "author_column", None),
+            year_column=getattr(args, "year_column", None),
+            container_column=getattr(args, "container_column", None),
+            crossref_mailto=str(getattr(args, "crossref_mailto", "") or ""),
+            rows=int(getattr(args, "rows", 5)),
+            timeout=int(getattr(args, "timeout", 20)),
+            max_retries=int(getattr(args, "max_retries", 3)),
+            use_cache=bool(getattr(args, "cache", True)),
+            refresh_cache=bool(getattr(args, "refresh_cache", False)),
+        )
+    )
+    print(f"[resolve-dois] wrote artifacts to {out_dir}")
+    return paths
 
 
 def _discover_ocr_doc_dirs(ocr_out_dir: Path) -> list[Path]:
@@ -1805,6 +1918,8 @@ def main() -> None:
         asyncio.run(_run(args))
     elif args.command == "fetch-telegram":
         asyncio.run(_run_fetch_telegram(args))
+    elif args.command == "resolve-dois":
+        _run_resolve_dois(args)
     elif args.command == "export-structured-data":
         _run_export_structured_data(args)
     elif args.command == "export-facts":

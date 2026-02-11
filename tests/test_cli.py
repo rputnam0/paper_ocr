@@ -44,6 +44,24 @@ async def _fake_fetch_from_telegram(config):
     return []
 
 
+def _fake_resolve_dois(config):
+    _fake_resolve_dois.last_config = config
+    out_dir = config.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fetch_ready = out_dir / "fetch_ready_dois.csv"
+    fetch_ready.write_text("DOI\n10.1000/abc\n")
+    summary_json = out_dir / "summary.json"
+    summary_json.write_text('{"status_counts":{"needs_review":1}}')
+    return {
+        "resolved_csv": str(out_dir / "resolved.csv"),
+        "fetch_ready_csv": str(fetch_ready),
+        "candidates_jsonl": str(out_dir / "candidates.jsonl"),
+        "crossref_raw_jsonl": str(out_dir / "crossref_raw.jsonl"),
+        "summary_json": str(summary_json),
+        "cache_json": str(out_dir / "cache.json"),
+    }
+
+
 def test_process_pdf_uses_cached_page_count_after_close(monkeypatch, tmp_path: Path):
     in_dir = tmp_path / "in"
     in_dir.mkdir()
@@ -116,6 +134,44 @@ def test_parse_fetch_telegram_defaults(monkeypatch):
     assert args.max_delay == 8.0
     assert args.response_timeout == 15
     assert args.search_timeout == 40
+    assert args.resolve_dois is True
+    assert args.resolve_rows == 5
+    assert args.resolve_timeout == 20
+    assert args.resolve_max_retries == 3
+    assert args.resolve_cache is True
+    assert args.resolve_refresh_cache is False
+
+
+def test_parse_resolve_dois_args(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "resolve-dois",
+            "input/papers.csv",
+            "data/jobs",
+            "--rows",
+            "7",
+            "--timeout",
+            "33",
+            "--max-retries",
+            "4",
+            "--no-cache",
+            "--refresh-cache",
+            "--crossref-mailto",
+            "bot@example.com",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "resolve-dois"
+    assert args.input_csv == Path("input/papers.csv")
+    assert args.output_root == Path("data/jobs")
+    assert args.rows == 7
+    assert args.timeout == 33
+    assert args.max_retries == 4
+    assert args.cache is False
+    assert args.refresh_cache is True
+    assert args.crossref_mailto == "bot@example.com"
 
 
 def test_parse_export_structured_data_args(monkeypatch):
@@ -646,6 +702,18 @@ def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=True,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -670,6 +738,18 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -697,6 +777,18 @@ def test_fetch_telegram_normalizes_job_slug(monkeypatch, tmp_path: Path):
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -724,6 +816,18 @@ def test_fetch_telegram_migrates_legacy_default_job_dir(monkeypatch, tmp_path: P
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
     legacy_job = tmp_path / "data" / "telegram_jobs" / "papers"
@@ -757,6 +861,18 @@ def test_fetch_telegram_keeps_input_csv_outside_job_folder(monkeypatch, tmp_path
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
     )
     monkeypatch.setenv("TG_API_ID", "123")
     monkeypatch.setenv("TG_API_HASH", "abc")
@@ -781,6 +897,18 @@ def test_fetch_telegram_does_not_create_ocr_out_subdir(monkeypatch, tmp_path: Pa
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
     monkeypatch.setenv("TG_API_ID", "123")
@@ -790,6 +918,45 @@ def test_fetch_telegram_does_not_create_ocr_out_subdir(monkeypatch, tmp_path: Pa
     asyncio.run(cli._run_fetch_telegram(args))
     assert not (tmp_path / "jobs" / "papers" / "ocr_out").exists()
     assert not (tmp_path / "jobs" / "papers" / "input").exists()
+
+
+def test_fetch_telegram_auto_resolve_rewrites_input_csv(monkeypatch, tmp_path: Path):
+    args = argparse.Namespace(
+        doi_csv=tmp_path / "papers.csv",
+        output_root=tmp_path / "jobs",
+        doi_column="DOI",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+        resolve_dois=True,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="bot@example.com",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+    )
+    args.doi_csv.write_text("doi,url_landing\n,https://doi.org/10.1000/abc\n")
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "resolve_dois", _fake_resolve_dois)
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+
+    assert _fake_fetch_from_telegram.last_config.doi_csv.name == "fetch_ready_dois.csv"
+    assert _fake_resolve_dois.last_config.input_csv == args.doi_csv
 
 
 def test_run_rejects_output_under_jobs_folder(tmp_path: Path):
