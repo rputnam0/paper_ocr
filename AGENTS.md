@@ -5,6 +5,9 @@
   - Install deps: `uv sync`
   - Run CLI: `uv run paper-ocr run <in_dir> <out_dir>`
   - Run tests: `uv run pytest`
+- Use the WSL-hosted structured services for all processing work by default.
+  - Access services through SSH alias `wsl`.
+  - Do not run local Marker CLI extraction unless explicitly requested by the user.
 - Make **frequent git commits** after meaningful additions to the codebase.
 - Use **test-driven development** for new features.
   - Write tests first, then implement.
@@ -18,8 +21,8 @@ Key behaviors:
 - Renders pages to images with the **longest dimension capped at 1288 px**.
 - Parses YAML front matter from model output and writes markdown + metadata per page.
 - Extracts bibliographic metadata from first-page markdown using `nvidia/Nemotron-3-Nano-30B-A3B` by default.
-- Names each output document folder from extracted author/year metadata.
-- Names each consolidated markdown file from extracted paper title.
+- Names each output document folder as `doc_<doc_id>` (deterministic from source hash).
+- Uses a stable consolidated markdown filename: `document.md`.
 - Extracts discovery metadata (`paper_summary`, `key_topics`) from the first few pages (abstract-first).
 - Writes group-level paper index README files for fast folder-level discoverability.
 - Produces a full output bundle per PDF, including manifest, debug artifacts, and assembled document files.
@@ -52,8 +55,8 @@ For each PDF:
 ```
 out/<input_parent>/
   README.md
-out/<input_parent>/<author_year>/
-  <paper_title>.md
+out/<input_parent>/doc_<doc_id>/
+  document.md
   pages/
     0001.md
     0002.md
@@ -112,7 +115,8 @@ Validation command:
 - Do not write final `paper-ocr run` outputs under `data/jobs`; use `out/<...>`.
 
 ## Remote Service Guidance (Marker/GROBID)
-- Prefer service URLs for heavy structured extraction when running from low-resource clients.
+- All structured extraction must use WSL-hosted services via SSH access to `wsl`.
+- Treat local CLI extraction as fallback only when the user explicitly requests it.
 - `paper-ocr run` supports both:
   - Marker CLI mode: `--marker-command ...`
   - Marker service mode: `--marker-url <base_url>`
@@ -123,7 +127,17 @@ Validation command:
 - Service health checks before long runs:
   - Marker: `GET <marker_url>/openapi.json`
   - GROBID: `GET <grobid_url>/api/isalive`
-- If services are remote, agents may use SSH local forwarding to bind remote service ports to localhost, then pass localhost URLs to CLI options/env vars.
+- Agents must use SSH local forwarding through `wsl` and then pass localhost URLs to CLI options/env vars.
+  - Example tunnel:
+    - `ssh -N -L 8008:127.0.0.1:8008 -L 8070:127.0.0.1:8070 wsl`
+  - Example env:
+    - `export PAPER_OCR_MARKER_URL=http://127.0.0.1:8008`
+    - `export PAPER_OCR_GROBID_URL=http://127.0.0.1:8070`
+  - Example preflight checks:
+    - `curl -fsS http://127.0.0.1:8008/openapi.json >/dev/null`
+    - `curl -fsS http://127.0.0.1:8070/api/isalive`
+  - Example run:
+    - `uv run paper-ocr run <in_dir> <out_dir> --marker-url http://127.0.0.1:8008 --grobid-url http://127.0.0.1:8070`
 - Marker OCR must remain disabled by default; do not remove no-OCR safeguards in structured extraction path.
 
 ## Table Pipeline Guardrails
