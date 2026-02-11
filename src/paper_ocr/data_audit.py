@@ -7,7 +7,7 @@ import re
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_TOP_LEVEL_DIRS = {"corpora", "jobs", "cache", "archive", "tmp"}
 ALLOWED_TOP_LEVEL_FILES = {"README.md"}
-REQUIRED_JOB_SUBDIRS = ("input", "pdfs", "reports")
+REQUIRED_JOB_SUBDIRS = ("pdfs", "reports")
 ALLOWED_JOB_SUBDIRS = {"input", "pdfs", "reports", "ocr_out", "logs"}
 ALLOWED_CORPUS_SUBDIRS = {"source_pdfs", "metadata", "notes"}
 
@@ -171,6 +171,24 @@ def run_data_audit(data_dir: Path) -> AuditReport:
                             severity="warning",
                         )
                     )
+                if child.is_dir() and child.name == "input":
+                    issues.append(
+                        AuditIssue(
+                            code="deprecated_job_subdir",
+                            path=_rel(child, root),
+                            message="Job-level 'input/' is deprecated. Store CSV inputs under input/ at repo root.",
+                            severity="warning",
+                        )
+                    )
+                if child.is_dir() and child.name == "ocr_out":
+                    issues.append(
+                        AuditIssue(
+                            code="deprecated_job_subdir",
+                            path=_rel(child, root),
+                            message="Job-level 'ocr_out/' is deprecated. Write final OCR outputs under out/.",
+                            severity="warning",
+                        )
+                    )
 
     for candidate in root.rglob("*"):
         if candidate.is_file() and candidate.suffix.lower() == ".pdf":
@@ -202,6 +220,15 @@ def run_data_audit(data_dir: Path) -> AuditReport:
                             code="misplaced_pdf",
                             path=_rel(candidate, root),
                             message="Job PDF must live under jobs/<slug>/pdfs/ or jobs/<slug>/ocr_out/.",
+                        )
+                    )
+                elif rel_parts[2] == "ocr_out":
+                    issues.append(
+                        AuditIssue(
+                            code="deprecated_job_ocr_out_pdf",
+                            path=_rel(candidate, root),
+                            message="PDF under jobs/<slug>/ocr_out/ is deprecated; final outputs belong in out/.",
+                            severity="warning",
                         )
                     )
             elif top_level not in {"archive", "cache", "tmp"}:

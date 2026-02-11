@@ -7,11 +7,13 @@ import json
 import os
 import re
 import shutil
+from io import BytesIO
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import fitz
+from PIL import Image
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -39,7 +41,7 @@ from .postprocess import parse_yaml_front_matter
 from .render import render_page
 from .schemas import new_manifest
 from .store import ensure_dirs, write_json, write_text
-from .structured_data import build_structured_exports
+from .structured_data import build_structured_exports, compare_marker_tables_with_ocr_html
 from .structured_extract import (
     build_render_contract,
     grobid_coords_to_px,
@@ -65,6 +67,8 @@ MARKER_URL_DEFAULT = ""
 MARKER_TIMEOUT_DEFAULT = "120"
 GROBID_TIMEOUT_DEFAULT = "60"
 DEPLOT_TIMEOUT_DEFAULT = "90"
+TABLE_HEADER_OCR_MODEL_DEFAULT = "allenai/olmOCR-2-7B-1025"
+TABLE_HEADER_OCR_MAX_TOKENS_DEFAULT = 1400
 DEFAULT_FETCH_OUTPUT_ROOT = Path("data/jobs")
 LEGACY_FETCH_OUTPUT_ROOT = Path("data/telegram_jobs")
 
@@ -173,6 +177,34 @@ def _parse_args() -> argparse.Namespace:
         default="marker-first",
     )
     run.add_argument(
+        "--table-ocr-merge",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Deterministically merge OCR HTML table cells into Marker tables to recover symbols/formatting.",
+    )
+    run.add_argument(
+        "--table-ocr-merge-scope",
+        choices=["header", "full"],
+        default="header",
+        help="Merge OCR data into table headers only (default) or full table grid.",
+    )
+    run.add_argument(
+        "--table-header-ocr-auto",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-generate missing table header OCR artifacts before merge.",
+    )
+    run.add_argument(
+        "--table-header-ocr-model",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_HEADER_OCR_MODEL", TABLE_HEADER_OCR_MODEL_DEFAULT),
+    )
+    run.add_argument(
+        "--table-header-ocr-max-tokens",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_HEADER_OCR_MAX_TOKENS", str(TABLE_HEADER_OCR_MAX_TOKENS_DEFAULT))),
+    )
+    run.add_argument(
         "--table-quality-gate",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -187,6 +219,24 @@ def _parse_args() -> argparse.Namespace:
         "--table-qa-mode",
         choices=["off", "warn", "strict"],
         default="warn",
+    )
+    run.add_argument(
+        "--table-artifact-mode",
+        choices=["permissive", "strict"],
+        default="permissive",
+        help="Artifact gating policy for large runs; strict fails documents when required table artifacts are missing.",
+    )
+    run.add_argument(
+        "--compare-ocr-html",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compare Marker-extracted tables against OCR HTML table outputs in structured QA artifacts.",
+    )
+    run.add_argument(
+        "--ocr-html-dir",
+        type=Path,
+        default=None,
+        help="Optional directory containing OCR HTML tables (default: metadata/assets/structured/qa/bbox_ocr_outputs).",
     )
 
     fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")
@@ -225,6 +275,34 @@ def _parse_args() -> argparse.Namespace:
         default="marker-first",
     )
     export.add_argument(
+        "--table-ocr-merge",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Deterministically merge OCR HTML table cells into Marker tables to recover symbols/formatting.",
+    )
+    export.add_argument(
+        "--table-ocr-merge-scope",
+        choices=["header", "full"],
+        default="header",
+        help="Merge OCR data into table headers only (default) or full table grid.",
+    )
+    export.add_argument(
+        "--table-header-ocr-auto",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-generate missing table header OCR artifacts before merge.",
+    )
+    export.add_argument(
+        "--table-header-ocr-model",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_HEADER_OCR_MODEL", TABLE_HEADER_OCR_MODEL_DEFAULT),
+    )
+    export.add_argument(
+        "--table-header-ocr-max-tokens",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_HEADER_OCR_MAX_TOKENS", str(TABLE_HEADER_OCR_MAX_TOKENS_DEFAULT))),
+    )
+    export.add_argument(
         "--table-quality-gate",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -239,6 +317,24 @@ def _parse_args() -> argparse.Namespace:
         "--table-qa-mode",
         choices=["off", "warn", "strict"],
         default="warn",
+    )
+    export.add_argument(
+        "--table-artifact-mode",
+        choices=["permissive", "strict"],
+        default="permissive",
+        help="Artifact gating policy for large runs; strict fails documents when required table artifacts are missing.",
+    )
+    export.add_argument(
+        "--compare-ocr-html",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compare Marker-extracted tables against OCR HTML table outputs in structured QA artifacts.",
+    )
+    export.add_argument(
+        "--ocr-html-dir",
+        type=Path,
+        default=None,
+        help="Optional directory containing OCR HTML tables (default: metadata/assets/structured/qa/bbox_ocr_outputs).",
     )
 
     eval_tables = sub.add_parser(
@@ -283,6 +379,134 @@ def _page_out_path(pages_dir: Path, page_index: int) -> Path:
 
 def _debug_path(debug_dir: Path, page_index: int, suffix: str) -> Path:
     return debug_dir / f"page_{page_index+1:04d}.{suffix}"
+
+
+def _bbox_from_polygons(polygons: list[list[list[float]]]) -> list[float]:
+    xs: list[float] = []
+    ys: list[float] = []
+    for poly in polygons:
+        for point in poly:
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            try:
+                xs.append(float(point[0]))
+                ys.append(float(point[1]))
+            except Exception:
+                continue
+    if not xs or not ys:
+        return []
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _load_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    for line in path.read_text().splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+async def _ensure_header_ocr_artifacts(
+    *,
+    doc_dir: Path,
+    client: AsyncOpenAI,
+    model: str,
+    max_tokens: int,
+) -> dict[str, Any]:
+    marker_tables_path = doc_dir / "metadata" / "assets" / "structured" / "marker" / "tables_raw.jsonl"
+    qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa"
+    ocr_out = qa_root / "bbox_ocr_outputs"
+    ocr_crops = qa_root / "bbox_ocr_crops"
+    ocr_out.mkdir(parents=True, exist_ok=True)
+    ocr_crops.mkdir(parents=True, exist_ok=True)
+
+    existing = sorted(ocr_out.glob("table_*_page_*.md"))
+    if existing:
+        return {"generated": 0, "skipped_existing": len(existing), "status": "already_present"}
+    if not marker_tables_path.exists():
+        return {"generated": 0, "skipped_existing": 0, "status": "missing_tables_raw"}
+
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    if not manifest_path.exists():
+        return {"generated": 0, "skipped_existing": 0, "status": "missing_manifest"}
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except Exception:
+        manifest = {}
+    source_path_raw = str(manifest.get("source_path", "")).strip()
+    if not source_path_raw:
+        return {"generated": 0, "skipped_existing": 0, "status": "missing_source_path"}
+    source_path = Path(source_path_raw)
+    if not source_path.exists():
+        return {"generated": 0, "skipped_existing": 0, "status": f"missing_source_pdf:{source_path}"}
+
+    table_rows = _load_jsonl_dicts(marker_tables_path)
+    if not table_rows:
+        return {"generated": 0, "skipped_existing": 0, "status": "empty_tables_raw"}
+
+    generated = 0
+    with fitz.open(source_path) as pdf:
+        by_page_counter: dict[int, int] = {}
+        for row in table_rows:
+            page = int(row.get("page") or 0)
+            if page < 1 or page > int(pdf.page_count):
+                continue
+            polygons = row.get("polygons")
+            bbox = row.get("bbox") if isinstance(row.get("bbox"), list) else []
+            if (not isinstance(bbox, list) or len(bbox) < 4) and isinstance(polygons, list):
+                bbox = _bbox_from_polygons(polygons)
+            if not bbox or len(bbox) < 4:
+                continue
+
+            by_page_counter[page] = by_page_counter.get(page, 0) + 1
+            ordinal = by_page_counter[page]
+            out_md = ocr_out / f"table_{ordinal:02d}_page_{page:04d}.md"
+            if out_md.exists():
+                continue
+
+            x0, y0, x1, y1 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            header_h = max(72.0, min(180.0, (y1 - y0) * 0.33))
+            clip = fitz.Rect(x0, y0, x1, min(y1, y0 + header_h))
+            page_obj = pdf.load_page(page - 1)
+            pix = page_obj.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72), clip=clip, alpha=False)
+            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            buf = BytesIO()
+            image.save(buf, format="PNG", optimize=True)
+            image_bytes = buf.getvalue()
+            (ocr_crops / f"table_{ordinal:02d}_page_{page:04d}.png").write_bytes(image_bytes)
+
+            prompt = (
+                "Extract only table header rows from this image crop as HTML table markup. "
+                "Preserve Greek letters, superscripts/subscripts, symbols, and column grouping. "
+                "Return only <table>...</table> with <th> cells."
+            )
+            try:
+                response = await call_olmocr(
+                    client=client,
+                    model=model,
+                    prompt=prompt,
+                    image_bytes=image_bytes,
+                    mime_type="image/png",
+                    max_tokens=max_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001
+                out_md.write_text(f"<!-- header_ocr_error: {exc} -->")
+                continue
+            out_md.write_text(str(response.content or "").strip())
+            generated += 1
+
+    return {"generated": generated, "skipped_existing": len(existing), "status": "ok"}
 
 
 async def _extract_bibliography(
@@ -517,6 +741,14 @@ def _is_same_path(a: Path, b: Path) -> bool:
         return a.resolve() == b.resolve()
     except Exception:  # noqa: BLE001
         return str(a) == str(b)
+
+
+def _is_path_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _resolve_fetch_job_dir(output_root: Path, csv_slug: str) -> Path:
@@ -1063,14 +1295,29 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "deplot_count": 0,
             "unresolved_figure_count": 0,
             "errors": [],
+            "header_ocr": {},
+            "ocr_merge": {},
+            "ocr_html_comparison": {},
         }
         if structured_data_enabled:
             try:
+                if bool(getattr(args, "table_ocr_merge", True)) and bool(getattr(args, "table_header_ocr_auto", True)):
+                    header_ocr = await _ensure_header_ocr_artifacts(
+                        doc_dir=doc_dir,
+                        client=client,
+                        model=str(getattr(args, "table_header_ocr_model", TABLE_HEADER_OCR_MODEL_DEFAULT)),
+                        max_tokens=int(getattr(args, "table_header_ocr_max_tokens", TABLE_HEADER_OCR_MAX_TOKENS_DEFAULT)),
+                    )
+                    structured_data_manifest["header_ocr"] = header_ocr
                 summary = build_structured_exports(
                     doc_dir=doc_dir,
                     deplot_command=deplot_command,
                     deplot_timeout=deplot_timeout,
                     table_source=str(getattr(args, "table_source", "marker-first")),
+                    table_ocr_merge=bool(getattr(args, "table_ocr_merge", True)),
+                    table_ocr_merge_scope=str(getattr(args, "table_ocr_merge_scope", "header")),
+                    table_artifact_mode=str(getattr(args, "table_artifact_mode", "permissive")),
+                    ocr_html_dir=getattr(args, "ocr_html_dir", None),
                     table_quality_gate=bool(getattr(args, "table_quality_gate", True)),
                     table_escalation=str(getattr(args, "table_escalation", "auto")),
                     table_escalation_max=int(getattr(args, "table_escalation_max", 20)),
@@ -1084,10 +1331,19 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                         "deplot_count": summary.deplot_count,
                         "unresolved_figure_count": summary.unresolved_figure_count,
                         "errors": summary.errors,
+                        "ocr_merge": summary.ocr_merge,
                     }
                 )
+                if bool(getattr(args, "compare_ocr_html", False)):
+                    ocr_html_dir = getattr(args, "ocr_html_dir", None)
+                    compare_summary = compare_marker_tables_with_ocr_html(
+                        doc_dir=doc_dir,
+                        ocr_html_dir=ocr_html_dir,
+                    )
+                    structured_data_manifest["ocr_html_comparison"] = compare_summary
             except Exception as exc:  # noqa: BLE001
                 structured_data_manifest["errors"] = [str(exc)]
+                structured_data_manifest["ocr_merge"] = {}
         manifest["structured_data_extraction"] = structured_data_manifest
         qa_flags_path = final_dirs["assets"] / "structured" / "extracted" / "qa" / "table_flags.jsonl"
         if not qa_flags_path.exists():
@@ -1136,6 +1392,11 @@ def _write_group_readmes(records: list[dict[str, Any]]) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
+    if _is_path_within(args.out_dir, DEFAULT_FETCH_OUTPUT_ROOT):
+        raise SystemExit(
+            "Refusing to write final OCR outputs under data/jobs. "
+            "Use a canonical output folder such as out/<job_slug>."
+        )
     pdfs = discover_pdfs(args.in_dir)
     if not pdfs:
         raise SystemExit(f"No PDFs found in {args.in_dir}")
@@ -1156,17 +1417,10 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
     api_id, api_hash = _require_telegram_credentials()
     csv_name = _job_slug_from_csv_stem(args.doi_csv.stem)
     job_dir = _resolve_fetch_job_dir(args.output_root, csv_name)
-    input_dir = job_dir / "input"
     pdf_dir = job_dir / "pdfs"
     reports_dir = job_dir / "reports"
-    ocr_out_dir = job_dir / "ocr_out"
-    input_dir.mkdir(parents=True, exist_ok=True)
     pdf_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    ocr_out_dir.mkdir(parents=True, exist_ok=True)
-    copied_csv = input_dir / args.doi_csv.name
-    if args.doi_csv.resolve() != copied_csv.resolve():
-        shutil.copy2(args.doi_csv, copied_csv)
 
     config = FetchTelegramConfig(
         api_id=api_id,
@@ -1246,11 +1500,32 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
             grobid_status = "unknown"
 
         try:
+            header_ocr_summary: dict[str, Any] = {}
+            if bool(getattr(args, "table_ocr_merge", True)) and bool(getattr(args, "table_header_ocr_auto", True)):
+                api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
+                if api_key:
+                    base_url = str(manifest.get("base_url", "") or "https://api.deepinfra.com/v1/openai")
+                    ocr_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+                    header_ocr_summary = asyncio.run(
+                        _ensure_header_ocr_artifacts(
+                            doc_dir=doc_dir,
+                            client=ocr_client,
+                            model=str(getattr(args, "table_header_ocr_model", TABLE_HEADER_OCR_MODEL_DEFAULT)),
+                            max_tokens=int(getattr(args, "table_header_ocr_max_tokens", TABLE_HEADER_OCR_MAX_TOKENS_DEFAULT)),
+                        )
+                    )
+                else:
+                    header_ocr_summary = {"generated": 0, "skipped_existing": 0, "status": "missing_api_key"}
+
             summary = build_structured_exports(
                 doc_dir=doc_dir,
                 deplot_command=str(getattr(args, "deplot_command", "") or ""),
                 deplot_timeout=int(getattr(args, "deplot_timeout", int(DEPLOT_TIMEOUT_DEFAULT))),
                 table_source=str(getattr(args, "table_source", "marker-first")),
+                table_ocr_merge=bool(getattr(args, "table_ocr_merge", True)),
+                table_ocr_merge_scope=str(getattr(args, "table_ocr_merge_scope", "header")),
+                table_artifact_mode=str(getattr(args, "table_artifact_mode", "permissive")),
+                ocr_html_dir=getattr(args, "ocr_html_dir", None),
                 table_quality_gate=bool(getattr(args, "table_quality_gate", True)),
                 table_escalation=str(getattr(args, "table_escalation", "auto")),
                 table_escalation_max=int(getattr(args, "table_escalation_max", 20)),
@@ -1264,7 +1539,16 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "deplot_count": summary.deplot_count,
                 "unresolved_figure_count": summary.unresolved_figure_count,
                 "errors": summary.errors,
+                "header_ocr": header_ocr_summary,
+                "ocr_merge": summary.ocr_merge,
+                "ocr_html_comparison": {},
             }
+            if bool(getattr(args, "compare_ocr_html", False)):
+                compare_summary = compare_marker_tables_with_ocr_html(
+                    doc_dir=doc_dir,
+                    ocr_html_dir=getattr(args, "ocr_html_dir", None),
+                )
+                structured_data_manifest["ocr_html_comparison"] = compare_summary
         except Exception as exc:  # noqa: BLE001
             structured_data_manifest = {
                 "enabled": True,
@@ -1273,6 +1557,9 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "deplot_count": 0,
                 "unresolved_figure_count": 0,
                 "errors": [str(exc)],
+                "header_ocr": {},
+                "ocr_merge": {},
+                "ocr_html_comparison": {},
             }
         manifest["structured_data_extraction"] = structured_data_manifest
         write_json(manifest_path, manifest)

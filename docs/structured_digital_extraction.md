@@ -171,6 +171,18 @@ CLI options:
 - `--extract-structured-data/--no-extract-structured-data`
 - `--deplot-command "<cmd with {image}>"`
 - `--deplot-timeout <sec>`
+- `--table-source marker-first|markdown-only`
+- `--table-ocr-merge/--no-table-ocr-merge`
+- `--table-ocr-merge-scope header|full` (default `header`)
+- `--table-quality-gate/--no-table-quality-gate`
+- `--table-escalation off|auto|always`
+- `--table-escalation-max <int>`
+- `--table-qa-mode off|warn|strict`
+
+Default table extraction stack:
+- Marker-first extraction (`--table-source marker-first`)
+- OCR header-only merge (`--table-ocr-merge --table-ocr-merge-scope header`)
+- Header-only merge is the default to recover symbols and notation while preserving Marker body rows.
 
 ## Recommended WSL GROBID Setup
 

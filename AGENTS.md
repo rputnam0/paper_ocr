@@ -93,11 +93,11 @@ out/<input_parent>/<author_year>/
 - When changing routing heuristics or rendering settings, update tests accordingly.
 - If adding new dependencies, update `pyproject.toml` and ensure `uv sync` remains clean.
 - Avoid committing secrets or API keys; rely on `.env` and `.gitignore`.
-- Keep generated datasets and run artifacts under `data/`, not in repository root.
+- Keep ingestion/state artifacts under `data/` and final OCR outputs under `out/`.
 
 ## Repository Folder Contracts
 - `data/corpora/<slug>/source_pdfs/`: canonical source PDFs by topic/corpus.
-- `data/jobs/<job_slug>/`: pipeline jobs with required `input/`, `pdfs/`, `reports/`; optional `ocr_out/`, `logs/`.
+- `data/jobs/<job_slug>/`: pipeline jobs with required `pdfs/`, `reports/`; optional `logs/`.
 - `data/archive/`: legacy outputs and historical runs.
 - `data/cache/`: disposable cache-only artifacts.
 - `data/tmp/`: transient scratch.
@@ -109,6 +109,7 @@ out/<input_parent>/<author_year>/
 
 Validation command:
 - `uv run paper-ocr data-audit data --strict`
+- Do not write final `paper-ocr run` outputs under `data/jobs`; use `out/<...>`.
 
 ## Remote Service Guidance (Marker/GROBID)
 - Prefer service URLs for heavy structured extraction when running from low-resource clients.
@@ -127,6 +128,7 @@ Validation command:
 
 ## Table Pipeline Guardrails
 - Keep table extraction `marker-first`; markdown table parsing is fallback only.
+- Keep OCR table merge enabled by default and scoped to headers (`--table-ocr-merge --table-ocr-merge-scope header`) to recover symbols without corrupting body rows.
 - Preserve canonical coordinate normalization (PDF-space to render-pixel transforms) before QA matching.
 - Do not compare raw GROBID coordinates directly against marker/crop pixel coordinates.
 - GROBID is a QA comparator, not a hard dependency; gate disagreement flags when GROBID parse quality is invalid.

@@ -11,7 +11,6 @@ def _mkdir(path: Path) -> Path:
 def test_data_audit_happy_path(tmp_path: Path):
     data_dir = tmp_path / "data"
     _mkdir(data_dir / "corpora" / "polymer-viscosity" / "source_pdfs")
-    _mkdir(data_dir / "jobs" / "doi-smoke" / "input")
     _mkdir(data_dir / "jobs" / "doi-smoke" / "pdfs")
     _mkdir(data_dir / "jobs" / "doi-smoke" / "reports")
     _mkdir(data_dir / "cache")
@@ -63,7 +62,6 @@ def test_data_audit_flags_corpus_and_job_contract_issues(tmp_path: Path):
 def test_data_audit_flags_misplaced_pdf(tmp_path: Path):
     data_dir = tmp_path / "data"
     _mkdir(data_dir / "corpora" / "polymer")
-    _mkdir(data_dir / "jobs" / "job-1" / "input")
     _mkdir(data_dir / "jobs" / "job-1" / "pdfs")
     _mkdir(data_dir / "jobs" / "job-1" / "reports")
     _mkdir(data_dir / "cache")
@@ -80,7 +78,6 @@ def test_data_audit_flags_misplaced_pdf(tmp_path: Path):
 def test_data_audit_allows_pdfs_under_job_ocr_out(tmp_path: Path):
     data_dir = tmp_path / "data"
     _mkdir(data_dir / "corpora")
-    _mkdir(data_dir / "jobs" / "job-1" / "input")
     _mkdir(data_dir / "jobs" / "job-1" / "pdfs")
     _mkdir(data_dir / "jobs" / "job-1" / "reports")
     _mkdir(data_dir / "jobs" / "job-1" / "ocr_out")
@@ -91,4 +88,20 @@ def test_data_audit_allows_pdfs_under_job_ocr_out(tmp_path: Path):
     (data_dir / "jobs" / "job-1" / "ocr_out" / "derived.pdf").write_bytes(b"pdf")
     report = run_data_audit(data_dir)
     misplaced = [item for item in report.issues if item.code == "misplaced_pdf"]
+    deprecated = [item for item in report.issues if item.code in {"deprecated_job_subdir", "deprecated_job_ocr_out_pdf"}]
     assert not misplaced
+    assert deprecated
+
+
+def test_data_audit_marks_job_input_subdir_deprecated(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    _mkdir(data_dir / "corpora")
+    _mkdir(data_dir / "jobs" / "job-1" / "input")
+    _mkdir(data_dir / "jobs" / "job-1" / "pdfs")
+    _mkdir(data_dir / "jobs" / "job-1" / "reports")
+    _mkdir(data_dir / "cache")
+    _mkdir(data_dir / "archive")
+    _mkdir(data_dir / "tmp")
+    report = run_data_audit(data_dir)
+    deprecated = [item for item in report.issues if item.code == "deprecated_job_subdir" and item.path.endswith("input")]
+    assert deprecated

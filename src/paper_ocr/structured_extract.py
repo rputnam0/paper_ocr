@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+from html import unescape
+from html.parser import HTMLParser
 import json
 import os
 import re
@@ -543,6 +545,301 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+PAGE_ID_RE = re.compile(r"/page/(\d+)/")
+TABLE_NUM_RE = re.compile(r"\b(?:table|tab\.?)\s*([0-9ivxlcdm]+)\b", re.IGNORECASE)
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _marker_page_from_id(block_id: str) -> int | None:
+    match = PAGE_ID_RE.search(str(block_id or ""))
+    if not match:
+        return None
+    return int(match.group(1)) + 1
+
+
+def _marker_bbox(block: dict[str, Any]) -> list[float]:
+    bbox = block.get("bbox")
+    if isinstance(bbox, list) and len(bbox) >= 4:
+        try:
+            return [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+        except Exception:
+            return []
+    return []
+
+
+def _marker_polygons(block: dict[str, Any]) -> list[list[list[float]]]:
+    poly = block.get("polygon")
+    if not isinstance(poly, list) or not poly:
+        return []
+    # Marker commonly emits a single polygon [[x,y], ...]
+    if isinstance(poly[0], list) and poly[0] and isinstance(poly[0][0], (int, float)):
+        out = []
+        pts = []
+        for p in poly:
+            if not isinstance(p, list) or len(p) < 2:
+                continue
+            try:
+                pts.append([float(p[0]), float(p[1])])
+            except Exception:
+                continue
+        if pts:
+            out.append(pts)
+        return out
+    # Already polygon list [[[x,y],...], ...]
+    out: list[list[list[float]]] = []
+    for one in poly:
+        if not isinstance(one, list):
+            continue
+        pts = []
+        for p in one:
+            if not isinstance(p, list) or len(p) < 2:
+                continue
+            try:
+                pts.append([float(p[0]), float(p[1])])
+            except Exception:
+                continue
+        if pts:
+            out.append(pts)
+    return out
+
+
+def _plain_text_from_html(html_text: str) -> str:
+    txt = str(html_text or "")
+    txt = txt.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+    txt = TAG_RE.sub(" ", txt)
+    txt = unescape(txt)
+    return " ".join(txt.split())
+
+
+def _extract_table_number(text: str) -> str:
+    m = TABLE_NUM_RE.search(str(text or ""))
+    if not m:
+        return ""
+    return m.group(1).strip().lower()
+
+
+class _HTMLTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_tr = False
+        self.in_cell = False
+        self.cell_tag = ""
+        self.cell_buf: list[str] = []
+        self.cell_colspan = 1
+        self.cell_rowspan = 1
+        self.current_col = 0
+        self.row_cells: list[tuple[int, str, str]] = []
+        self.pending_rowspans: dict[int, tuple[int, str, str]] = {}
+        self.header_rows: list[list[str]] = []
+        self.data_rows: list[list[str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        if t == "tr":
+            self.in_tr = True
+            self.row_cells = []
+            self.current_col = 0
+            self._consume_pending_spans()
+            return
+        if t in {"th", "td"} and self.in_tr:
+            self._consume_pending_spans()
+            self.in_cell = True
+            self.cell_tag = t
+            self.cell_buf = []
+            self.cell_colspan = max(1, self._int_attr(attrs, "colspan", 1))
+            self.cell_rowspan = max(1, self._int_attr(attrs, "rowspan", 1))
+            return
+        if t == "br" and self.in_cell:
+            self.cell_buf.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in {"th", "td"} and self.in_cell:
+            text = unescape("".join(self.cell_buf)).strip()
+            for _ in range(self.cell_colspan):
+                self.row_cells.append((self.current_col, self.cell_tag, text))
+                if self.cell_rowspan > 1:
+                    self.pending_rowspans[self.current_col] = (self.cell_rowspan - 1, self.cell_tag, text)
+                self.current_col += 1
+            self.in_cell = False
+            self.cell_tag = ""
+            self.cell_buf = []
+            self.cell_colspan = 1
+            self.cell_rowspan = 1
+            return
+        if t == "tr" and self.in_tr:
+            self._consume_pending_spans()
+            if self.row_cells:
+                max_col = max(c for c, _, _ in self.row_cells) + 1
+                vals = [""] * max_col
+                tags: list[str] = []
+                for col, cell_tag, text in self.row_cells:
+                    vals[col] = text
+                    tags.append(cell_tag)
+                if tags and all(k == "th" for k in tags):
+                    self.header_rows.append(vals)
+                else:
+                    self.data_rows.append(vals)
+            self.in_tr = False
+            self.row_cells = []
+            self.current_col = 0
+
+    def handle_data(self, data: str) -> None:
+        if self.in_cell:
+            self.cell_buf.append(data)
+
+    def _int_attr(self, attrs: list[tuple[str, str | None]], key: str, default: int) -> int:
+        for name, value in attrs:
+            if str(name).lower() != key:
+                continue
+            try:
+                return int(str(value or default).strip())
+            except Exception:
+                return default
+        return default
+
+    def _consume_pending_spans(self) -> None:
+        while self.current_col in self.pending_rowspans:
+            remaining, cell_tag, text = self.pending_rowspans[self.current_col]
+            self.row_cells.append((self.current_col, cell_tag, text))
+            if remaining <= 1:
+                self.pending_rowspans.pop(self.current_col, None)
+            else:
+                self.pending_rowspans[self.current_col] = (remaining - 1, cell_tag, text)
+            self.current_col += 1
+
+
+def _parse_html_table_rows(table_html: str) -> tuple[list[list[str]], list[list[str]]]:
+    parser = _HTMLTableParser()
+    parser.feed(str(table_html or ""))
+    parser.close()
+    all_rows = parser.header_rows + parser.data_rows
+    max_cols = max((len(r) for r in all_rows), default=0)
+    if max_cols:
+        parser.header_rows = [list(r) + [""] * (max_cols - len(r)) for r in parser.header_rows]
+        parser.data_rows = [list(r) + [""] * (max_cols - len(r)) for r in parser.data_rows]
+    return parser.header_rows, parser.data_rows
+
+
+def _flatten_marker_blocks(root_obj: Any) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    stack: list[Any] = [root_obj]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if "block_type" in node:
+                block_id = str(node.get("id", ""))
+                key = f"{block_id}|{node.get('block_type', '')}|{node.get('bbox', '')}"
+                if key not in seen:
+                    seen.add(key)
+                    blocks.append(node)
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+    return blocks
+
+
+def _marker_rows_for_localization(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for block in blocks:
+        block_type = str(block.get("block_type", "")).strip()
+        if not block_type:
+            continue
+        page = _marker_page_from_id(str(block.get("id", "")))
+        row: dict[str, Any] = {
+            "type": block_type.lower(),
+            "page": page or 0,
+        }
+        bbox = _marker_bbox(block)
+        if bbox:
+            row["bbox"] = bbox
+        polygons = _marker_polygons(block)
+        if polygons:
+            row["polygon"] = polygons[0]
+        rows.append(row)
+    return rows
+
+
+def _choose_caption_block(table_block: dict[str, Any], captions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not captions:
+        return None
+    table_html = str(table_block.get("html", "") or "")
+    table_num = _extract_table_number(_plain_text_from_html(table_html))
+    table_bbox = _marker_bbox(table_block)
+    table_y = table_bbox[1] if table_bbox else 0.0
+    matched: list[dict[str, Any]] = []
+    for cap in captions:
+        cap_num = _extract_table_number(_plain_text_from_html(str(cap.get("html", "") or "")))
+        if table_num and cap_num and cap_num == table_num:
+            matched.append(cap)
+    candidates = matched or captions
+
+    def _score(cap: dict[str, Any]) -> tuple[float, float]:
+        cap_bbox = _marker_bbox(cap)
+        if not cap_bbox:
+            return (999999.0, 999999.0)
+        cap_y = cap_bbox[1]
+        vertical = abs(table_y - cap_y)
+        above_penalty = 0.0 if cap_y <= table_y else 1000.0
+        return (vertical + above_penalty, vertical)
+
+    return sorted(candidates, key=_score)[0]
+
+
+def _extract_tables_raw_from_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    captions_by_page: dict[int, list[dict[str, Any]]] = {}
+    tables: list[dict[str, Any]] = []
+    for block in blocks:
+        btype = str(block.get("block_type", "")).lower()
+        page = _marker_page_from_id(str(block.get("id", "")))
+        if page is None:
+            continue
+        if btype == "caption":
+            captions_by_page.setdefault(page, []).append(block)
+        elif btype == "table":
+            tables.append(block)
+
+    tables_raw: list[dict[str, Any]] = []
+    by_page_counter: dict[int, int] = {}
+    for table_block in sorted(tables, key=lambda b: (_marker_page_from_id(str(b.get("id", ""))) or 0, str(b.get("id", "")))):
+        page = _marker_page_from_id(str(table_block.get("id", "")))
+        if page is None:
+            continue
+        by_page_counter[page] = by_page_counter.get(page, 0) + 1
+        idx = by_page_counter[page]
+        table_html = str(table_block.get("html", "") or "")
+        header_rows, data_rows = _parse_html_table_rows(table_html)
+        caption_block = _choose_caption_block(table_block, captions_by_page.get(page, []))
+        caption_text = _plain_text_from_html(str((caption_block or {}).get("html", "")))
+        if not caption_text:
+            caption_text = _plain_text_from_html(table_html[:220])
+        polygons = _marker_polygons(table_block)
+        table_block_id = str(table_block.get("id", "") or "")
+        caption_block_id = str((caption_block or {}).get("id", "") or "")
+        tables_raw.append(
+            {
+                "table_group_id": f"page_{page:04d}_table_{idx:02d}",
+                "table_block_ids": [table_block_id] if table_block_id else [],
+                "caption_block_id": caption_block_id,
+                "note_block_ids": [],
+                "page": page,
+                "polygons": polygons,
+                "header_rows": header_rows,
+                "data_rows": data_rows,
+                "caption_text": caption_text,
+                "caption_confidence": 0.95 if caption_block_id else 0.6,
+                "source_format": "html",
+                "html_table": table_html,
+            }
+        )
+    return tables_raw
+
+
 def _has_geometry(block: dict[str, Any]) -> bool:
     poly = block.get("polygon")
     if isinstance(poly, list) and poly:
@@ -563,7 +860,7 @@ def _collect_localization_status(block_rows: list[dict[str, Any]], page_count: i
         page = int(row.get("page") or 0)
         if page < 1 or page > page_count:
             continue
-        typ = str(row.get("type", "")).lower()
+        typ = str(row.get("type") or row.get("block_type") or "").lower()
         if typ in {"table", "figure", "caption"}:
             status[page]["has_candidate"] = True
             if _has_geometry(row):
@@ -618,8 +915,30 @@ def run_marker_doc(
                 if md:
                     (marker_root / "full_document.md").write_text(md)
                 (marker_root / "raw_service_payload.json").write_text(json.dumps(payload, indent=2, ensure_ascii=True))
-                blocks = payload.get("chunks") or payload.get("blocks") or []
-                block_rows = [b for b in blocks if isinstance(b, dict)]
+                block_rows: list[dict[str, Any]] = [b for b in (payload.get("chunks") or payload.get("blocks") or []) if isinstance(b, dict)]
+                derived_rows: list[dict[str, Any]] = []
+                tree_obj: Any | None = None
+                output_obj = payload.get("output")
+                if isinstance(output_obj, dict):
+                    tree_obj = output_obj
+                elif isinstance(output_obj, str):
+                    try:
+                        loaded_output = json.loads(output_obj)
+                        if isinstance(loaded_output, dict):
+                            tree_obj = loaded_output
+                    except Exception:
+                        tree_obj = None
+                flat_blocks = _flatten_marker_blocks(tree_obj) if tree_obj is not None else []
+                if flat_blocks:
+                    derived_rows = _marker_rows_for_localization(flat_blocks)
+                    tables_raw = _extract_tables_raw_from_blocks(flat_blocks)
+                    if tables_raw:
+                        (marker_root / "tables_raw.jsonl").write_text(
+                            "\n".join(json.dumps(r, ensure_ascii=True) for r in tables_raw) + "\n"
+                        )
+                # Prefer derived rows from output-tree flattening when available.
+                if derived_rows:
+                    block_rows = derived_rows
                 if block_rows:
                     (marker_root / "blocks.jsonl").write_text(
                         "\n".join(json.dumps(r, ensure_ascii=True) for r in block_rows) + "\n"
@@ -631,6 +950,8 @@ def run_marker_doc(
                 }
                 if (marker_root / "blocks.jsonl").exists():
                     artifacts["blocks"] = str(marker_root / "blocks.jsonl")
+                if (marker_root / "tables_raw.jsonl").exists():
+                    artifacts["tables_raw"] = str(marker_root / "tables_raw.jsonl")
                 return MarkerDocResult(success=True, markdown=md, artifacts=artifacts, localization_page_status=status)
             except Exception as exc:  # noqa: BLE001
                 return MarkerDocResult(success=False, error=str(exc))
@@ -677,6 +998,20 @@ def run_marker_doc(
                         (marker_root / "blocks.jsonl").write_text(
                             "\n".join(json.dumps(r, ensure_ascii=True) for r in block_rows) + "\n"
                         )
+                    flat_blocks = _flatten_marker_blocks(loaded)
+                    if flat_blocks:
+                        derived_rows = _marker_rows_for_localization(flat_blocks)
+                        if not block_rows:
+                            block_rows = derived_rows
+                        if derived_rows and not (marker_root / "blocks.jsonl").exists():
+                            (marker_root / "blocks.jsonl").write_text(
+                                "\n".join(json.dumps(r, ensure_ascii=True) for r in derived_rows) + "\n"
+                            )
+                        tables_raw = _extract_tables_raw_from_blocks(flat_blocks)
+                        if tables_raw:
+                            (marker_root / "tables_raw.jsonl").write_text(
+                                "\n".join(json.dumps(r, ensure_ascii=True) for r in tables_raw) + "\n"
+                            )
             if not (marker_root / "blocks.jsonl").exists() and block_rows:
                 (marker_root / "blocks.jsonl").write_text(
                     "\n".join(json.dumps(r, ensure_ascii=True) for r in block_rows) + "\n"
@@ -691,6 +1026,8 @@ def run_marker_doc(
                 artifacts["chunks"] = str(marker_root / "chunks.jsonl")
             if (marker_root / "blocks.jsonl").exists():
                 artifacts["blocks"] = str(marker_root / "blocks.jsonl")
+            if (marker_root / "tables_raw.jsonl").exists():
+                artifacts["tables_raw"] = str(marker_root / "tables_raw.jsonl")
 
             status = _collect_localization_status(block_rows, page_count=page_count)
             return MarkerDocResult(

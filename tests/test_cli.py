@@ -152,10 +152,16 @@ def test_parse_run_table_pipeline_defaults(monkeypatch):
     assert args.marker_localize_profile == "full_json"
     assert args.layout_fallback == "surya"
     assert args.table_source == "marker-first"
+    assert args.table_ocr_merge is True
+    assert args.table_ocr_merge_scope == "header"
+    assert args.table_header_ocr_auto is True
+    assert args.table_artifact_mode == "permissive"
     assert args.table_quality_gate is True
     assert args.table_escalation == "auto"
     assert args.table_escalation_max == 20
     assert args.table_qa_mode == "warn"
+    assert args.compare_ocr_html is False
+    assert args.ocr_html_dir is None
 
 
 def test_parse_export_table_pipeline_options(monkeypatch):
@@ -173,6 +179,12 @@ def test_parse_export_table_pipeline_options(monkeypatch):
             "always",
             "--table-escalation-max",
             "3",
+            "--no-table-ocr-merge",
+            "--table-ocr-merge-scope",
+            "full",
+            "--no-table-header-ocr-auto",
+            "--table-artifact-mode",
+            "strict",
         ],
     )
     args = cli._parse_args()
@@ -180,6 +192,33 @@ def test_parse_export_table_pipeline_options(monkeypatch):
     assert args.table_qa_mode == "strict"
     assert args.table_escalation == "always"
     assert args.table_escalation_max == 3
+    assert args.table_ocr_merge is False
+    assert args.table_ocr_merge_scope == "full"
+    assert args.table_header_ocr_auto is False
+    assert args.table_artifact_mode == "strict"
+    assert args.compare_ocr_html is False
+    assert args.ocr_html_dir is None
+
+
+def test_parse_export_table_comparison_options(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "export-structured-data",
+            "out",
+            "--compare-ocr-html",
+            "--ocr-html-dir",
+            "custom/ocr_html",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.table_ocr_merge is True
+    assert args.table_ocr_merge_scope == "header"
+    assert args.table_header_ocr_auto is True
+    assert args.table_artifact_mode == "permissive"
+    assert args.compare_ocr_html is True
+    assert args.ocr_html_dir == Path("custom/ocr_html")
 
 
 def test_parse_eval_table_pipeline_args(monkeypatch):
@@ -254,22 +293,44 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
         )
 
     monkeypatch.setattr(cli, "build_structured_exports", _fake_build)
+    monkeypatch.setattr(
+        cli,
+        "compare_marker_tables_with_ocr_html",
+        lambda **kwargs: {
+            "tables_compared": 2,
+            "avg_similarity": 0.95,
+            "report_path": "metadata/assets/structured/qa/table_ocr_html_compare.json",
+        },
+    )
 
     args = argparse.Namespace(
         ocr_out_dir=root,
         deplot_command="deplot-cli --image {image}",
         deplot_timeout=30,
         table_source="marker-first",
+        table_ocr_merge=True,
+        table_ocr_merge_scope="header",
+        table_header_ocr_auto=False,
+        table_header_ocr_model="m",
+        table_header_ocr_max_tokens=500,
+        table_artifact_mode="permissive",
+        ocr_html_dir=None,
         table_quality_gate=True,
         table_escalation="auto",
         table_escalation_max=20,
         table_qa_mode="warn",
+        compare_ocr_html=True,
     )
     result = cli._run_export_structured_data(args)
     assert result["docs_processed"] == 1
     payload = json.loads(manifest_path.read_text())
     assert payload["structured_data_extraction"]["table_count"] == 2
     assert payload["structured_data_extraction"]["figure_count"] == 3
+    assert payload["structured_data_extraction"]["ocr_html_comparison"]["tables_compared"] == 2
+    assert seen_kwargs["table_ocr_merge"] is True
+    assert seen_kwargs["table_ocr_merge_scope"] == "header"
+    assert seen_kwargs["table_artifact_mode"] == "permissive"
+    assert seen_kwargs["ocr_html_dir"] is None
     assert seen_kwargs["grobid_status"] == "unknown"
 
 
@@ -293,6 +354,13 @@ def test_run_export_structured_data_passes_grobid_ok_when_manifest_records_usage
         deplot_command="",
         deplot_timeout=30,
         table_source="marker-first",
+        table_ocr_merge=True,
+        table_ocr_merge_scope="header",
+        table_header_ocr_auto=False,
+        table_header_ocr_model="m",
+        table_header_ocr_max_tokens=500,
+        table_artifact_mode="permissive",
+        ocr_html_dir=None,
         table_quality_gate=True,
         table_escalation="auto",
         table_escalation_max=20,
@@ -307,6 +375,13 @@ def test_run_export_structured_data_requires_docs(tmp_path: Path):
         ocr_out_dir=tmp_path / "empty_out",
         deplot_command="",
         deplot_timeout=90,
+        table_ocr_merge=True,
+        table_ocr_merge_scope="header",
+        table_header_ocr_auto=False,
+        table_header_ocr_model="m",
+        table_header_ocr_max_tokens=500,
+        table_artifact_mode="permissive",
+        ocr_html_dir=None,
     )
     args.ocr_out_dir.mkdir(parents=True, exist_ok=True)
     with pytest.raises(SystemExit, match="No OCR document folders found"):
@@ -505,10 +580,9 @@ def test_fetch_telegram_migrates_legacy_default_job_dir(monkeypatch, tmp_path: P
     assert (tmp_path / "data" / "jobs" / "papers" / "reports" / "download_index.json").exists()
 
 
-def test_fetch_telegram_skips_copy_when_csv_already_in_job_input(monkeypatch, tmp_path: Path):
+def test_fetch_telegram_keeps_input_csv_outside_job_folder(monkeypatch, tmp_path: Path):
     output_root = tmp_path / "jobs"
-    doi_csv = output_root / "papers" / "input" / "papers.csv"
-    doi_csv.parent.mkdir(parents=True, exist_ok=True)
+    doi_csv = tmp_path / "papers.csv"
     doi_csv.write_text("DOI\n10.1000/abc\n")
     args = argparse.Namespace(
         doi_csv=doi_csv,
@@ -530,6 +604,41 @@ def test_fetch_telegram_skips_copy_when_csv_already_in_job_input(monkeypatch, tm
 
     asyncio.run(cli._run_fetch_telegram(args))
     assert _fake_fetch_from_telegram.last_config.doi_csv == doi_csv
+    assert not (output_root / "papers" / "input").exists()
+
+
+def test_fetch_telegram_does_not_create_ocr_out_subdir(monkeypatch, tmp_path: Path):
+    args = argparse.Namespace(
+        doi_csv=tmp_path / "papers.csv",
+        output_root=tmp_path / "jobs",
+        doi_column="DOI",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+    )
+    args.doi_csv.write_text("DOI\n10.1000/abc\n")
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+    assert not (tmp_path / "jobs" / "papers" / "ocr_out").exists()
+    assert not (tmp_path / "jobs" / "papers" / "input").exists()
+
+
+def test_run_rejects_output_under_jobs_folder(tmp_path: Path):
+    args = argparse.Namespace(
+        in_dir=tmp_path / "in",
+        out_dir=Path("data/jobs/example/ocr_out"),
+    )
+    with pytest.raises(SystemExit, match="Refusing to write final OCR outputs under data/jobs"):
+        asyncio.run(cli._run(args))
 
 
 def test_render_dims_for_route_matches_truncation_behavior():

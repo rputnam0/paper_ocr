@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import hashlib
+from difflib import SequenceMatcher
+from html import unescape
+from html.parser import HTMLParser
 import json
 import re
 import shlex
@@ -13,6 +16,36 @@ from typing import Any
 
 
 FIGURE_MD_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+OCR_TABLE_FILE_RE = re.compile(r"table_(\d+)_page_(\d+)\.md$", re.IGNORECASE)
+SYMBOL_CHAR_RE = re.compile(r"[^\x00-\x7F]|[±≤≥≈×÷°µμδΔητσγβαΩω]")
+LATEX_GREEK_MAP = {
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "eta": "η",
+    "theta": "θ",
+    "kappa": "κ",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "pi": "π",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "phi": "φ",
+    "psi": "ψ",
+    "omega": "ω",
+    "Gamma": "Γ",
+    "Delta": "Δ",
+    "Theta": "Θ",
+    "Lambda": "Λ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Phi": "Φ",
+    "Psi": "Ψ",
+    "Omega": "Ω",
+}
 
 
 @dataclass
@@ -22,6 +55,7 @@ class StructuredExportSummary:
     deplot_count: int = 0
     unresolved_figure_count: int = 0
     errors: list[str] = field(default_factory=list)
+    ocr_merge: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -207,9 +241,9 @@ def _write_table_csv(path: Path, headers: list[str], rows: list[list[str]]) -> N
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(headers)
+        writer.writerow([_normalize_cell_text(h) for h in headers])
         for row in rows:
-            writer.writerow(row)
+            writer.writerow([_normalize_cell_text(cell) for cell in row])
 
 
 def _portable_path(path: Path, root: Path) -> str:
@@ -272,6 +306,109 @@ def _extract_table_number(caption: str) -> str:
     return match.group(1).strip().lower()
 
 
+class _HTMLTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_tr = False
+        self.in_cell = False
+        self.cell_tag = ""
+        self.cell_buf: list[str] = []
+        self.cell_colspan = 1
+        self.cell_rowspan = 1
+        self.current_col = 0
+        self.row_cells: list[tuple[int, str, str]] = []
+        self.pending_rowspans: dict[int, tuple[int, str, str]] = {}
+        self.header_rows: list[list[str]] = []
+        self.data_rows: list[list[str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        if t == "tr":
+            self.in_tr = True
+            self.row_cells = []
+            self.current_col = 0
+            self._consume_pending_spans()
+            return
+        if t in {"th", "td"} and self.in_tr:
+            self._consume_pending_spans()
+            self.in_cell = True
+            self.cell_tag = t
+            self.cell_buf = []
+            self.cell_colspan = max(1, self._int_attr(attrs, "colspan", 1))
+            self.cell_rowspan = max(1, self._int_attr(attrs, "rowspan", 1))
+            return
+        if t == "br" and self.in_cell:
+            self.cell_buf.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in {"th", "td"} and self.in_cell:
+            text = unescape("".join(self.cell_buf)).strip()
+            for _ in range(self.cell_colspan):
+                self.row_cells.append((self.current_col, self.cell_tag, text))
+                if self.cell_rowspan > 1:
+                    self.pending_rowspans[self.current_col] = (self.cell_rowspan - 1, self.cell_tag, text)
+                self.current_col += 1
+            self.in_cell = False
+            self.cell_tag = ""
+            self.cell_buf = []
+            self.cell_colspan = 1
+            self.cell_rowspan = 1
+            return
+        if t == "tr" and self.in_tr:
+            self._consume_pending_spans()
+            if self.row_cells:
+                max_col = max(c for c, _, _ in self.row_cells) + 1
+                vals = [""] * max_col
+                tags: list[str] = []
+                for col, cell_tag, text in self.row_cells:
+                    vals[col] = text
+                    tags.append(cell_tag)
+                if tags and all(k == "th" for k in tags):
+                    self.header_rows.append(vals)
+                else:
+                    self.data_rows.append(vals)
+            self.in_tr = False
+            self.row_cells = []
+            self.current_col = 0
+
+    def handle_data(self, data: str) -> None:
+        if self.in_cell:
+            self.cell_buf.append(data)
+
+    def _int_attr(self, attrs: list[tuple[str, str | None]], key: str, default: int) -> int:
+        for name, value in attrs:
+            if str(name).lower() != key:
+                continue
+            try:
+                return int(str(value or default).strip())
+            except Exception:
+                return default
+        return default
+
+    def _consume_pending_spans(self) -> None:
+        while self.current_col in self.pending_rowspans:
+            remaining, cell_tag, text = self.pending_rowspans[self.current_col]
+            self.row_cells.append((self.current_col, cell_tag, text))
+            if remaining <= 1:
+                self.pending_rowspans.pop(self.current_col, None)
+            else:
+                self.pending_rowspans[self.current_col] = (remaining - 1, cell_tag, text)
+            self.current_col += 1
+
+
+def _parse_html_table_rows(table_html: str) -> tuple[list[list[str]], list[list[str]]]:
+    parser = _HTMLTableParser()
+    parser.feed(str(table_html or ""))
+    parser.close()
+    all_rows = parser.header_rows + parser.data_rows
+    max_cols = max((len(r) for r in all_rows), default=0)
+    if max_cols:
+        parser.header_rows = [list(r) + [""] * (max_cols - len(r)) for r in parser.header_rows]
+        parser.data_rows = [list(r) + [""] * (max_cols - len(r)) for r in parser.data_rows]
+    return parser.header_rows, parser.data_rows
+
+
 def _normalize_fragment_from_marker(row: dict[str, Any], index: int) -> TableFragment:
     page = int(row.get("page") or 1)
     polygons = row.get("polygons")
@@ -283,6 +420,12 @@ def _normalize_fragment_from_marker(row: dict[str, Any], index: int) -> TableFra
     data_rows = row.get("data_rows")
     if not isinstance(data_rows, list):
         data_rows = []
+    if not header_rows and not data_rows:
+        html_table = str(row.get("html_table", "") or row.get("html", "") or "")
+        if "<table" in html_table.lower():
+            parsed_headers, parsed_rows = _parse_html_table_rows(html_table)
+            header_rows = parsed_headers
+            data_rows = parsed_rows
     caption_text = str(row.get("caption_text", "") or "")
     raw_group_id = str(row.get("table_group_id", "") or "").strip()
     table_group_id = raw_group_id or f"group_{page}_{index}"
@@ -435,6 +578,539 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
         path.write_text("")
 
 
+def _normalize_cell_text(value: str) -> str:
+    text = str(value or "")
+    text = text.replace("\\(", " ").replace("\\)", " ").replace("$", " ")
+    text = re.sub(
+        r"\\([A-Za-z]+)",
+        lambda m: LATEX_GREEK_MAP.get(m.group(1), m.group(0)),
+        text,
+    )
+    text = text.replace("{", "").replace("}", "")
+    text = text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
+    return " ".join(text.split())
+
+
+def _collapse_header_rows(header_rows: list[list[str]]) -> list[str]:
+    if not header_rows:
+        return []
+    max_cols = max((len(r) for r in header_rows), default=0)
+    if max_cols <= 0:
+        return []
+    normalized = [list(r) + [""] * (max_cols - len(r)) for r in header_rows]
+    out: list[str] = []
+    for col in range(max_cols):
+        tokens: list[str] = []
+        for row in normalized:
+            token = _normalize_cell_text(row[col])
+            if not token:
+                continue
+            if not tokens or tokens[-1] != token:
+                tokens.append(token)
+        if not tokens:
+            out.append("")
+        elif len(tokens) == 1:
+            out.append(tokens[0])
+        else:
+            out.append(f"{tokens[0]} ({' / '.join(tokens[1:])})")
+    return out
+
+
+def _flatten_table_text(headers: list[str], rows: list[list[str]]) -> str:
+    parts: list[str] = []
+    if headers:
+        parts.append(" | ".join(_normalize_cell_text(c) for c in headers))
+    for row in rows:
+        parts.append(" | ".join(_normalize_cell_text(c) for c in row))
+    return "\n".join(parts)
+
+
+def _extract_symbols(text: str) -> str:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for ch in SYMBOL_CHAR_RE.findall(str(text or "")):
+        if ch in seen:
+            continue
+        seen.add(ch)
+        ordered.append(ch)
+    return "".join(ordered)
+
+
+def _parse_ocr_html_table(path: Path) -> tuple[list[str], list[list[str]]]:
+    raw = path.read_text()
+    header_rows, data_rows = _parse_html_table_rows(raw)
+    if not header_rows and not data_rows:
+        markdown_tables = extract_markdown_tables(raw)
+        if markdown_tables:
+            first = markdown_tables[0]
+            return list(first.get("headers", [])), [list(r) for r in first.get("rows", [])]
+        return [], []
+    headers = _collapse_header_rows(header_rows) if header_rows else []
+    rows = [list(r) for r in data_rows]
+    return headers, rows
+
+
+def _alnum_signature(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def _cell_patch_decision(marker_value: str, ocr_value: str, *, allow_empty_fill: bool = True) -> tuple[str, str]:
+    marker_text = _normalize_cell_text(marker_value)
+    ocr_text = _normalize_cell_text(ocr_value)
+    if not ocr_text:
+        return marker_text, ""
+    if allow_empty_fill and not marker_text:
+        if _extract_symbols(ocr_text):
+            return ocr_text, "empty_fill"
+        return marker_text, ""
+    if marker_text == ocr_text:
+        return marker_text, ""
+
+    marker_symbols = set(_extract_symbols(marker_text))
+    ocr_symbols = set(_extract_symbols(ocr_text))
+    if ocr_symbols.difference(marker_symbols):
+        marker_sig = _alnum_signature(marker_text)
+        ocr_sig = _alnum_signature(ocr_text)
+        if marker_sig and ocr_sig:
+            ratio = SequenceMatcher(None, marker_sig, ocr_sig).ratio()
+            if ratio >= 0.50:
+                return ocr_text, "symbol_patch"
+        else:
+            return ocr_text, "symbol_patch"
+
+    if "<br" in str(marker_value or "") and "<br" not in str(ocr_value or ""):
+        marker_sig = _alnum_signature(marker_text)
+        ocr_sig = _alnum_signature(ocr_text)
+        if marker_sig and marker_sig == ocr_sig:
+            return ocr_text, "format_patch"
+
+    return marker_text, ""
+
+
+def _load_ocr_tables_by_page(ocr_root: Path) -> dict[int, list[dict[str, Any]]]:
+    tables_by_page: dict[int, list[dict[str, Any]]] = {}
+    for path in sorted(ocr_root.glob("table_*_page_*.md")):
+        match = OCR_TABLE_FILE_RE.search(path.name)
+        if not match:
+            continue
+        page = int(match.group(2))
+        ordinal = int(match.group(1))
+        headers, rows = _parse_ocr_html_table(path)
+        tables_by_page.setdefault(page, []).append(
+            {
+                "ordinal": ordinal,
+                "headers": headers,
+                "rows": rows,
+                "path": path,
+            }
+        )
+    for rows in tables_by_page.values():
+        rows.sort(key=lambda row: int(row.get("ordinal", 0)))
+    return tables_by_page
+
+
+def _table_token_set(headers: list[str], rows: list[list[str]]) -> set[str]:
+    tokens: set[str] = set()
+    for cell in headers:
+        for token in re.split(r"\W+", _normalize_cell_text(cell).lower()):
+            token = token.strip()
+            if token:
+                tokens.add(token)
+    if rows:
+        first = rows[0]
+        for cell in first:
+            for token in re.split(r"\W+", _normalize_cell_text(cell).lower()):
+                token = token.strip()
+                if token:
+                    tokens.add(token)
+    return tokens
+
+
+def _header_similarity_by_tokens(lhs_headers: list[str], lhs_rows: list[list[str]], rhs_headers: list[str], rhs_rows: list[list[str]]) -> float:
+    lhs = _table_token_set(lhs_headers, lhs_rows)
+    rhs = _table_token_set(rhs_headers, rhs_rows)
+    if not lhs and not rhs:
+        return 1.0
+    if not lhs or not rhs:
+        return 0.0
+    return len(lhs.intersection(rhs)) / max(len(lhs.union(rhs)), 1)
+
+
+
+def _match_tables_for_page(
+    marker_tables: list[dict[str, Any]],
+    ocr_tables: list[dict[str, Any]],
+) -> tuple[list[tuple[int, int, float]], list[int], list[int]]:
+    if not marker_tables or not ocr_tables:
+        return [], list(range(len(marker_tables))), list(range(len(ocr_tables)))
+
+    candidates: list[tuple[float, int, int]] = []
+    for m_idx, marker in enumerate(marker_tables):
+        m_headers = [str(x) for x in marker.get("headers", [])]
+        m_rows = [[str(x) for x in row] for row in marker.get("rows", []) if isinstance(row, list)]
+        for o_idx, ocr in enumerate(ocr_tables):
+            o_headers = [str(x) for x in ocr.get("headers", [])]
+            o_rows = [[str(x) for x in row] for row in ocr.get("rows", []) if isinstance(row, list)]
+            header_sim = _header_similarity_by_tokens(m_headers, m_rows, o_headers, o_rows)
+            col_sim = 1.0 - (abs(len(m_headers) - len(o_headers)) / max(len(m_headers), len(o_headers), 1))
+            row_sim = 1.0 - (abs(len(m_rows) - len(o_rows)) / max(len(m_rows), len(o_rows), 1))
+            score = (0.7 * header_sim) + (0.2 * col_sim) + (0.1 * row_sim)
+            candidates.append((score, m_idx, o_idx))
+
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    used_marker: set[int] = set()
+    used_ocr: set[int] = set()
+    matches: list[tuple[int, int, float]] = []
+    for score, m_idx, o_idx in candidates:
+        if score < 0.25:
+            continue
+        if m_idx in used_marker or o_idx in used_ocr:
+            continue
+        used_marker.add(m_idx)
+        used_ocr.add(o_idx)
+        matches.append((m_idx, o_idx, round(float(score), 4)))
+
+    unmatched_marker = [idx for idx in range(len(marker_tables)) if idx not in used_marker]
+    unmatched_ocr = [idx for idx in range(len(ocr_tables)) if idx not in used_ocr]
+    return matches, unmatched_marker, unmatched_ocr
+
+
+def _patch_table_grid(
+    marker_headers: list[str],
+    marker_rows: list[list[str]],
+    ocr_headers: list[str],
+    ocr_rows: list[list[str]],
+    *,
+    merge_scope: str,
+) -> tuple[list[str], list[list[str]], int, dict[str, int]]:
+    headers = list(marker_headers)
+    rows = [list(row) for row in marker_rows]
+    patch_count = 0
+    patch_reasons: dict[str, int] = {}
+
+    max_header_cols = min(len(headers), len(ocr_headers))
+    for col in range(max_header_cols):
+        merged, reason = _cell_patch_decision(headers[col], ocr_headers[col], allow_empty_fill=True)
+        if reason:
+            headers[col] = merged
+            patch_count += 1
+            patch_reasons[reason] = patch_reasons.get(reason, 0) + 1
+
+    if merge_scope == "full":
+        max_rows = min(len(rows), len(ocr_rows))
+        for row_idx in range(max_rows):
+            marker_row_sig = _alnum_signature(" ".join(str(cell) for cell in rows[row_idx]))
+            ocr_row_sig = _alnum_signature(" ".join(str(cell) for cell in ocr_rows[row_idx]))
+            row_similarity = SequenceMatcher(None, marker_row_sig, ocr_row_sig).ratio() if (marker_row_sig or ocr_row_sig) else 1.0
+            allow_empty_fill = row_similarity >= 0.90
+            max_cols = min(len(rows[row_idx]), len(ocr_rows[row_idx]))
+            for col_idx in range(max_cols):
+                merged, reason = _cell_patch_decision(
+                    rows[row_idx][col_idx],
+                    ocr_rows[row_idx][col_idx],
+                    allow_empty_fill=allow_empty_fill,
+                )
+                if reason:
+                    rows[row_idx][col_idx] = merged
+                    patch_count += 1
+                    patch_reasons[reason] = patch_reasons.get(reason, 0) + 1
+    return headers, rows, patch_count, patch_reasons
+
+
+def _merge_marker_tables_with_ocr_html(
+    *,
+    canonical_tables: list[dict[str, Any]],
+    doc_dir: Path,
+    ocr_html_dir: Path | None = None,
+    merge_scope: str = "header",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa"
+    qa_root.mkdir(parents=True, exist_ok=True)
+    report_path = qa_root / "table_ocr_merge.json"
+
+    if not canonical_tables:
+        payload = {
+            "enabled": True,
+            "tables_considered": 0,
+            "tables_matched": 0,
+            "tables_patched": 0,
+            "cells_patched": 0,
+            "report_path": _portable_path(report_path, doc_dir),
+            "results": [],
+        }
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        return canonical_tables, payload
+
+    ocr_root = ocr_html_dir or (qa_root / "bbox_ocr_outputs")
+    if not ocr_root.exists():
+        payload = {
+            "enabled": True,
+            "tables_considered": len(canonical_tables),
+            "tables_matched": 0,
+            "tables_patched": 0,
+            "cells_patched": 0,
+            "report_path": _portable_path(report_path, doc_dir),
+            "results": [],
+            "warning": f"ocr_html_dir_missing:{ocr_root}",
+        }
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        return canonical_tables, payload
+
+    ocr_by_page = _load_ocr_tables_by_page(ocr_root)
+    marker_by_page: dict[int, list[int]] = {}
+    for idx, table in enumerate(canonical_tables):
+        pages = [int(p) for p in table.get("pages", []) if int(p) > 0]
+        primary_page = min(pages) if pages else 1
+        marker_by_page.setdefault(primary_page, []).append(idx)
+    for page in marker_by_page:
+        marker_by_page[page].sort(key=lambda i: str(canonical_tables[i].get("table_id", "")))
+
+    merged_tables: list[dict[str, Any]] = [dict(table) for table in canonical_tables]
+    results: list[dict[str, Any]] = []
+    tables_matched = 0
+    tables_patched = 0
+    cells_patched = 0
+    unmatched_marker_total = 0
+    unmatched_ocr_total = 0
+
+    for page in sorted(marker_by_page):
+        marker_indices = marker_by_page.get(page, [])
+        ocr_tables = ocr_by_page.get(page, [])
+        page_marker_rows: list[dict[str, Any]] = []
+        for marker_table_index in marker_indices:
+            table = merged_tables[marker_table_index]
+            header_rows = table.get("header_rows", [])
+            marker_headers = list(header_rows[0]) if isinstance(header_rows, list) and header_rows else []
+            marker_rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
+            page_marker_rows.append(
+                {
+                    "table_id": str(table.get("table_id", "")),
+                    "headers": marker_headers,
+                    "rows": marker_rows,
+                    "table_index": marker_table_index,
+                }
+            )
+
+        matches, unmatched_marker, unmatched_ocr = _match_tables_for_page(page_marker_rows, ocr_tables)
+        unmatched_marker_total += len(unmatched_marker)
+        unmatched_ocr_total += len(unmatched_ocr)
+
+        for marker_local_idx in unmatched_marker:
+            table_id = str(page_marker_rows[marker_local_idx].get("table_id", ""))
+            results.append(
+                {
+                    "table_id": table_id,
+                    "page": page,
+                    "status": "missing_ocr_html",
+                    "cells_patched": 0,
+                    "ocr_html_path": "",
+                }
+            )
+
+        for m_idx, o_idx, match_score in matches:
+            marker_table_index = int(page_marker_rows[m_idx].get("table_index", 0))
+            table = merged_tables[marker_table_index]
+            ocr_table = ocr_tables[o_idx]
+            table_id = str(table.get("table_id", ""))
+            header_rows = table.get("header_rows", [])
+            marker_headers = list(header_rows[0]) if isinstance(header_rows, list) and header_rows else []
+            marker_rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
+            marker_symbols_before = _extract_symbols(_flatten_table_text(marker_headers, marker_rows))
+            table_cell_patches = 0
+            patch_reasons: dict[str, int] = {}
+
+            tables_matched += 1
+            ocr_headers = [str(x) for x in ocr_table.get("headers", [])]
+            ocr_rows = [[str(x) for x in row] for row in ocr_table.get("rows", []) if isinstance(row, list)]
+            marker_headers, marker_rows, table_cell_patches, patch_reasons = _patch_table_grid(
+                marker_headers=marker_headers,
+                marker_rows=marker_rows,
+                ocr_headers=ocr_headers,
+                ocr_rows=ocr_rows,
+                merge_scope=merge_scope,
+            )
+
+            table["header_rows"] = [marker_headers] if marker_headers else []
+            table["data_rows"] = marker_rows
+            if table_cell_patches:
+                table["source_format"] = "hybrid"
+                table["ocr_merge"] = {
+                    "enabled": True,
+                    "ocr_html_path": _portable_path(Path(ocr_table["path"]), doc_dir),
+                    "cells_patched": table_cell_patches,
+                    "patch_reasons": patch_reasons,
+                }
+                tables_patched += 1
+                cells_patched += table_cell_patches
+                status = "patched"
+            else:
+                table["ocr_merge"] = {
+                    "enabled": True,
+                    "ocr_html_path": _portable_path(Path(ocr_table["path"]), doc_dir),
+                    "cells_patched": 0,
+                    "patch_reasons": {},
+                }
+                status = "unchanged"
+
+            results.append(
+                {
+                    "table_id": table_id,
+                    "page": page,
+                    "status": status,
+                    "cells_patched": table_cell_patches,
+                    "patch_reasons": patch_reasons,
+                    "match_score": match_score,
+                    "ocr_html_path": _portable_path(Path(ocr_table["path"]), doc_dir),
+                    "marker_symbols_before": marker_symbols_before,
+                    "marker_symbols_after": _extract_symbols(_flatten_table_text(marker_headers, marker_rows)),
+                    "ocr_symbols": _extract_symbols(_flatten_table_text(ocr_headers, ocr_rows)),
+                }
+            )
+
+    payload = {
+        "enabled": True,
+        "merge_scope": merge_scope,
+        "tables_considered": len(canonical_tables),
+        "tables_matched": tables_matched,
+        "tables_unmatched_marker": unmatched_marker_total,
+        "tables_unmatched_ocr": unmatched_ocr_total,
+        "tables_patched": tables_patched,
+        "cells_patched": cells_patched,
+        "report_path": _portable_path(report_path, doc_dir),
+        "results": results,
+    }
+    report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+    return merged_tables, payload
+
+
+def compare_marker_tables_with_ocr_html(
+    *,
+    doc_dir: Path,
+    ocr_html_dir: Path | None = None,
+) -> dict[str, Any]:
+    qa_dir = doc_dir / "metadata" / "assets" / "structured" / "qa"
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    report_path = qa_dir / "table_ocr_html_compare.json"
+    tables_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    if not tables_manifest.exists():
+        payload = {
+            "doc_dir": str(doc_dir),
+            "tables_compared": 0,
+            "avg_similarity": 0.0,
+            "results": [],
+            "error": "missing tables manifest",
+            "report_path": _portable_path(report_path, doc_dir),
+        }
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        return payload
+
+    html_root = ocr_html_dir or (qa_dir / "bbox_ocr_outputs")
+    if not html_root.exists():
+        payload = {
+            "doc_dir": str(doc_dir),
+            "ocr_html_dir": str(html_root),
+            "tables_compared": 0,
+            "avg_similarity": 0.0,
+            "results": [],
+            "error": "ocr html directory missing",
+            "report_path": _portable_path(report_path, doc_dir),
+        }
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        return payload
+
+    table_rows = _load_jsonl(tables_manifest)
+    tables_by_page: dict[int, list[dict[str, Any]]] = {}
+    for row in table_rows:
+        page = int(row.get("page") or 0)
+        if page <= 0:
+            continue
+        tables_by_page.setdefault(page, []).append(row)
+    for rows in tables_by_page.values():
+        rows.sort(key=lambda r: str(r.get("table_id", "")))
+
+    ocr_tables_by_page = _load_ocr_tables_by_page(html_root)
+
+    results: list[dict[str, Any]] = []
+    similarities: list[float] = []
+    unmatched_marker_total = 0
+    unmatched_ocr_total = 0
+    for page in sorted(tables_by_page):
+        marker_tables = tables_by_page.get(page, [])
+        ocr_tables = ocr_tables_by_page.get(page, [])
+        matches, unmatched_marker, unmatched_ocr = _match_tables_for_page(marker_tables, ocr_tables)
+        unmatched_marker_total += len(unmatched_marker)
+        unmatched_ocr_total += len(unmatched_ocr)
+
+        for m_idx in unmatched_marker:
+            marker_row = marker_tables[m_idx]
+            marker_headers = [str(x) for x in marker_row.get("headers", [])]
+            marker_data_rows = [[str(x) for x in row] for row in marker_row.get("rows", []) if isinstance(row, list)]
+            marker_text = _flatten_table_text(marker_headers, marker_data_rows)
+            results.append(
+                {
+                    "table_id": str(marker_row.get("table_id", "")),
+                    "page": page,
+                    "ocr_html_path": "",
+                    "similarity": 0.0,
+                    "marker_symbols": _extract_symbols(marker_text),
+                    "ocr_symbols": "",
+                    "missing_in_marker_vs_ocr": "",
+                    "missing_in_ocr_vs_marker": _extract_symbols(marker_text),
+                    "status": "missing_ocr_html",
+                }
+            )
+
+        for m_idx, o_idx, match_score in matches:
+            marker_row = marker_tables[m_idx]
+            ocr_table = ocr_tables[o_idx]
+            marker_headers = [str(x) for x in marker_row.get("headers", [])]
+            marker_data_rows = [[str(x) for x in row] for row in marker_row.get("rows", []) if isinstance(row, list)]
+            marker_text = _flatten_table_text(marker_headers, marker_data_rows)
+            ocr_headers = [str(x) for x in ocr_table.get("headers", [])]
+            ocr_rows = [[str(x) for x in row] for row in ocr_table.get("rows", []) if isinstance(row, list)]
+            ocr_text = _flatten_table_text(ocr_headers, ocr_rows)
+            similarity = SequenceMatcher(None, marker_text, ocr_text).ratio() if (marker_text or ocr_text) else 1.0
+            similarities.append(float(similarity))
+
+            marker_symbols = _extract_symbols(marker_text)
+            ocr_symbols = _extract_symbols(ocr_text)
+            missing_in_marker = "".join(ch for ch in ocr_symbols if ch not in marker_symbols)
+            missing_in_ocr = "".join(ch for ch in marker_symbols if ch not in ocr_symbols)
+
+            results.append(
+                {
+                    "table_id": str(marker_row.get("table_id", "")),
+                    "page": page,
+                    "ocr_html_path": _portable_path(Path(str(ocr_table.get("path", ""))), doc_dir),
+                    "marker_rows": len(marker_data_rows),
+                    "marker_cols": len(marker_headers),
+                    "ocr_rows": len(ocr_rows),
+                    "ocr_cols": len(ocr_headers),
+                    "similarity": round(float(similarity), 4),
+                    "match_score": match_score,
+                    "marker_symbols": marker_symbols,
+                    "ocr_symbols": ocr_symbols,
+                    "missing_in_marker_vs_ocr": missing_in_marker,
+                    "missing_in_ocr_vs_marker": missing_in_ocr,
+                    "status": "ok",
+                }
+            )
+
+    avg_similarity = round(sum(similarities) / len(similarities), 4) if similarities else 0.0
+    payload = {
+        "doc_dir": str(doc_dir),
+        "ocr_html_dir": str(html_root),
+        "tables_compared": len(similarities),
+        "tables_unmatched_marker": unmatched_marker_total,
+        "tables_unmatched_ocr": unmatched_ocr_total,
+        "avg_similarity": avg_similarity,
+        "results": results,
+        "report_path": _portable_path(report_path, doc_dir),
+    }
+    report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+    return payload
+
+
 def _reconcile_with_grobid(
     *,
     canonical_tables: list[dict[str, Any]],
@@ -488,6 +1164,10 @@ def build_structured_exports(
     deplot_command: str = "",
     deplot_timeout: int = 90,
     table_source: str = "marker-first",
+    table_ocr_merge: bool = True,
+    table_ocr_merge_scope: str = "header",
+    table_artifact_mode: str = "permissive",
+    ocr_html_dir: Path | None = None,
     table_quality_gate: bool = True,
     table_escalation: str = "auto",
     table_escalation_max: int = 20,
@@ -515,13 +1195,46 @@ def build_structured_exports(
     fragments: list[TableFragment] = []
     canonical_tables: list[dict[str, Any]] = []
     qa_flags: list[QAFlag] = []
+    strict_errors: list[str] = []
+    markdown_merge_results: list[dict[str, Any]] = []
+    markdown_tables_matched = 0
+    markdown_tables_patched = 0
+    markdown_cells_patched = 0
+    ocr_tables_by_page: dict[int, list[dict[str, Any]]] = {}
+    ocr_root = (ocr_html_dir or (doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"))
+    if table_ocr_merge and ocr_root.exists():
+        ocr_tables_by_page = _load_ocr_tables_by_page(ocr_root)
 
     marker_tables_raw = doc_dir / "metadata" / "assets" / "structured" / "marker" / "tables_raw.jsonl"
+    pipeline_status: dict[str, Any] = {
+        "table_source": table_source,
+        "table_artifact_mode": table_artifact_mode,
+        "marker_tables_raw_exists": marker_tables_raw.exists(),
+        "table_ocr_merge_enabled": table_ocr_merge,
+        "table_ocr_merge_scope": table_ocr_merge_scope,
+        "ocr_html_dir": str(ocr_root),
+        "ocr_html_inputs_exists": ocr_root.exists(),
+        "ocr_html_input_count": sum(1 for _ in ocr_root.glob("table_*_page_*.md")) if ocr_root.exists() else 0,
+        "errors": [],
+    }
     if table_source == "marker-first" and marker_tables_raw.exists():
         marker_rows = _load_jsonl(marker_tables_raw)
         for idx, row in enumerate(marker_rows, start=1):
             fragments.append(_normalize_fragment_from_marker(row, idx))
         canonical_tables = _merge_table_fragments(fragments)
+        if table_ocr_merge:
+            canonical_tables, merge_summary = _merge_marker_tables_with_ocr_html(
+                canonical_tables=canonical_tables,
+                doc_dir=doc_dir,
+                ocr_html_dir=ocr_html_dir,
+                merge_scope=table_ocr_merge_scope,
+            )
+            summary.ocr_merge = merge_summary
+            pipeline_status["ocr_merge"] = merge_summary
+    elif table_source == "marker-first":
+        pipeline_status["errors"].append("marker_tables_raw_missing")
+        if table_artifact_mode == "strict":
+            strict_errors.append("missing marker/tables_raw.jsonl for marker-first extraction")
 
     for page_path in sorted(pages_dir.glob("*.md")):
         if not page_path.stem.isdigit():
@@ -530,17 +1243,79 @@ def build_structured_exports(
         markdown = page_path.read_text()
 
         tables = [] if canonical_tables else extract_markdown_tables(markdown)
+        page_match_map: dict[int, dict[str, Any]] = {}
+        if table_ocr_merge and tables:
+            page_marker_tables = [
+                {
+                    "table_id": f"p{page_index:04d}_t{t_idx:02d}",
+                    "headers": [_normalize_cell_text(x) for x in table.get("headers", [])],
+                    "rows": [[_normalize_cell_text(x) for x in row] for row in table.get("rows", []) if isinstance(row, list)],
+                }
+                for t_idx, table in enumerate(tables, start=1)
+            ]
+            ocr_tables = ocr_tables_by_page.get(page_index, [])
+            matches, unmatched_marker, unmatched_ocr = _match_tables_for_page(page_marker_tables, ocr_tables)
+            for m_idx, o_idx, score in matches:
+                page_match_map[m_idx] = {"ocr_table": ocr_tables[o_idx], "score": score}
+            for m_idx in unmatched_marker:
+                markdown_merge_results.append(
+                    {
+                        "table_id": f"p{page_index:04d}_t{m_idx + 1:02d}",
+                        "page": page_index,
+                        "status": "missing_ocr_html",
+                        "cells_patched": 0,
+                        "ocr_html_path": "",
+                    }
+                )
+
         for t_index, table in enumerate(tables, start=1):
+            headers = [_normalize_cell_text(x) for x in table["headers"]]
+            rows = [[_normalize_cell_text(x) for x in r] for r in table["rows"]]
+            if table_ocr_merge:
+                matched = page_match_map.get(t_index - 1)
+                ocr_table = matched.get("ocr_table") if isinstance(matched, dict) else None
+                if ocr_table is not None:
+                    markdown_tables_matched += 1
+                    marker_symbols_before = _extract_symbols(_flatten_table_text(headers, rows))
+                    ocr_headers = [str(x) for x in ocr_table.get("headers", [])]
+                    ocr_rows = [[str(x) for x in row] for row in ocr_table.get("rows", []) if isinstance(row, list)]
+                    headers, rows, patched_cells, patch_reasons = _patch_table_grid(
+                        marker_headers=headers,
+                        marker_rows=rows,
+                        ocr_headers=ocr_headers,
+                        ocr_rows=ocr_rows,
+                        merge_scope=table_ocr_merge_scope,
+                    )
+                    if patched_cells:
+                        markdown_tables_patched += 1
+                        markdown_cells_patched += patched_cells
+                        merge_status = "patched"
+                    else:
+                        merge_status = "unchanged"
+                    markdown_merge_results.append(
+                        {
+                            "table_id": f"p{page_index:04d}_t{t_index:02d}",
+                            "page": page_index,
+                            "status": merge_status,
+                            "match_score": float(matched.get("score", 0.0)) if isinstance(matched, dict) else 0.0,
+                            "cells_patched": patched_cells,
+                            "patch_reasons": patch_reasons,
+                            "ocr_html_path": _portable_path(Path(ocr_table["path"]), doc_dir),
+                            "marker_symbols_before": marker_symbols_before,
+                            "marker_symbols_after": _extract_symbols(_flatten_table_text(headers, rows)),
+                            "ocr_symbols": _extract_symbols(_flatten_table_text(ocr_headers, ocr_rows)),
+                        }
+                    )
             table_id = f"p{page_index:04d}_t{t_index:02d}"
             csv_path = tables_dir / f"{table_id}.csv"
             json_path = tables_dir / f"{table_id}.json"
-            _write_table_csv(csv_path, table["headers"], table["rows"])
+            _write_table_csv(csv_path, headers, rows)
             payload = {
                 "table_id": table_id,
                 "page": page_index,
                 "caption": table["caption"],
-                "headers": table["headers"],
-                "rows": table["rows"],
+                "headers": headers,
+                "rows": rows,
                 "csv_path": _portable_path(csv_path, doc_dir),
             }
             json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
@@ -602,8 +1377,13 @@ def build_structured_exports(
         canonical_rows: list[dict[str, Any]] = []
         for table in canonical_tables:
             header = table.get("header_rows", [])
-            headers = list(header[0]) if header else []
-            rows = [list(r) for r in table.get("data_rows", []) if isinstance(r, list)]
+            headers = _collapse_header_rows(header) if isinstance(header, list) else []
+            headers = [_normalize_cell_text(x) for x in headers]
+            rows = [
+                [_normalize_cell_text(x) for x in r]
+                for r in table.get("data_rows", [])
+                if isinstance(r, list)
+            ]
             metrics = _quality_metrics(headers, rows)
             if table_quality_gate and _fails_quality(metrics):
                 msg = f"{table.get('table_id')}: quality gate failed"
@@ -677,7 +1457,41 @@ def build_structured_exports(
             )
         )
         if table_qa_mode == "strict" and any(flag.severity in {"warn", "error"} for flag in qa_flags):
-            raise RuntimeError("Table QA strict mode failed due to disagreements.")
+            strict_errors.append("table QA strict mode failed due to disagreements")
+    elif table_ocr_merge:
+        qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa"
+        qa_root.mkdir(parents=True, exist_ok=True)
+        merge_payload = {
+            "enabled": True,
+            "merge_scope": table_ocr_merge_scope,
+            "tables_considered": len(table_rows),
+            "tables_matched": markdown_tables_matched,
+            "tables_patched": markdown_tables_patched,
+            "cells_patched": markdown_cells_patched,
+            "report_path": _portable_path(qa_root / "table_ocr_merge.json", doc_dir),
+            "results": markdown_merge_results,
+            "mode": "markdown_tables",
+        }
+        (qa_root / "table_ocr_merge.json").write_text(json.dumps(merge_payload, indent=2, ensure_ascii=True))
+        summary.ocr_merge = merge_payload
+        pipeline_status["ocr_merge"] = merge_payload
+
+    if table_ocr_merge and summary.table_count > 0:
+        merge_info = summary.ocr_merge if isinstance(summary.ocr_merge, dict) else {}
+        matched = int(merge_info.get("tables_matched", 0) or 0)
+        if matched == 0:
+            pipeline_status["errors"].append("no_ocr_table_matches")
+        if table_artifact_mode == "strict" and matched < summary.table_count:
+            strict_errors.append(f"OCR merge matched {matched}/{summary.table_count} tables")
+
+    pipeline_status_path = doc_dir / "metadata" / "assets" / "structured" / "qa" / "pipeline_status.json"
+    pipeline_status_path.parent.mkdir(parents=True, exist_ok=True)
+    pipeline_status["table_count"] = summary.table_count
+    pipeline_status["figure_count"] = summary.figure_count
+    if strict_errors:
+        pipeline_status["errors"].extend([f"strict:{err}" for err in strict_errors])
+    pipeline_status["status"] = "ok" if not pipeline_status["errors"] else ("error" if strict_errors else "warnings")
+    pipeline_status_path.write_text(json.dumps(pipeline_status, indent=2, ensure_ascii=True))
 
     tables_jsonl = tables_dir / "manifest.jsonl"
     if table_rows:
@@ -702,4 +1516,6 @@ def build_structured_exports(
     }
     extracted_root.mkdir(parents=True, exist_ok=True)
     (extracted_root / "manifest.json").write_text(json.dumps(manifest_payload, indent=2, ensure_ascii=True))
+    if strict_errors:
+        raise RuntimeError("Strict table artifact mode failed: " + "; ".join(strict_errors))
     return summary
