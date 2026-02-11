@@ -4,7 +4,8 @@
 - Use `uv` for Python workflows instead of `pip`.
   - Install deps: `uv sync`
   - Run CLI: `uv run paper-ocr run <in_dir> <out_dir>`
-  - Run tests: `uv run pytest`
+  - Run tests (fast lane, default): `uv run pytest`
+  - Run full suite (pre-merge/CI parity): `uv run pytest --run-integration --run-slow --run-network --run-service --run-gpu`
 - Run normal/lightweight tasks locally on this machine by default.
 - Use WSL only for heavy structured workloads that need GPU-backed services:
   - Marker service workloads
@@ -88,9 +89,16 @@ out/<input_parent>/doc_<doc_id>/
 - `src/paper_ocr/schemas.py` manifest construction
 
 ## Testing
-- Run tests with: `uv run pytest`
+- Fast lane (default local): `uv run pytest`
+  - Skips tests marked `integration`, `slow`, `network`, `service`, `gpu`.
+- Full lane (required before merge): `uv run pytest --run-integration --run-slow --run-network --run-service --run-gpu`
+- Optional full-lane env toggle: `PAPER_OCR_TEST_FULL=1 uv run pytest`
 - Add tests in `tests/` for each new feature or bugfix.
 - Tests are required for new additions and must pass.
+- Useful local iteration commands:
+  - Last failed only: `uv run pytest --lf`
+  - Failed-first ordering: `uv run pytest --ff`
+  - Subset filter: `uv run pytest -k "<expr>"`
 
 ## Best Practices
 - Preserve stable output (idempotent writes unless `--force`).

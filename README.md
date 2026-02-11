@@ -489,10 +489,42 @@ Behavior notes:
 
 ## Development
 
-Run tests:
+The test suite uses **test lanes** so local iteration stays fast on low-resource machines.
+
+Fast lane (default local run):
 
 ```bash
 uv run pytest
+```
+
+This excludes tests marked `integration`, `slow`, `network`, `service`, and `gpu`.
+
+Full lane (pre-push / CI / release checks):
+
+```bash
+uv run pytest --run-integration --run-slow --run-network --run-service --run-gpu
+```
+
+Equivalent env-based full run:
+
+```bash
+PAPER_OCR_TEST_FULL=1 uv run pytest
+```
+
+Useful developer commands:
+
+```bash
+# run only last failed tests
+uv run pytest --lf
+
+# run failures first, then the rest
+uv run pytest --ff
+
+# run a subset by expression
+uv run pytest -k "doi and not telegram"
+
+# run one module in full lane
+uv run pytest tests/test_cli.py --run-integration
 ```
 
 Project layout:
@@ -530,7 +562,10 @@ Project layout:
 
 ## Contributing
 
-- Use `uv` commands (`uv sync`, `uv run ...`, `uv run pytest`).
+- Use `uv` commands (`uv sync`, `uv run ...`).
+- Use test lanes:
+  - local fast lane: `uv run pytest`
+  - full lane before merge: `uv run pytest --run-integration --run-slow --run-network --run-service --run-gpu`
 - Add/adjust tests with behavior changes.
 - Keep output structure deterministic and idempotent.
 - Prefer small, reviewable commits.

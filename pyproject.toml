@@ -31,4 +31,12 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q -ra"
+testpaths = ["tests"]
+markers = [
+  "slow: long-running tests (opt-in locally)",
+  "integration: cross-module integration tests (opt-in locally)",
+  "network: tests requiring outbound network access (opt-in locally)",
+  "service: tests requiring running external services (opt-in locally)",
+  "gpu: tests requiring GPU resources (opt-in locally)",
+]
