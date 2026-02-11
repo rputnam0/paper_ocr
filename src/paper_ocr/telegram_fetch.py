@@ -41,6 +41,8 @@ FAILURE_MARKERS = (
     "no points",
 )
 SEARCHING_MARKERS = ("searching", "processing", "queued", "looking at")
+UPLOAD_PROGRESS_MARKERS = ("uploaded to telegram", "uploading to telegram")
+POINTS_LABEL_RE = re.compile(r"(\d+)\s*pts?", re.IGNORECASE)
 
 REPORT_COLUMNS = [
     "doi_original",
@@ -333,6 +335,27 @@ def _pdf_button_index(message: Any) -> int | None:
     return None
 
 
+def _confirm_button_index(message: Any) -> int | None:
+    labels = _button_labels(message)
+    for idx, label in enumerate(labels):
+        low = label.lower()
+        if "confirm" in low or "✅" in label:
+            return idx
+    return None
+
+
+def _required_points(message: Any) -> int | None:
+    labels = _button_labels(message)
+    for label in labels:
+        match = POINTS_LABEL_RE.search(label)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+    return None
+
+
 def _is_hard_failure(text: str) -> bool:
     low = text.lower()
     return any(marker in low for marker in FAILURE_MARKERS)
@@ -340,7 +363,9 @@ def _is_hard_failure(text: str) -> bool:
 
 def _is_searching(text: str) -> bool:
     low = text.lower()
-    return any(marker in low for marker in SEARCHING_MARKERS)
+    return any(marker in low for marker in SEARCHING_MARKERS) or any(
+        marker in low for marker in UPLOAD_PROGRESS_MARKERS
+    )
 
 
 async def _with_floodwait(call: Callable[[], Awaitable[Any]]) -> Any:
@@ -405,43 +430,12 @@ async def process_doi(
     async def _next_response(conv: Any, *, edit_from: Any | None = None) -> Any:
         while True:
             try:
-                if edit_from is not None and hasattr(conv, "get_edit"):
-                    response_task = asyncio.create_task(_with_floodwait(conv.get_response))
-                    edit_task = asyncio.create_task(
-                        _with_floodwait(lambda: conv.get_edit(message=edit_from))
-                    )
-                    done, pending = await asyncio.wait(
-                        {response_task, edit_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    response_timed_out = False
-                    if response_task in done:
-                        exc = response_task.exception()
-                        if exc is None:
-                            return response_task.result()
-                        if isinstance(exc, asyncio.TimeoutError):
-                            response_timed_out = True
-                        else:
-                            raise exc
-
-                    edit_timed_out = False
-                    if edit_task in done:
-                        exc = edit_task.exception()
-                        if exc is None:
-                            return edit_task.result()
-                        if isinstance(exc, asyncio.TimeoutError):
-                            edit_timed_out = True
-                        else:
-                            raise exc
-
-                    if response_timed_out or edit_timed_out:
-                        raise asyncio.TimeoutError()
-                    raise RuntimeError("No completed task result while waiting for bot response")
-
-                return await _with_floodwait(conv.get_response)
+                try:
+                    return await _with_floodwait(conv.get_response)
+                except asyncio.TimeoutError:
+                    if edit_from is not None and hasattr(conv, "get_edit"):
+                        return await _with_floodwait(lambda: conv.get_edit(message=edit_from))
+                    raise
             except asyncio.TimeoutError:
                 if saw_searching and search_deadline is not None and time.monotonic() < search_deadline:
                     continue
@@ -484,6 +478,17 @@ async def process_doi(
                     await _with_floodwait(lambda: response.click(pdf_button_idx))
                     response = await _next_response(conv)
                     continue
+
+                confirm_idx = _confirm_button_index(response)
+                if confirm_idx is not None:
+                    required_points = _required_points(response)
+                    if required_points is not None and required_points <= 0:
+                        await _with_floodwait(lambda: response.click(confirm_idx))
+                        saw_searching = True
+                        if search_deadline is None:
+                            search_deadline = time.monotonic() + max(search_timeout, response_timeout)
+                        response = await _next_response(conv, edit_from=sent_message)
+                        continue
 
                 if _is_hard_failure(text):
                     status = "Failed"

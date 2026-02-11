@@ -295,6 +295,80 @@ def test_process_doi_searching_then_timeout_then_success(tmp_path: Path):
     assert result.status == "Success"
 
 
+def test_process_doi_uploaded_to_telegram_then_timeout_then_success(tmp_path: Path):
+    conv = _FakeConversation(
+        [
+            _FakeMessage(text="⬇️ sample.pdf\n|███ 25% uploaded to Telegram..."),
+            asyncio.TimeoutError(),
+            _FakeMessage(has_file=True),
+        ]
+    )
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+
+
+def test_process_doi_zero_point_confirm_then_success(tmp_path: Path):
+    file_msg = _FakeMessage(has_file=True)
+    conv = _FakeConversation([])
+
+    def _on_confirm(_index: int) -> None:
+        conv._responses.append(file_msg)
+
+    confirm_msg = _FakeMessage(
+        text="Ready to send",
+        buttons=[[_FakeButton("⚡ 0 pts"), _FakeButton("✅ Confirm"), _FakeButton("✖️ Cancel")]],
+        on_click=_on_confirm,
+    )
+    conv._responses.append(confirm_msg)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+    assert confirm_msg.clicked == [1]
+
+
+def test_process_doi_nonzero_point_confirm_stays_unknown(tmp_path: Path):
+    confirm_msg = _FakeMessage(
+        text="Ready to send",
+        buttons=[[_FakeButton("⚡ 1 pts"), _FakeButton("✅ Confirm"), _FakeButton("✖️ Cancel")]],
+    )
+    conv = _FakeConversation([confirm_msg])
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "UnknownResponse"
+    assert confirm_msg.clicked == []
+
+
 def test_process_doi_link_button_resolves_doi_and_requeries(tmp_path: Path):
     card = _FakeMessage(
         text="🔬 Result card",
