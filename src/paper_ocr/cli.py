@@ -293,7 +293,7 @@ def _parse_args() -> argparse.Namespace:
     fetch.add_argument(
         "--scihub-base-urls",
         type=str,
-        default=os.getenv("SCIHUB_BASE_URLS", ""),
+        default=os.getenv("PAPER_OCR_SCIHUB_BASE_URLS", os.getenv("SCIHUB_BASE_URLS", "")),
         help="Optional comma-separated Sci-Hub mirrors; auto-discovered if omitted.",
     )
     fetch.add_argument("--report-file", type=Path, default=None)

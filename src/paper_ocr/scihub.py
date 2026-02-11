@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import re
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -130,36 +129,3 @@ def download_pdf_via_scihub(
         except Exception:
             continue
     return None
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Download a paper PDF via Sci-Hub mirrors.")
-    parser.add_argument("identifier", type=str, help="DOI, PMID, or paper URL")
-    parser.add_argument("output", type=Path, help="Output PDF path")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
-    parser.add_argument(
-        "--base-urls",
-        type=str,
-        default="",
-        help="Comma-separated mirror URLs. If empty, discover mirrors from sci-hub.now.sh.",
-    )
-    return parser
-
-
-def main() -> int:
-    args = _build_parser().parse_args()
-    path = download_pdf_via_scihub(
-        identifier=args.identifier,
-        output_path=args.output,
-        timeout=int(args.timeout),
-        base_urls=parse_scihub_base_urls(args.base_urls),
-    )
-    if path is None:
-        print("Failed to download PDF via Sci-Hub mirrors")
-        return 1
-    print(str(path))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

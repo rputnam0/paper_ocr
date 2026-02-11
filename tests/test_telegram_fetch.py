@@ -269,6 +269,37 @@ def test_process_doi_hard_failure_then_scihub_fallback_failure_keeps_status(tmp_
     assert "scihub fallback did not find a pdf" in result.error.lower()
 
 
+def test_process_doi_hard_failure_scihub_fallback_tries_original_then_normalized(tmp_path: Path, monkeypatch):
+    conv = _FakeConversation([_FakeMessage(text="Not found")])
+    seen_identifiers = []
+
+    def _fake_download(**kwargs):  # noqa: ANN001
+        identifier = kwargs["identifier"]
+        seen_identifiers.append(identifier)
+        if identifier == "10.1000/abc":
+            out = kwargs["output_path"]
+            out.write_bytes(b"pdf")
+            return out
+        return None
+
+    monkeypatch.setattr(telegram_fetch, "download_pdf_via_scihub", _fake_download)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="https://doi.org/10.1000/ABC",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            scihub_fallback=True,
+            scihub_timeout=5,
+            scihub_base_urls=[],
+        )
+    )
+
+    assert result.status == "Success"
+    assert seen_identifiers == ["https://doi.org/10.1000/ABC", "10.1000/abc"]
+
+
 def test_process_doi_unknown_response(tmp_path: Path):
     conv = _FakeConversation([_FakeMessage(text="Working on it")])
 

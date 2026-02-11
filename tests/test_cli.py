@@ -167,6 +167,23 @@ def test_parse_fetch_telegram_scihub_flags(monkeypatch):
     assert args.scihub_base_urls == "https://sci-hub.se,https://sci-hub.ru"
 
 
+def test_parse_fetch_telegram_scihub_base_urls_from_project_env(monkeypatch):
+    monkeypatch.setenv("PAPER_OCR_SCIHUB_BASE_URLS", "https://sci-hub.st,https://sci-hub.se")
+    monkeypatch.delenv("SCIHUB_BASE_URLS", raising=False)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "fetch-telegram",
+            "papers.csv",
+        ],
+    )
+
+    args = cli._parse_args()
+
+    assert args.scihub_base_urls == "https://sci-hub.st,https://sci-hub.se"
+
+
 def test_parse_resolve_dois_args(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",

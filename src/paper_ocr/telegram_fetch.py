@@ -549,17 +549,26 @@ async def process_doi(
     if scihub_fallback and status not in {"Success", "Exists"}:
         original_status = status
         fallback_note = "SciHub fallback did not find a PDF"
+        fallback_identifiers: list[str] = []
+        for candidate in [doi_original.strip(), doi_normalized.strip()]:
+            if candidate and candidate not in fallback_identifiers:
+                fallback_identifiers.append(candidate)
         try:
-            fallback_download = await asyncio.to_thread(
-                download_pdf_via_scihub,
-                identifier=doi_normalized,
-                output_path=fallback_path,
-                timeout=int(scihub_timeout),
-                base_urls=scihub_base_urls or None,
-            )
-            if fallback_download is not None and Path(fallback_download).exists():
+            fallback_download: Path | None = None
+            for identifier in fallback_identifiers:
+                candidate_path = await asyncio.to_thread(
+                    download_pdf_via_scihub,
+                    identifier=identifier,
+                    output_path=fallback_path,
+                    timeout=int(scihub_timeout),
+                    base_urls=scihub_base_urls or None,
+                )
+                if candidate_path is not None and Path(candidate_path).exists():
+                    fallback_download = Path(candidate_path)
+                    break
+            if fallback_download is not None:
                 status = "Success"
-                fallback_path = Path(fallback_download)
+                fallback_path = fallback_download
                 error = ""
                 marker = f"fallback=scihub after={original_status}"
                 excerpt = _excerpt(f"{excerpt} | {marker}" if excerpt else marker)
