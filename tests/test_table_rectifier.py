@@ -200,3 +200,67 @@ def test_rectifier_requires_provenance_for_new_nonempty_cells(tmp_path: Path):
     table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
     after = json.loads(table_json_path.read_text())
     assert after["data_rows"] == before["data_rows"]
+
+
+def test_rectifier_infers_missing_provenance_from_ocr_evidence(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "table_01_page_0001.md").write_text(
+        "<table><tr><th>Polymer</th><th>Value</th></tr><tr><td>A</td><td>1.2 ± 0.2</td></tr></table>"
+    )
+    payload = {
+        "rectified_header_rows_full": [["Polymer", "Value"]],
+        "rectified_rows": [["A", "1.2 ± 0.2"]],
+        "edits": [{"type": "replace_cell", "description": "fix OCR symbol"}],
+        "cell_provenance": [],
+        "rectifier_confidence": 0.82,
+        "needs_review": False,
+    }
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        return _FakeTextResponse(json.dumps(payload))
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.applied == 1
+    table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
+    after = json.loads(table_json_path.read_text())
+    assert after["data_rows"] == [["A", "1.2 ± 0.2"]]
+    assert any(int(item.get("row", -1)) == 0 and int(item.get("col", -1)) == 1 for item in after["cell_provenance"])
+
+
+def test_rectifier_retries_on_invalid_schema_before_fallback(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    calls = {"count": 0}
+    invalid_payload = {
+        "rectified_header_rows_full": [],
+        "rectified_rows": [],
+        "edits": [],
+        "cell_provenance": [],
+        "rectifier_confidence": 0.2,
+        "needs_review": True,
+    }
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return _FakeTextResponse(json.dumps(invalid_payload))
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert calls["count"] == 2
+    assert result.applied == 1

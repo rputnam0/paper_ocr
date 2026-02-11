@@ -322,6 +322,32 @@ def _build_repair_prompt(raw_text: str) -> str:
     )
 
 
+def _build_schema_retry_prompt(*, schema_reason: str, raw_payload: dict[str, Any], table_payload: dict[str, Any]) -> str:
+    request = {
+        "schema_reason": schema_reason,
+        "required_keys": [
+            "rectified_header_rows_full",
+            "rectified_rows",
+            "edits",
+            "cell_provenance",
+            "rectifier_confidence",
+            "needs_review",
+        ],
+        "minimum_requirements": {
+            "nonempty_rectified_header_rows_full": True,
+            "nonempty_rectified_rows": True,
+            "rectangular_grid": True,
+            "include_cell_provenance_for_changed_cells": True,
+        },
+        "fallback_if_unsure": {
+            "rectified_header_rows_full": table_payload.get("header_rows_full", []),
+            "rectified_rows": table_payload.get("data_rows", []),
+        },
+        "previous_output": raw_payload,
+    }
+    return "Your previous rectification output was invalid. Return corrected JSON only.\n" + json.dumps(request, ensure_ascii=True)
+
+
 def _normalize_rectified_payload(payload: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
     header_rows_raw = payload.get("rectified_header_rows_full")
     rows_raw = payload.get("rectified_rows")
@@ -422,8 +448,75 @@ def _normalize_provenance(raw: Any) -> dict[tuple[int, int], dict[str, Any]]:
     return out
 
 
+def _looks_substantive(value: str) -> bool:
+    text = _normalize_cell_text(value)
+    return bool(text and text not in {"-", "—", "–", "na", "n/a"})
+
+
+def _infer_provenance_for_changed_cells(
+    *,
+    provenance_by_cell: dict[tuple[int, int], dict[str, Any]],
+    rows: list[list[str]],
+    orig_rows: list[list[str]],
+    evidence: dict[str, str],
+) -> dict[tuple[int, int], dict[str, Any]]:
+    out = dict(provenance_by_cell)
+    marker_text = str(evidence.get("marker_text", ""))
+    ocr_text = str(evidence.get("ocr_text", ""))
+    context_text = str(evidence.get("context_text", ""))
+    marker_lower = marker_text.lower()
+    ocr_lower = ocr_text.lower()
+    context_lower = context_text.lower()
+
+    def _pick_source(cell_text: str, old_text: str) -> tuple[str, str, float] | None:
+        cell_lower = cell_text.lower()
+        if cell_lower and cell_lower in marker_lower:
+            return ("marker", cell_text, 0.86)
+        if cell_lower and cell_lower in ocr_lower:
+            return ("ocr", cell_text, 0.81)
+        if cell_lower and cell_lower in context_lower:
+            return ("context", cell_text, 0.72)
+        old_lower = old_text.lower()
+        if old_text and old_lower and old_lower in marker_lower:
+            return ("marker", old_text, 0.66)
+        return None
+
+    for row_idx, row in enumerate(rows):
+        for col_idx, cell in enumerate(row):
+            if (row_idx, col_idx) in out:
+                continue
+            new_text = _normalize_cell_text(cell)
+            old_text = ""
+            if row_idx < len(orig_rows) and col_idx < len(orig_rows[row_idx]):
+                old_text = _normalize_cell_text(orig_rows[row_idx][col_idx])
+            if not new_text or new_text == old_text:
+                continue
+            inferred = _pick_source(new_text, old_text)
+            if inferred is None:
+                continue
+            source, evidence_text, confidence = inferred
+            out[(row_idx, col_idx)] = {
+                "row": row_idx,
+                "col": col_idx,
+                "source": source,
+                "evidence_text": evidence_text,
+                "confidence": confidence,
+            }
+    return out
+
+
 def _tokenize(text: str) -> set[str]:
     return {token for token in TOKEN_RE.findall(str(text or "").lower()) if token}
+
+
+def _canonicalize_symbol(ch: str) -> str:
+    dash_chars = {"-", "−", "–", "—", "‑"}
+    degree_chars = {"°", "º"}
+    if ch in dash_chars:
+        return "-"
+    if ch in degree_chars:
+        return "°"
+    return ch
 
 
 def _validate_evidence(
@@ -459,6 +552,12 @@ def _validate_evidence(
         return False, "evidence_violation:row_loss", []
 
     provenance_by_cell = _normalize_provenance(normalized.get("cell_provenance_raw"))
+    provenance_by_cell = _infer_provenance_for_changed_cells(
+        provenance_by_cell=provenance_by_cell,
+        rows=rows,
+        orig_rows=orig_rows,
+        evidence=evidence,
+    )
     normalized_provenance = sorted(provenance_by_cell.values(), key=lambda row: (int(row["row"]), int(row["col"])))
     marker_lower = evidence.get("marker_text", "").lower()
     ocr_lower = evidence.get("ocr_text", "").lower()
@@ -469,7 +568,7 @@ def _validate_evidence(
             old_value = ""
             if row_idx < len(orig_rows) and col_idx < len(orig_rows[row_idx]):
                 old_value = _normalize_cell_text(orig_rows[row_idx][col_idx])
-            if new_value and new_value != old_value:
+            if _looks_substantive(new_value) and new_value != old_value:
                 provenance = provenance_by_cell.get((row_idx, col_idx))
                 if provenance is None:
                     return False, f"evidence_violation:missing_provenance:{row_idx}:{col_idx}", []
@@ -488,7 +587,7 @@ def _validate_evidence(
         if source_blob and evidence_text_lower not in source_blob:
             return False, f"evidence_violation:provenance_mismatch:{key[0]}:{key[1]}", []
 
-    original_union_symbols = _extract_symbols(
+    original_union_symbols_raw = _extract_symbols(
         "\n".join(
             [
                 " | ".join(orig_headers),
@@ -497,10 +596,12 @@ def _validate_evidence(
             ]
         )
     )
-    rectified_symbols = _extract_symbols(
+    rectified_symbols_raw = _extract_symbols(
         "\n".join([" | ".join(headers), "\n".join(" | ".join(row) for row in rows)])
     )
-    missing_symbols = "".join(sym for sym in original_union_symbols if sym not in rectified_symbols)
+    original_union_symbols = {_canonicalize_symbol(sym) for sym in original_union_symbols_raw}
+    rectified_symbols = {_canonicalize_symbol(sym) for sym in rectified_symbols_raw}
+    missing_symbols = "".join(sorted(sym for sym in original_union_symbols if sym not in rectified_symbols))
     if missing_symbols:
         return False, f"evidence_violation:symbol_loss:{missing_symbols}", []
 
@@ -727,7 +828,31 @@ async def run_table_rectification_for_doc(
             )
             continue
 
+        schema_retry_count = 0
         ok_schema, schema_reason, normalized = _normalize_rectified_payload(parsed)
+        while (not ok_schema) and schema_retry_count < 1 and schema_reason in {
+            "invalid_schema:missing_grid",
+            "invalid_schema:empty_grid",
+        }:
+            schema_retry_count += 1
+            try:
+                retry = await call_model(
+                    client=client,
+                    model=config.model,
+                    prompt=_build_schema_retry_prompt(
+                        schema_reason=schema_reason,
+                        raw_payload=parsed,
+                        table_payload=table_payload,
+                    ),
+                    max_tokens=int(config.max_tokens),
+                )
+            except Exception:
+                break
+            retry_parsed = _extract_json_object(getattr(retry, "content", ""))
+            if not retry_parsed:
+                break
+            parsed = retry_parsed
+            ok_schema, schema_reason, normalized = _normalize_rectified_payload(parsed)
         if not ok_schema:
             result.fallbacked += 1
             result.invalid_schema += 1
