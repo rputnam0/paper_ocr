@@ -104,7 +104,7 @@ def _is_table_separator(line: str, expected_cols: int) -> bool:
     if len(cells) != expected_cols or expected_cols == 0:
         return False
     for cell in cells:
-        if not re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")):
+        if not re.fullmatch(r":?-{2,}:?", cell.replace(" ", "")):
             return False
     return True
 
@@ -153,6 +153,36 @@ def extract_markdown_tables(markdown: str) -> list[dict[str, Any]]:
         )
         i = j
     return out
+
+
+def _markdown_fallback_table_for_page(doc_dir: Path, page: int) -> dict[str, Any] | None:
+    page_path = doc_dir / "pages" / f"{int(page):04d}.md"
+    if not page_path.exists():
+        return None
+    tables = extract_markdown_tables(page_path.read_text())
+    if not tables:
+        return None
+
+    best: dict[str, Any] | None = None
+    best_score = -1.0
+    for table in tables:
+        headers = [_normalize_cell_text(x) for x in table.get("headers", [])]
+        rows = [
+            [_normalize_cell_text(x) for x in r]
+            for r in table.get("rows", [])
+            if isinstance(r, list)
+        ]
+        nonempty_headers = sum(1 for h in headers if h)
+        nonempty_cells = sum(1 for r in rows for c in r if str(c).strip())
+        score = float(nonempty_cells) + float(nonempty_headers * 2)
+        if score > best_score:
+            best_score = score
+            best = {
+                "headers": headers,
+                "rows": rows,
+                "caption": str(table.get("caption", "")).strip(),
+            }
+    return best
 
 
 def extract_markdown_figures(markdown: str) -> list[dict[str, str]]:
@@ -570,6 +600,21 @@ def _fails_quality(metrics: dict[str, Any]) -> bool:
     )
 
 
+def _catastrophic_quality(headers: list[str], rows: list[list[str]], metrics: dict[str, Any]) -> tuple[bool, str]:
+    # Catastrophic outputs are excluded from exported dataset to avoid high-confidence bad tables.
+    if not rows:
+        return True, "no_data_rows"
+    nonempty_headers = [str(h or "").strip() for h in headers if str(h or "").strip()]
+    if len(headers) >= 4 and len(nonempty_headers) <= 1:
+        return True, "sparse_headers"
+    if len(nonempty_headers) >= 3 and len(set(nonempty_headers)) <= 1:
+        return True, "duplicate_headers"
+    max_header_len = max((len(str(h or "")) for h in headers), default=0)
+    if max_header_len >= 180:
+        return True, f"header_cell_too_long:{max_header_len}"
+    return False, ""
+
+
 def _escalation_improves_quality(before: dict[str, Any], after: dict[str, Any]) -> bool:
     keys = (
         "empty_cell_ratio",
@@ -665,8 +710,15 @@ def _parse_ocr_html_table(path: Path) -> tuple[list[str], list[list[str]]]:
             first = markdown_tables[0]
             return list(first.get("headers", [])), [list(r) for r in first.get("rows", [])]
         return [], []
-    headers = _collapse_header_rows(header_rows) if header_rows else []
-    rows = [list(r) for r in data_rows]
+    # Some OCR engines emit all rows as <th>. Treat first row as header and the
+    # remainder as data so we can still recover usable tables.
+    if header_rows and not data_rows and len(header_rows) > 1:
+        headers = [_normalize_cell_text(x) for x in header_rows[0]]
+        rows = [[_normalize_cell_text(x) for x in row] for row in header_rows[1:]]
+        return headers, rows
+
+    headers = [_normalize_cell_text(x) for x in (_collapse_header_rows(header_rows) if header_rows else [])]
+    rows = [[_normalize_cell_text(x) for x in r] for r in data_rows]
     return headers, rows
 
 
@@ -793,6 +845,29 @@ def _match_tables_for_page(
     unmatched_marker = [idx for idx in range(len(marker_tables)) if idx not in used_marker]
     unmatched_ocr = [idx for idx in range(len(ocr_tables)) if idx not in used_ocr]
     return matches, unmatched_marker, unmatched_ocr
+
+
+def _select_ocr_fallback_for_marker_table(
+    marker_headers: list[str],
+    marker_rows: list[list[str]],
+    page_ocr_tables: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not page_ocr_tables:
+        return None
+    marker_rows_payload = [
+        {
+            "table_id": "marker",
+            "headers": [str(x) for x in marker_headers],
+            "rows": [[str(x) for x in row] for row in marker_rows],
+        }
+    ]
+    matches, _, _ = _match_tables_for_page(marker_rows_payload, page_ocr_tables)
+    if matches:
+        _, o_idx, _ = matches[0]
+        return page_ocr_tables[o_idx]
+    if len(page_ocr_tables) == 1:
+        return page_ocr_tables[0]
+    return None
 
 
 def _patch_table_grid(
@@ -1226,7 +1301,23 @@ def build_structured_exports(
     if table_ocr_merge and ocr_root.exists():
         ocr_tables_by_page = _load_ocr_tables_by_page(ocr_root)
 
+    marker_localization_success: bool | None = None
+    marker_localization_error = ""
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest_payload = json.loads(manifest_path.read_text())
+        except Exception:
+            manifest_payload = {}
+        structured_extraction = manifest_payload.get("structured_extraction", {}) if isinstance(manifest_payload, dict) else {}
+        marker_localization = structured_extraction.get("marker_localization", {}) if isinstance(structured_extraction, dict) else {}
+        if isinstance(marker_localization, dict):
+            if "success" in marker_localization:
+                marker_localization_success = bool(marker_localization.get("success"))
+            marker_localization_error = str(marker_localization.get("error", "") or "").strip()
+
     marker_tables_raw = doc_dir / "metadata" / "assets" / "structured" / "marker" / "tables_raw.jsonl"
+    marker_tables_raw_missing = table_source == "marker-first" and not marker_tables_raw.exists()
     pipeline_status: dict[str, Any] = {
         "table_source": table_source,
         "table_artifact_mode": table_artifact_mode,
@@ -1238,6 +1329,10 @@ def build_structured_exports(
         "ocr_html_input_count": sum(1 for _ in ocr_root.glob("table_*_page_*.md")) if ocr_root.exists() else 0,
         "errors": [],
     }
+    if marker_localization_success is not None:
+        pipeline_status["marker_localization_success"] = marker_localization_success
+    if marker_localization_error:
+        pipeline_status["marker_localization_error"] = marker_localization_error
     if table_source == "marker-first" and marker_tables_raw.exists():
         marker_rows = _load_jsonl(marker_tables_raw)
         for idx, row in enumerate(marker_rows, start=1):
@@ -1253,7 +1348,6 @@ def build_structured_exports(
             summary.ocr_merge = merge_summary
             pipeline_status["ocr_merge"] = merge_summary
     elif table_source == "marker-first":
-        pipeline_status["errors"].append("marker_tables_raw_missing")
         if table_artifact_mode == "strict":
             strict_errors.append("missing marker/tables_raw.jsonl for marker-first extraction")
 
@@ -1397,6 +1491,7 @@ def build_structured_exports(
         _write_jsonl(extracted_root / "table_fragments.jsonl", fragment_rows)
         fragment_conf = {frag.fragment_id: float(frag.caption_confidence) for frag in fragments}
         canonical_rows: list[dict[str, Any]] = []
+        excluded_low_quality = 0
         for table in canonical_tables:
             header = table.get("header_rows", [])
             headers = _collapse_header_rows(header) if isinstance(header, list) else []
@@ -1498,6 +1593,96 @@ def build_structured_exports(
             table["quality_metrics"] = metrics
             if escalated:
                 table["escalated"] = True
+            catastrophic, catastrophic_reason = _catastrophic_quality(headers, rows, metrics)
+            if catastrophic:
+                page_ocr_tables = ocr_tables_by_page.get(int(page), [])
+                ocr_fallback = _select_ocr_fallback_for_marker_table(headers, rows, page_ocr_tables)
+                if ocr_fallback is not None:
+                    ocr_headers = [_normalize_cell_text(x) for x in ocr_fallback.get("headers", [])]
+                    ocr_rows = [
+                        [_normalize_cell_text(x) for x in r]
+                        for r in ocr_fallback.get("rows", [])
+                        if isinstance(r, list)
+                    ]
+                    ocr_metrics = _quality_metrics(ocr_headers, ocr_rows)
+                    ocr_catastrophic, ocr_reason = _catastrophic_quality(ocr_headers, ocr_rows, ocr_metrics)
+                    if not ocr_catastrophic:
+                        headers = ocr_headers
+                        rows = ocr_rows
+                        metrics = ocr_metrics
+                        table["source_format"] = "ocr_fallback"
+                        table["quality_metrics"] = ocr_metrics
+                        qa_flags.append(
+                            QAFlag(
+                                flag_id=_stable_id("qa", table_id, "fallback_ocr_applied"),
+                                severity="info",
+                                type="fallback_ocr_applied",
+                                page=int(page),
+                                table_ref=table_id or "*",
+                                details=f"replaced_catastrophic:{catastrophic_reason}",
+                            )
+                        )
+                        catastrophic = False
+                    else:
+                        catastrophic_reason = f"{catastrophic_reason};ocr_fallback_failed:{ocr_reason}"
+                if catastrophic:
+                    fallback = _markdown_fallback_table_for_page(doc_dir, int(page))
+                    if fallback is not None:
+                        fb_headers = list(fallback.get("headers", []))
+                        fb_rows = [list(r) for r in fallback.get("rows", []) if isinstance(r, list)]
+                        fb_caption = str(fallback.get("caption", "")).strip()
+                        fb_metrics = _quality_metrics(fb_headers, fb_rows)
+                        fb_catastrophic, fb_reason = _catastrophic_quality(fb_headers, fb_rows, fb_metrics)
+                        if not fb_catastrophic:
+                            headers = fb_headers
+                            rows = fb_rows
+                            metrics = fb_metrics
+                            table["source_format"] = "markdown_fallback"
+                            table["quality_metrics"] = fb_metrics
+                            if fb_caption:
+                                table["caption_text"] = fb_caption
+                            qa_flags.append(
+                                QAFlag(
+                                    flag_id=_stable_id("qa", table_id, "fallback_markdown_applied"),
+                                    severity="info",
+                                    type="fallback_markdown_applied",
+                                    page=int(page),
+                                    table_ref=table_id or "*",
+                                    details=f"replaced_catastrophic:{catastrophic_reason}",
+                                )
+                            )
+                        else:
+                            catastrophic_reason = f"{catastrophic_reason};markdown_fallback_failed:{fb_reason}"
+                            excluded_low_quality += 1
+                            summary.errors.append(f"{table_id}: excluded_low_quality:{catastrophic_reason}")
+                            qa_flags.append(
+                                QAFlag(
+                                    flag_id=_stable_id("qa", table_id, "excluded_low_quality"),
+                                    severity="warn",
+                                    type="excluded_low_quality",
+                                    page=int(page),
+                                    table_ref=table_id or "*",
+                                    details=catastrophic_reason,
+                                )
+                            )
+                            continue
+                    else:
+                        excluded_low_quality += 1
+                        summary.errors.append(f"{table_id}: excluded_low_quality:{catastrophic_reason}")
+                        qa_flags.append(
+                            QAFlag(
+                                flag_id=_stable_id("qa", table_id, "excluded_low_quality"),
+                                severity="warn",
+                                type="excluded_low_quality",
+                                page=int(page),
+                                table_ref=table_id or "*",
+                                details=catastrophic_reason,
+                            )
+                        )
+                        continue
+            table["header_rows"] = [list(headers)]
+            table["data_rows"] = [list(r) for r in rows]
+            table["quality_metrics"] = metrics
             canonical_rows.append(table)
             csv_path = tables_dir / f"{table_id}.csv"
             _write_table_csv(csv_path, headers, rows)
@@ -1530,6 +1715,7 @@ def build_structured_exports(
             summary.table_count += 1
         _write_jsonl(tables_dir / "canonical.jsonl", canonical_rows)
 
+        grobid_tables: list[dict[str, Any]] = []
         if table_qa_mode != "off":
             grobid_tables_path = doc_dir / "metadata" / "assets" / "structured" / "grobid" / "figures_tables.jsonl"
             grobid_tables = [row for row in _load_jsonl(grobid_tables_path) if str(row.get("type", "")).lower() == "table"]
@@ -1544,10 +1730,21 @@ def build_structured_exports(
                         details=f"grobid_status={grobid_status}",
                     )
                 )
+            elif not grobid_tables:
+                qa_flags.append(
+                    QAFlag(
+                        flag_id=_stable_id("qa-skip", "grobid_no_table_signal"),
+                        severity="info",
+                        type="qa_skipped",
+                        page=0,
+                        table_ref="*",
+                        details="grobid_no_table_signal",
+                    )
+                )
             else:
                 qa_flags.extend(
                     _reconcile_with_grobid(
-                        canonical_tables=canonical_tables,
+                        canonical_tables=canonical_rows,
                         grobid_tables=grobid_tables,
                     )
                 )
@@ -1568,13 +1765,16 @@ def build_structured_exports(
             json.dumps(
                 {
                     "qa_mode": table_qa_mode,
-                    "marker_table_count": len(canonical_tables),
+                    "marker_table_count": len(canonical_rows),
+                    "grobid_table_count": len(grobid_tables),
                     "flag_count": len(qa_rows),
                 },
                 indent=2,
                 ensure_ascii=True,
             )
         )
+        if excluded_low_quality > 0:
+            pipeline_status["errors"].append(f"excluded_low_quality_tables:{excluded_low_quality}")
         if table_qa_mode == "strict" and any(flag.severity in {"warn", "error"} for flag in qa_flags):
             strict_errors.append("table QA strict mode failed due to disagreements")
     elif table_ocr_merge:
@@ -1602,6 +1802,17 @@ def build_structured_exports(
             pipeline_status["errors"].append("no_ocr_table_matches")
         if table_artifact_mode == "strict" and matched < summary.table_count:
             strict_errors.append(f"OCR merge matched {matched}/{summary.table_count} tables")
+
+    if marker_tables_raw_missing:
+        grobid_tables_path = doc_dir / "metadata" / "assets" / "structured" / "grobid" / "figures_tables.jsonl"
+        grobid_table_count = len(
+            [row for row in _load_jsonl(grobid_tables_path) if str(row.get("type", "")).lower() == "table"]
+        )
+        no_table_signals = summary.table_count == 0 and grobid_table_count == 0
+        if marker_localization_success is False and marker_localization_error:
+            pipeline_status["errors"].append(f"marker_localization_failed:{marker_localization_error}")
+        elif not no_table_signals:
+            pipeline_status["errors"].append("marker_tables_raw_missing")
 
     pipeline_status_path = doc_dir / "metadata" / "assets" / "structured" / "qa" / "pipeline_status.json"
     pipeline_status_path.parent.mkdir(parents=True, exist_ok=True)

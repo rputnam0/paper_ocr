@@ -15,6 +15,7 @@ dependencies = [
   "telethon>=1.36.0",
   "tqdm>=4.66.0",
   "pytest>=8.0.0",
+  "google-genai>=1.62.0",
 ]
 
 [project.scripts]

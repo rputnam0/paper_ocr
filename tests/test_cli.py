@@ -432,6 +432,63 @@ def test_parse_eval_table_pipeline_regression_options(monkeypatch):
     assert args.min_numeric_parse == 0.9
 
 
+def test_parse_validate_tables_gemini_defaults(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "validate-tables-gemini",
+            "out",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "validate-tables-gemini"
+    assert args.ocr_out_dir == Path("out")
+    assert args.model == "gemini-2.5-flash"
+    assert args.api_key_env == "GEMINI_API_KEY"
+    assert args.api_key == ""
+    assert args.max_output_tokens == 320
+    assert args.render_dpi == 220
+    assert args.only_problem_docs is True
+    assert args.max_docs == 0
+    assert args.max_tables_per_doc == 0
+
+
+def test_parse_validate_tables_gemini_overrides(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "validate-tables-gemini",
+            "out",
+            "--model",
+            "gemini-3-flash",
+            "--api-key-env",
+            "ALT_GEMINI_KEY",
+            "--api-key",
+            "manual-key",
+            "--max-output-tokens",
+            "512",
+            "--render-dpi",
+            "180",
+            "--no-only-problem-docs",
+            "--max-docs",
+            "4",
+            "--max-tables-per-doc",
+            "2",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.model == "gemini-3-flash"
+    assert args.api_key_env == "ALT_GEMINI_KEY"
+    assert args.api_key == "manual-key"
+    assert args.max_output_tokens == 512
+    assert args.render_dpi == 180
+    assert args.only_problem_docs is False
+    assert args.max_docs == 4
+    assert args.max_tables_per_doc == 2
+
+
 def test_parse_data_audit_args(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",

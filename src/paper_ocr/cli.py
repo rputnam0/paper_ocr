@@ -56,6 +56,7 @@ from .structured_extract import (
     run_marker_page,
 )
 from .table_eval import evaluate_table_pipeline
+from .table_validation import GeminiValidationConfig, run_gemini_table_validation
 from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
 METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
@@ -78,6 +79,7 @@ DEFAULT_FETCH_OUTPUT_ROOT = Path("data/jobs")
 LEGACY_FETCH_OUTPUT_ROOT = Path("data/telegram_jobs")
 RESOURCE_GUARD_MIN_MEM_GB_DEFAULT = 24.0
 RESOURCE_GUARD_MIN_CPUS_DEFAULT = 8
+GEMINI_TABLE_VALIDATION_MODEL_DEFAULT = "gemini-2.5-flash"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -438,6 +440,57 @@ def _parse_args() -> argparse.Namespace:
     eval_tables.add_argument("--max-precision-drop", type=float, default=0.03)
     eval_tables.add_argument("--max-recall-drop", type=float, default=0.03)
     eval_tables.add_argument("--min-numeric-parse", type=float, default=0.8)
+
+    validate_tables = sub.add_parser(
+        "validate-tables-gemini",
+        help="Use Gemini vision review to validate extracted tables against source PDF pages.",
+    )
+    validate_tables.add_argument("ocr_out_dir", type=Path)
+    validate_tables.add_argument(
+        "--model",
+        type=str,
+        default=os.getenv("PAPER_OCR_GEMINI_MODEL", GEMINI_TABLE_VALIDATION_MODEL_DEFAULT),
+    )
+    validate_tables.add_argument(
+        "--api-key-env",
+        type=str,
+        default="GEMINI_API_KEY",
+        help="Environment variable name used to load Gemini API key.",
+    )
+    validate_tables.add_argument(
+        "--api-key",
+        type=str,
+        default="",
+        help="Optional Gemini API key override.",
+    )
+    validate_tables.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=320,
+    )
+    validate_tables.add_argument(
+        "--render-dpi",
+        type=int,
+        default=220,
+    )
+    validate_tables.add_argument(
+        "--only-problem-docs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Review only docs with non-ok structured pipeline status (default: enabled).",
+    )
+    validate_tables.add_argument(
+        "--max-docs",
+        type=int,
+        default=0,
+        help="Maximum docs to review (0 means no limit).",
+    )
+    validate_tables.add_argument(
+        "--max-tables-per-doc",
+        type=int,
+        default=0,
+        help="Maximum tables reviewed per document (0 means no limit).",
+    )
 
     audit = sub.add_parser("data-audit", help="Validate data/ folder organization contract")
     audit.add_argument("data_dir", type=Path, nargs="?", default=Path("data"))
@@ -2008,6 +2061,37 @@ def _run_eval_table_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     return metrics
 
 
+def _run_validate_tables_gemini(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.ocr_out_dir.exists():
+        raise SystemExit(f"OCR output directory does not exist: {args.ocr_out_dir}")
+
+    api_key = str(getattr(args, "api_key", "") or "").strip()
+    if not api_key:
+        env_name = str(getattr(args, "api_key_env", "GEMINI_API_KEY") or "GEMINI_API_KEY")
+        api_key = os.getenv(env_name, "").strip()
+    if not api_key:
+        env_name = str(getattr(args, "api_key_env", "GEMINI_API_KEY") or "GEMINI_API_KEY")
+        raise SystemExit(f"Missing Gemini API key. Set {env_name} or pass --api-key.")
+
+    config = GeminiValidationConfig(
+        model=str(getattr(args, "model", GEMINI_TABLE_VALIDATION_MODEL_DEFAULT)),
+        api_key=api_key,
+        max_output_tokens=int(getattr(args, "max_output_tokens", 320)),
+        render_dpi=int(getattr(args, "render_dpi", 220)),
+    )
+    summary = asyncio.run(
+        run_gemini_table_validation(
+            ocr_out_dir=args.ocr_out_dir,
+            config=config,
+            only_problem_docs=bool(getattr(args, "only_problem_docs", True)),
+            max_docs=int(getattr(args, "max_docs", 0)),
+            max_tables_per_doc=int(getattr(args, "max_tables_per_doc", 0)),
+        )
+    )
+    print(json.dumps(summary, indent=2))
+    return summary
+
+
 def _run_data_audit(args: argparse.Namespace) -> dict[str, Any]:
     report = run_data_audit(args.data_dir)
     payload = report.to_dict()
@@ -2037,6 +2121,8 @@ def main() -> None:
         _run_data_audit(args)
     elif args.command == "eval-table-pipeline":
         _run_eval_table_pipeline(args)
+    elif args.command == "validate-tables-gemini":
+        _run_validate_tables_gemini(args)
 
 
 if __name__ == "__main__":
