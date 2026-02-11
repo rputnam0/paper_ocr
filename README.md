@@ -165,8 +165,8 @@ Fetch options:
 - `--session-name` default `nexus_session`
 - `--min-delay` default `4`
 - `--max-delay` default `8`
-- `--response-timeout` default `15` (seconds per poll)
-- `--search-timeout` default `40` (seconds total after `searching...`)
+- `--response-timeout` default `4` (seconds per poll)
+- `--search-timeout` default `6` (seconds total after `searching...`)
 - `--resolve-dois` / `--no-resolve-dois` default enabled
 - `--url-column` / `--title-column` / `--author-column` / `--year-column` / `--container-column` (optional input overrides)
 - `--crossref-mailto` optional contact for Crossref polite pool
@@ -176,7 +176,7 @@ Fetch options:
 - `--resolve-cache` / `--no-resolve-cache` default enabled
 - `--resolve-refresh-cache` default disabled
 - `--scihub-fallback` / `--no-scihub-fallback` default enabled (backup when Telegram fails)
-- `--scihub-timeout` default `45`
+- `--scihub-timeout` default `6`
 - `--scihub-base-urls` optional comma-separated mirrors (otherwise auto-discover)
 - `--debug`
 - `--report-file` override report path

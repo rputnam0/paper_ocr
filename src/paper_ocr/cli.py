@@ -60,8 +60,9 @@ from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
 MIN_DELAY_DEFAULT = "4"
 MAX_DELAY_DEFAULT = "8"
-RESPONSE_TIMEOUT_DEFAULT = 15
-SEARCH_TIMEOUT_DEFAULT = 40
+RESPONSE_TIMEOUT_DEFAULT = 4
+SEARCH_TIMEOUT_DEFAULT = 6
+SCIHUB_TIMEOUT_DEFAULT = 6
 CSV_JOB_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 UNDERSCORE_RUN_RE = re.compile(r"_+")
 DIGITAL_STRUCTURED_DEFAULT = "auto"
@@ -287,7 +288,7 @@ def _parse_args() -> argparse.Namespace:
     fetch.add_argument(
         "--scihub-timeout",
         type=int,
-        default=45,
+        default=SCIHUB_TIMEOUT_DEFAULT,
         help="Timeout in seconds per Sci-Hub request.",
     )
     fetch.add_argument(
@@ -1664,7 +1665,7 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         failed_file=args.failed_file or (reports_dir / "telegram_failed_papers.csv"),
         debug=args.debug,
         scihub_fallback=bool(getattr(args, "scihub_fallback", True)),
-        scihub_timeout=int(getattr(args, "scihub_timeout", 45)),
+        scihub_timeout=int(getattr(args, "scihub_timeout", SCIHUB_TIMEOUT_DEFAULT)),
         scihub_base_urls=str(getattr(args, "scihub_base_urls", "") or ""),
     )
     await fetch_from_telegram(config)
