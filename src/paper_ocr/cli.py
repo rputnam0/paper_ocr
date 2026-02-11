@@ -278,6 +278,24 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
     )
+    fetch.add_argument(
+        "--scihub-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Try Sci-Hub mirror download when Telegram lookup fails (default: enabled).",
+    )
+    fetch.add_argument(
+        "--scihub-timeout",
+        type=int,
+        default=45,
+        help="Timeout in seconds per Sci-Hub request.",
+    )
+    fetch.add_argument(
+        "--scihub-base-urls",
+        type=str,
+        default=os.getenv("SCIHUB_BASE_URLS", ""),
+        help="Optional comma-separated Sci-Hub mirrors; auto-discovered if omitted.",
+    )
     fetch.add_argument("--report-file", type=Path, default=None)
     fetch.add_argument("--failed-file", type=Path, default=None)
 
@@ -1645,6 +1663,9 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         report_file=args.report_file or (reports_dir / "telegram_download_report.csv"),
         failed_file=args.failed_file or (reports_dir / "telegram_failed_papers.csv"),
         debug=args.debug,
+        scihub_fallback=bool(getattr(args, "scihub_fallback", True)),
+        scihub_timeout=int(getattr(args, "scihub_timeout", 45)),
+        scihub_base_urls=str(getattr(args, "scihub_base_urls", "") or ""),
     )
     await fetch_from_telegram(config)
 

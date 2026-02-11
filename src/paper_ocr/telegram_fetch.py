@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .scihub import download_pdf_via_scihub, parse_scihub_base_urls
+
 try:
     from telethon import TelegramClient
     from telethon.errors import FloodWaitError
@@ -88,6 +90,9 @@ class FetchTelegramConfig:
     report_file: Path | None = None
     failed_file: Path | None = None
     debug: bool = False
+    scihub_fallback: bool = True
+    scihub_timeout: int = 45
+    scihub_base_urls: str = ""
 
 
 def normalize_doi(raw: str) -> str:
@@ -386,6 +391,9 @@ async def process_doi(
     search_timeout: int = 40,
     existing_file_path: Path | None = None,
     debug: bool = False,
+    scihub_fallback: bool = False,
+    scihub_timeout: int = 45,
+    scihub_base_urls: list[str] | None = None,
 ) -> FetchResult:
     started = _utc_now()
     fallback_path = in_dir / doi_filename(doi_normalized)
@@ -538,6 +546,29 @@ async def process_doi(
         status = "Error"
         error = str(exc)
 
+    if scihub_fallback and status not in {"Success", "Exists"}:
+        original_status = status
+        fallback_note = "SciHub fallback did not find a PDF"
+        try:
+            fallback_download = await asyncio.to_thread(
+                download_pdf_via_scihub,
+                identifier=doi_normalized,
+                output_path=fallback_path,
+                timeout=int(scihub_timeout),
+                base_urls=scihub_base_urls or None,
+            )
+            if fallback_download is not None and Path(fallback_download).exists():
+                status = "Success"
+                fallback_path = Path(fallback_download)
+                error = ""
+                marker = f"fallback=scihub after={original_status}"
+                excerpt = _excerpt(f"{excerpt} | {marker}" if excerpt else marker)
+            else:
+                error = f"{error} | {fallback_note}" if error else fallback_note
+        except Exception as exc:
+            fallback_err = f"SciHub fallback error: {exc}"
+            error = f"{error} | {fallback_err}" if error else fallback_err
+
     finished = _utc_now()
     return FetchResult(
         doi_original=doi_original,
@@ -569,6 +600,7 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
     rows: list[FetchResult] = []
     index = load_download_index(index_file)
     index.update(load_index_from_report(report_file, config.in_dir))
+    scihub_base_urls = parse_scihub_base_urls(config.scihub_base_urls)
 
     client = TelegramClient(config.session_name, config.api_id, config.api_hash)
     await client.start()
@@ -589,6 +621,9 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
                 search_timeout=config.search_timeout,
                 existing_file_path=(config.in_dir / index[doi_normalized]) if doi_normalized in index else None,
                 debug=config.debug,
+                scihub_fallback=config.scihub_fallback,
+                scihub_timeout=config.scihub_timeout,
+                scihub_base_urls=scihub_base_urls,
             )
             rows.append(result)
             if result.status in {"Success", "Exists"} and result.file_path:

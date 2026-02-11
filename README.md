@@ -175,6 +175,9 @@ Fetch options:
 - `--resolve-max-retries` default `3`
 - `--resolve-cache` / `--no-resolve-cache` default enabled
 - `--resolve-refresh-cache` default disabled
+- `--scihub-fallback` / `--no-scihub-fallback` default enabled (backup when Telegram fails)
+- `--scihub-timeout` default `45`
+- `--scihub-base-urls` optional comma-separated mirrors (otherwise auto-discover)
 - `--debug`
 - `--report-file` override report path
 - `--failed-file` override failed-report path

@@ -218,6 +218,57 @@ def test_process_doi_hard_failure(tmp_path: Path):
     assert result.status == "Failed"
 
 
+def test_process_doi_hard_failure_then_scihub_fallback_success(tmp_path: Path, monkeypatch):
+    conv = _FakeConversation([_FakeMessage(text="Not found")])
+
+    def _fake_download(**kwargs):  # noqa: ANN001
+        out = kwargs["output_path"]
+        out.write_bytes(b"pdf")
+        return out
+
+    monkeypatch.setattr(telegram_fetch, "download_pdf_via_scihub", _fake_download)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            scihub_fallback=True,
+            scihub_timeout=5,
+            scihub_base_urls=[],
+        )
+    )
+
+    assert result.status == "Success"
+    assert result.file_path.endswith("10.1000_abc.pdf")
+    assert "fallback=scihub" in result.bot_message_excerpt
+
+
+def test_process_doi_hard_failure_then_scihub_fallback_failure_keeps_status(tmp_path: Path, monkeypatch):
+    conv = _FakeConversation([_FakeMessage(text="Not found")])
+
+    def _fake_download(**kwargs):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(telegram_fetch, "download_pdf_via_scihub", _fake_download)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            scihub_fallback=True,
+            scihub_timeout=5,
+            scihub_base_urls=[],
+        )
+    )
+
+    assert result.status == "Failed"
+    assert "scihub fallback did not find a pdf" in result.error.lower()
+
+
 def test_process_doi_unknown_response(tmp_path: Path):
     conv = _FakeConversation([_FakeMessage(text="Working on it")])
 

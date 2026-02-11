@@ -140,6 +140,31 @@ def test_parse_fetch_telegram_defaults(monkeypatch):
     assert args.resolve_max_retries == 3
     assert args.resolve_cache is True
     assert args.resolve_refresh_cache is False
+    assert args.scihub_fallback is True
+    assert args.scihub_timeout == 45
+    assert args.scihub_base_urls == ""
+
+
+def test_parse_fetch_telegram_scihub_flags(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "fetch-telegram",
+            "papers.csv",
+            "--no-scihub-fallback",
+            "--scihub-timeout",
+            "90",
+            "--scihub-base-urls",
+            "https://sci-hub.se,https://sci-hub.ru",
+        ],
+    )
+
+    args = cli._parse_args()
+
+    assert args.scihub_fallback is False
+    assert args.scihub_timeout == 90
+    assert args.scihub_base_urls == "https://sci-hub.se,https://sci-hub.ru"
 
 
 def test_parse_resolve_dois_args(monkeypatch):
@@ -714,6 +739,9 @@ def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
         resolve_max_retries=3,
         resolve_cache=True,
         resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -750,6 +778,9 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
         resolve_max_retries=3,
         resolve_cache=True,
         resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -761,6 +792,7 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
     config = _fake_fetch_from_telegram.last_config
     assert config.in_dir == tmp_path / "jobs" / "papers" / "pdfs"
     assert config.report_file == tmp_path / "jobs" / "papers" / "reports" / "telegram_download_report.csv"
+    assert config.scihub_fallback is True
 
 
 def test_fetch_telegram_normalizes_job_slug(monkeypatch, tmp_path: Path):
@@ -789,6 +821,9 @@ def test_fetch_telegram_normalizes_job_slug(monkeypatch, tmp_path: Path):
         resolve_max_retries=3,
         resolve_cache=True,
         resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -828,6 +863,9 @@ def test_fetch_telegram_migrates_legacy_default_job_dir(monkeypatch, tmp_path: P
         resolve_max_retries=3,
         resolve_cache=True,
         resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
     legacy_job = tmp_path / "data" / "telegram_jobs" / "papers"
@@ -873,6 +911,9 @@ def test_fetch_telegram_keeps_input_csv_outside_job_folder(monkeypatch, tmp_path
         resolve_max_retries=3,
         resolve_cache=True,
         resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     monkeypatch.setenv("TG_API_ID", "123")
     monkeypatch.setenv("TG_API_HASH", "abc")
@@ -909,6 +950,9 @@ def test_fetch_telegram_does_not_create_ocr_out_subdir(monkeypatch, tmp_path: Pa
         resolve_max_retries=3,
         resolve_cache=True,
         resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
     monkeypatch.setenv("TG_API_ID", "123")
@@ -946,6 +990,9 @@ def test_fetch_telegram_auto_resolve_rewrites_input_csv(monkeypatch, tmp_path: P
         resolve_max_retries=3,
         resolve_cache=True,
         resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("doi,url_landing\n,https://doi.org/10.1000/abc\n")
     monkeypatch.setenv("TG_API_ID", "123")
