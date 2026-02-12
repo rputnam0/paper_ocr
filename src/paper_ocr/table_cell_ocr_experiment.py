@@ -172,6 +172,54 @@ def _pick_positive_int(payload: dict[str, Any], keys: tuple[str, ...]) -> int:
     return 0
 
 
+def _row_col_boxes_from_detections(payload: dict[str, Any]) -> tuple[list[list[float]], list[list[float]]]:
+    detections = payload.get("detections", [])
+    if not isinstance(detections, list):
+        return [], []
+    row_boxes: list[list[float]] = []
+    col_boxes: list[list[float]] = []
+    for det in detections:
+        if not isinstance(det, dict):
+            continue
+        label = str(det.get("label", "")).strip().lower()
+        box = det.get("box")
+        if not isinstance(box, list) or len(box) < 4:
+            continue
+        try:
+            coords = [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
+        except Exception:
+            continue
+        if label == "table row":
+            row_boxes.append(coords)
+        elif label == "table column":
+            col_boxes.append(coords)
+    row_boxes.sort(key=lambda b: (b[1], b[0]))
+    col_boxes.sort(key=lambda b: (b[0], b[1]))
+    return row_boxes, col_boxes
+
+
+def _derive_bbox_from_row_col(
+    *,
+    row_start: int,
+    row_end: int,
+    col_start: int,
+    col_end: int,
+    row_boxes: list[list[float]],
+    col_boxes: list[list[float]],
+) -> list[float] | None:
+    if row_start < 0 or col_start < 0:
+        return None
+    if row_end >= len(row_boxes) or col_end >= len(col_boxes):
+        return None
+    top = min(row_boxes[i][1] for i in range(row_start, row_end + 1))
+    bottom = max(row_boxes[i][3] for i in range(row_start, row_end + 1))
+    left = min(col_boxes[j][0] for j in range(col_start, col_end + 1))
+    right = max(col_boxes[j][2] for j in range(col_start, col_end + 1))
+    if right <= left or bottom <= top:
+        return None
+    return [left, top, right, bottom]
+
+
 def _normalize_structure_payload_with_bboxes(
     payload: dict[str, Any],
     *,
@@ -185,6 +233,7 @@ def _normalize_structure_payload_with_bboxes(
     rows = _pick_positive_int(payload, ("rows", "row_count", "num_rows", "n_rows", "total_rows"))
     cols = _pick_positive_int(payload, ("cols", "col_count", "num_cols", "n_cols", "total_cols"))
     header_rows = _pick_positive_int(payload, ("header_rows", "header_row_count"))
+    row_boxes, col_boxes = _row_col_boxes_from_detections(payload)
 
     cells_raw = payload.get("cells", payload.get("cell_boxes", []))
     cells: list[dict[str, Any]] = []
@@ -196,6 +245,16 @@ def _normalize_structure_payload_with_bboxes(
             if bounds is None:
                 continue
             raw_bbox = _find_cell_bbox(item)
+            row_start, row_end, col_start, col_end = bounds
+            if raw_bbox is None and row_boxes and col_boxes:
+                raw_bbox = _derive_bbox_from_row_col(
+                    row_start=row_start,
+                    row_end=row_end,
+                    col_start=col_start,
+                    col_end=col_end,
+                    row_boxes=row_boxes,
+                    col_boxes=col_boxes,
+                )
             if raw_bbox is None:
                 continue
             bbox_px = _coerce_bbox_pixels(
@@ -206,7 +265,6 @@ def _normalize_structure_payload_with_bboxes(
             )
             if bbox_px is None:
                 continue
-            row_start, row_end, col_start, col_end = bounds
             cell_payload: dict[str, Any] = {
                 "row_start": row_start,
                 "row_end": row_end,

@@ -74,3 +74,30 @@ def test_apply_cell_text_to_grid_assigns_spans():
     )
 
     assert grid == [["Header", "Header"], ["A", "B"]]
+
+
+def test_normalize_structure_payload_derives_cell_bboxes_from_row_column_detections():
+    payload = {
+        "rows": 2,
+        "cols": 2,
+        "cells": [
+            {"row_start": 0, "row_end": 0, "col_start": 0, "col_end": 0},
+            {"row_start": 0, "row_end": 0, "col_start": 1, "col_end": 1},
+            {"row_start": 1, "row_end": 1, "col_start": 0, "col_end": 0},
+            {"row_start": 1, "row_end": 1, "col_start": 1, "col_end": 1},
+        ],
+        "detections": [
+            {"label": "table row", "box": [0, 0, 200, 50]},
+            {"label": "table row", "box": [0, 50, 200, 100]},
+            {"label": "table column", "box": [0, 0, 100, 100]},
+            {"label": "table column", "box": [100, 0, 200, 100]},
+        ],
+    }
+
+    normalized = _normalize_structure_payload_with_bboxes(payload, crop_width=200, crop_height=100, bbox_mode="pixels")
+
+    assert normalized["rows"] == 2
+    assert normalized["cols"] == 2
+    assert len(normalized["cells"]) == 4
+    assert normalized["cells"][0]["bbox"] == [0, 0, 100, 50]
+    assert normalized["cells"][3]["bbox"] == [100, 50, 200, 100]
