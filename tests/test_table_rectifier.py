@@ -82,6 +82,28 @@ def _valid_payload() -> str:
     return json.dumps(payload)
 
 
+def _valid_payload_with_context_request(*, window: str, reason: str) -> str:
+    payload = json.loads(_valid_payload())
+    payload["context_request"] = {
+        "needed": True,
+        "window": window,
+        "reason": reason,
+    }
+    return json.dumps(payload)
+
+
+def _extract_prompt_input(prompt: str) -> dict[str, object]:
+    marker = "Input:\n"
+    if marker not in prompt:
+        return {}
+    raw = prompt.split(marker, 1)[1]
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def test_rectifier_accepts_valid_payload_and_writes_outputs(tmp_path: Path):
     doc_dir, _ = _make_doc_with_one_table(tmp_path)
 
@@ -107,6 +129,44 @@ def test_rectifier_accepts_valid_payload_and_writes_outputs(tmp_path: Path):
     flags_path = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
     flags = [json.loads(line) for line in flags_path.read_text().splitlines() if line.strip()]
     assert any(flag["type"] == "llm_rectification_applied" for flag in flags)
+
+
+def test_rectifier_requests_nearby_context_only_on_demand(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    prompts: list[str] = []
+    calls = {"count": 0}
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        calls["count"] += 1
+        prompts.append(str(kwargs.get("prompt", "")))
+        if calls["count"] == 1:
+            return _FakeTextResponse(
+                _valid_payload_with_context_request(
+                    window="table_page",
+                    reason="aliases_or_abbreviations_without_definition",
+                )
+            )
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all", context_mode="on_demand"),
+            call_model=_fake_call_model,
+        )
+    )
+
+    assert result.applied == 1
+    assert calls["count"] == 2
+    first = _extract_prompt_input(prompts[0])
+    second = _extract_prompt_input(prompts[1])
+    first_evidence = first.get("evidence", {}) if isinstance(first.get("evidence"), dict) else {}
+    second_evidence = second.get("evidence", {}) if isinstance(second.get("evidence"), dict) else {}
+    assert first_evidence.get("nearby_pages_text", "") == ""
+    assert "Legend A = sample A" in str(second_evidence.get("nearby_pages_text", ""))
+    assert result.table_results and result.table_results[0].get("context_requested") is True
+    assert result.table_results[0].get("context_window") == "table_page"
 
 
 def test_rectifier_recovers_from_malformed_json_with_repair_call(tmp_path: Path):
@@ -136,7 +196,7 @@ def test_rectifier_rejects_evidence_violation_and_falls_back(tmp_path: Path):
     doc_dir, before = _make_doc_with_one_table(tmp_path)
     payload = {
         "rectified_header_rows_full": [["Polymer", "Value"]],
-        "rectified_rows": [["A", "FABRICATED 99"]],
+        "rectified_rows": [["A", "FABRICATED ± 99"]],
         "edits": [{"type": "replace_cell", "description": "invented value"}],
         "cell_provenance": [
             {"row": 0, "col": 0, "source": "context", "evidence_text": "sample A", "confidence": 0.9},
@@ -362,7 +422,7 @@ def test_rectifier_retries_after_evidence_violation_with_validation_feedback(tmp
 
     bad_payload = {
         "rectified_header_rows_full": [["Polymer", "Value"]],
-        "rectified_rows": [["A", "FABRICATED 99"]],
+        "rectified_rows": [["A", "FABRICATED ± 99"]],
         "edits": [{"type": "replace_cell", "description": "hallucinated replacement"}],
         "cell_provenance": [{"row": 0, "col": 1, "source": "context", "evidence_text": "fabricated", "confidence": 0.9}],
         "rectifier_confidence": 0.6,

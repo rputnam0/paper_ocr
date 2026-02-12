@@ -20,6 +20,7 @@ NUMERICISH_RE = re.compile(r"^[0-9.,+\-−–—/%()±×*]+$")
 PROVENANCE_SOURCES = {"marker", "ocr", "context"}
 IGNORABLE_SYMBOLS = {"-", "*"}
 GROUP_PAGE_TABLE_RE = re.compile(r"page_(\d+)_table_(\d+)$")
+CONTEXT_WINDOW_OPTIONS = ("none", "table_page", "page_plus_minus_1", "page_plus_minus_2")
 
 
 @dataclass
@@ -31,6 +32,7 @@ class RectifierConfig:
     target: str = "risk"
     structure_model: str = "off"
     structure_lock: bool = True
+    context_mode: str = "on_demand"
 
 
 @dataclass
@@ -426,18 +428,24 @@ def _collect_fragment_rows(
     return rows
 
 
-def _collect_evidence_bundle(
+def _collect_page_context_text(
+    *,
     doc_dir: Path,
     table_payload: dict[str, Any],
     page: int,
-    *,
-    fragment_index: dict[str, dict[str, Any]],
-    table_structure: dict[str, Any],
-) -> dict[str, str]:
-    fragment_rows = _collect_fragment_rows(table_payload=table_payload, fragment_index=fragment_index)
-    snippets: list[str] = []
-    pages_dir = doc_dir / "pages"
-    candidate_pages: set[int] = {int(page)}
+    context_window: str,
+) -> str:
+    window = str(context_window or "none").strip().lower()
+    if window not in CONTEXT_WINDOW_OPTIONS or window == "none":
+        return ""
+
+    base_pages: set[int] = set()
+    try:
+        current_page = int(page)
+    except Exception:
+        current_page = 0
+    if current_page > 0:
+        base_pages.add(current_page)
     raw_pages = table_payload.get("pages", [])
     if isinstance(raw_pages, list):
         for item in raw_pages:
@@ -446,14 +454,26 @@ def _collect_evidence_bundle(
             except Exception:
                 continue
             if p > 0:
-                candidate_pages.add(p)
-    expanded_pages: set[int] = set()
-    for p in candidate_pages:
-        for delta in (-2, -1, 0, 1, 2):
-            cp = p + delta
-            if cp > 0:
-                expanded_pages.add(cp)
-    for candidate_page in sorted(expanded_pages):
+                base_pages.add(p)
+    if not base_pages:
+        return ""
+
+    deltas = (0,)
+    if window == "page_plus_minus_1":
+        deltas = (-1, 0, 1)
+    elif window == "page_plus_minus_2":
+        deltas = (-2, -1, 0, 1, 2)
+
+    target_pages: set[int] = set()
+    for p in base_pages:
+        for delta in deltas:
+            candidate = p + delta
+            if candidate > 0:
+                target_pages.add(candidate)
+
+    snippets: list[str] = []
+    pages_dir = doc_dir / "pages"
+    for candidate_page in sorted(target_pages):
         page_path = pages_dir / f"{int(candidate_page):04d}.md"
         if not page_path.exists():
             continue
@@ -461,7 +481,25 @@ def _collect_evidence_bundle(
             snippets.append(f"[page_{candidate_page:04d}.md]\n{page_path.read_text()}")
         except Exception:
             continue
-    context_text = "\n\n".join(snippets)
+    return "\n\n".join(snippets)
+
+
+def _collect_evidence_bundle(
+    doc_dir: Path,
+    table_payload: dict[str, Any],
+    page: int,
+    *,
+    fragment_index: dict[str, dict[str, Any]],
+    table_structure: dict[str, Any],
+    context_window: str = "none",
+) -> dict[str, str]:
+    fragment_rows = _collect_fragment_rows(table_payload=table_payload, fragment_index=fragment_index)
+    context_text = _collect_page_context_text(
+        doc_dir=doc_dir,
+        table_payload=table_payload,
+        page=page,
+        context_window=context_window,
+    )
     headers = [str(x) for row in table_payload.get("header_rows_full", []) if isinstance(row, list) for x in row]
     rows = [str(x) for row in table_payload.get("data_rows", []) if isinstance(row, list) for x in row]
     fragment_text_parts: list[str] = []
@@ -497,11 +535,16 @@ def _build_prompt(
     evidence: dict[str, str],
     validation_feedback: dict[str, Any],
     table_structure: dict[str, Any],
+    context_window: str = "none",
+    context_mode: str = "on_demand",
 ) -> str:
+    active_context = evidence.get("context_text", "")
     request = {
         "table_id": str(table_payload.get("table_id", manifest_row.get("table_id", ""))),
         "page": int(manifest_row.get("page", 0) or 0),
         "risk_score": risk_score,
+        "context_mode": str(context_mode),
+        "context_window_active": str(context_window),
         "canonical_table": {
             "caption": str(table_payload.get("caption_text", manifest_row.get("caption", ""))),
             "header_rows_full": table_payload.get("header_rows_full", []),
@@ -514,10 +557,20 @@ def _build_prompt(
         "validation_feedback": validation_feedback,
         "table_structure": table_structure,
         "ocr_table_raw": evidence["ocr_text"][:24000],
+        "context_tool": {
+            "available": True,
+            "allowed_windows": list(CONTEXT_WINDOW_OPTIONS),
+            "use_only_if_needed": True,
+            "examples": [
+                "aliases_or_abbreviations_without_definition",
+                "units_or_material_names_missing_from_table_body",
+                "caption_or_body_text_needed_to_disambiguate_columns",
+            ],
+        },
         "evidence": {
             "marker_and_caption": evidence["marker_text"][:18000],
             "marker_fragment_rows": evidence.get("marker_fragment_text", "")[:22000],
-            "nearby_pages_text": evidence["context_text"][:24000],
+            "nearby_pages_text": active_context[:24000],
             "table_structure_raw": evidence.get("table_structure_text", "")[:18000],
         },
     }
@@ -525,16 +578,19 @@ def _build_prompt(
         "You are a table rectification model.\n"
         "Return JSON only.\n"
         "Rules:\n"
-        "- Evidence-bounded: do not invent values not supported by marker, OCR, or nearby context evidence.\n"
+        "- Evidence-bounded: do not invent values not supported by marker, OCR, caption, or provided context evidence.\n"
         "- Preserve units/symbols and table semantics.\n"
         "- Prioritize column alignment, multi-level header integrity, and row-to-column correctness over preserving superficial layout.\n"
         "- Structure lock: when table_structure is provided, preserve its row/column topology and spans.\n"
         "- If values are vertically stacked across lines, merge them into their logical cell.\n"
         "- If previous validation feedback lists specific failure modes or instructions, address them explicitly.\n"
+        "- Context discipline: default to table-local evidence (marker+caption+OCR). Request page context only when strictly needed.\n"
         "- Keep output rectangular.\n"
         "- Every non-empty changed cell must include provenance.\n"
         "Output schema keys (all required):\n"
         "rectified_header_rows_full, rectified_rows, edits, cell_provenance, rectifier_confidence, needs_review.\n\n"
+        "Optional key:\n"
+        "context_request with fields needed (bool), window (none|table_page|page_plus_minus_1|page_plus_minus_2), reason (string).\n\n"
         f"Input:\n{json.dumps(request, ensure_ascii=True)}"
     )
 
@@ -610,6 +666,20 @@ def _build_evidence_retry_prompt(
         "Do not hallucinate values.\n\n"
         f"Input:\n{json.dumps(request, ensure_ascii=True)}"
     )
+
+
+def _extract_context_request(payload: dict[str, Any]) -> tuple[bool, str, str]:
+    raw = payload.get("context_request")
+    if not isinstance(raw, dict):
+        return False, "none", ""
+    needed = bool(raw.get("needed", False))
+    window = str(raw.get("window", "none") or "none").strip().lower()
+    if window not in CONTEXT_WINDOW_OPTIONS:
+        window = "none"
+    reason = _normalize_cell_text(raw.get("reason", ""))
+    if not needed or window == "none":
+        return False, "none", reason
+    return True, window, reason
 
 
 def _normalize_rectified_payload(payload: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
@@ -1100,6 +1170,16 @@ def _validate_evidence(
             return False, f"evidence_violation:missing_evidence_text:{key[0]}:{key[1]}", [], headers, rows
         evidence_text_lower = evidence_text.lower()
         source_blob = marker_lower if source == "marker" else (ocr_lower if source == "ocr" else context_lower)
+        if source == "context" and not source_blob:
+            row_idx, col_idx = key
+            new_text = ""
+            old_text = ""
+            if row_idx < len(rows) and col_idx < len(rows[row_idx]):
+                new_text = _normalize_cell_text(rows[row_idx][col_idx])
+            if row_idx < len(orig_rows) and col_idx < len(orig_rows[row_idx]):
+                old_text = _normalize_cell_text(orig_rows[row_idx][col_idx])
+            if _looks_substantive(new_text) and new_text != old_text:
+                return False, f"evidence_violation:context_not_loaded:{key[0]}:{key[1]}", [], headers, rows
         if source_blob and (evidence_text_lower not in source_blob) and (not _text_supported_by_source(evidence_text, source_blob)):
             return False, f"evidence_violation:provenance_mismatch:{key[0]}:{key[1]}", [], headers, rows
         if confidence <= 0.0:
@@ -1371,12 +1451,16 @@ async def run_table_rectification_for_doc(
         table_payload = dict(candidate.get("table_payload", {}))
         validation_feedback = dict(validation_feedback_by_id.get(table_id, {}))
         table_structure = dict(table_structure_by_id.get(table_id, {}))
+        context_window_used = "none"
+        context_requested = False
+        context_request_reason = ""
         evidence = _collect_evidence_bundle(
             doc_dir,
             table_payload,
             page,
             fragment_index=fragment_index,
             table_structure=table_structure,
+            context_window=context_window_used,
         )
         prompt = _build_prompt(
             table_payload=table_payload,
@@ -1385,6 +1469,8 @@ async def run_table_rectification_for_doc(
             evidence=evidence,
             validation_feedback=validation_feedback,
             table_structure=table_structure,
+            context_window=context_window_used,
+            context_mode=str(config.context_mode),
         )
         parsed: dict[str, Any] = {}
         parse_status = "ok"
@@ -1423,9 +1509,65 @@ async def run_table_rectification_for_doc(
                     "risk_score": risk_score,
                     "status": "failed_fallback",
                     "error": str(exc),
+                    "context_requested": context_requested,
+                    "context_window": context_window_used,
                 }
             )
             continue
+
+        if parsed and str(config.context_mode).strip().lower() == "on_demand":
+            requested, requested_window, requested_reason = _extract_context_request(parsed)
+            if requested and requested_window != "none":
+                context_requested = True
+                context_window_used = requested_window
+                context_request_reason = requested_reason
+                evidence = _collect_evidence_bundle(
+                    doc_dir,
+                    table_payload,
+                    page,
+                    fragment_index=fragment_index,
+                    table_structure=table_structure,
+                    context_window=context_window_used,
+                )
+                _append_flag(
+                    qa_rows=qa_rows,
+                    existing_flag_ids=existing_flag_ids,
+                    table_id=table_id,
+                    page=page,
+                    flag_type="llm_rectification_context_requested",
+                    severity="info",
+                    details=f"window={context_window_used} reason={context_request_reason or 'unspecified'}",
+                )
+                context_prompt = _build_prompt(
+                    table_payload=table_payload,
+                    manifest_row=manifest_row,
+                    risk_score=risk_score,
+                    evidence=evidence,
+                    validation_feedback=validation_feedback,
+                    table_structure=table_structure,
+                    context_window=context_window_used,
+                    context_mode=str(config.context_mode),
+                )
+                try:
+                    context_response = await call_model(
+                        client=client,
+                        model=config.model,
+                        prompt=context_prompt,
+                        max_tokens=int(config.max_tokens),
+                    )
+                    context_parsed = _extract_json_object(getattr(context_response, "content", ""))
+                    if not context_parsed:
+                        context_repair = await call_model(
+                            client=client,
+                            model=config.model,
+                            prompt=_build_repair_prompt(getattr(context_response, "content", "")),
+                            max_tokens=int(config.max_tokens),
+                        )
+                        context_parsed = _extract_json_object(getattr(context_repair, "content", ""))
+                    if context_parsed:
+                        parsed = context_parsed
+                except Exception:
+                    pass
 
         schema_retry_count = 0
         ok_schema, schema_reason, normalized = _normalize_rectified_payload(parsed)
@@ -1478,6 +1620,8 @@ async def run_table_rectification_for_doc(
                     "risk_score": risk_score,
                     "status": "invalid_schema",
                     "reason": schema_reason,
+                    "context_requested": context_requested,
+                    "context_window": context_window_used,
                 }
             )
             continue
@@ -1565,6 +1709,9 @@ async def run_table_rectification_for_doc(
                     "status": parse_status,
                     "reason": evidence_reason,
                     "structure_used": bool(table_structure),
+                    "context_requested": context_requested,
+                    "context_window": context_window_used,
+                    "context_request_reason": context_request_reason,
                 }
             )
             continue
@@ -1632,6 +1779,9 @@ async def run_table_rectification_for_doc(
                 "risk_score": risk_score,
                 "status": "applied",
                 "structure_used": bool(table_structure),
+                "context_requested": context_requested,
+                "context_window": context_window_used,
+                "context_request_reason": context_request_reason,
                 "rectifier_confidence": float(updated_payload.get("rectifier_confidence", 0.0) or 0.0),
                 "needs_review": bool(updated_payload.get("rectifier_needs_review", False)),
             }
