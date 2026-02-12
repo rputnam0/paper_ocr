@@ -316,6 +316,21 @@ def test_resource_guard_blocks_local_structured_on_low_resource():
     assert "--marker-url http://127.0.0.1:8008" in msg
 
 
+def test_resource_guard_blocks_when_wsl_policy_enabled_even_on_high_resource():
+    args = argparse.Namespace(
+        digital_structured="auto",
+        marker_url="",
+        allow_local_heavy=False,
+    )
+    msg = cli._resource_guard_violation(
+        args,
+        cpu_count=32,
+        mem_gib=128.0,
+        env={"PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED": "1"},
+    )
+    assert "Resource guard blocked local structured run" in msg
+
+
 def test_resource_guard_allows_when_marker_service_url_is_set():
     args = argparse.Namespace(
         digital_structured="auto",
