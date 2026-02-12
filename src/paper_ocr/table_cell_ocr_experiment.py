@@ -19,12 +19,14 @@ import fitz
 from openai import AsyncOpenAI
 from PIL import Image
 
-from .client import call_olmocr
+from .bibliography import extract_json_object
+from .client import call_olmocr, call_text_model
 from .structured_extract import run_marker_doc
 
 GROUP_PAGE_TABLE_RE = re.compile(r"page_(\d+)_table_(\d+)$")
 DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai"
 DEFAULT_OCR_MODEL = "allenai/olmOCR-2-7B-1025"
+DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
 
 
 @dataclass
@@ -38,6 +40,8 @@ class ExperimentRow:
     cell_count: int = 0
     error: str = ""
     result_path: str = ""
+    llm_reconciled: bool = False
+    llm_applied_corrections: bool = False
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -361,6 +365,144 @@ def _grid_to_markdown(grid: list[list[str]], *, header_rows: int) -> str:
     return "\n".join(lines)
 
 
+def _grid_to_sections(grid: list[list[str]], *, header_rows: int, expected_rows: int) -> tuple[list[list[str]], list[list[str]]]:
+    ncols = max((len(row) for row in grid), default=0)
+    header_count = max(1, int(header_rows) if int(header_rows) > 0 else 1)
+    padded = [[str(c) for c in row] + [""] * (ncols - len(row)) for row in grid]
+    headers = padded[:header_count]
+    rows = padded[header_count:]
+    while len(headers) < header_count:
+        headers.append([""] * ncols)
+    if expected_rows > 0:
+        rows = rows[:expected_rows]
+        while len(rows) < expected_rows:
+            rows.append([""] * ncols)
+    return headers, rows
+
+
+def _build_llm_reconciliation_prompt(
+    *,
+    table_id: str,
+    structure: dict[str, Any],
+    prefilled_grid: list[list[str]],
+    cell_ocr_rows: list[dict[str, Any]],
+    full_table_ocr: str,
+) -> str:
+    request = {
+        "table_id": table_id,
+        "table_structure": {
+            "rows": int(structure.get("rows", 0) or 0),
+            "cols": int(structure.get("cols", 0) or 0),
+            "header_rows": int(structure.get("header_rows", 0) or 0),
+            "cells": [
+                {
+                    "row_start": int(cell.get("row_start", 0)),
+                    "row_end": int(cell.get("row_end", 0)),
+                    "col_start": int(cell.get("col_start", 0)),
+                    "col_end": int(cell.get("col_end", 0)),
+                }
+                for cell in structure.get("cells", [])
+                if isinstance(cell, dict)
+            ],
+        },
+        "prefilled_grid_from_cell_ocr": prefilled_grid,
+        "cell_level_ocr": cell_ocr_rows,
+        "full_table_ocr": str(full_table_ocr or "")[:32000],
+    }
+    return (
+        "You reconcile table extraction outputs.\n"
+        "Return JSON only.\n"
+        "Use table_structure as the topology lock for row/column layout.\n"
+        "Prefer cell-level OCR values, but correct cutoffs/splits using full_table_ocr evidence.\n"
+        "Do not hallucinate values not present in either OCR source.\n"
+        "Required keys:\n"
+        "- corrected_header_rows_full: list[list[str]]\n"
+        "- corrected_rows: list[list[str]]\n"
+        "- applied_corrections: boolean\n"
+        "- notes: string\n\n"
+        f"Input:\n{json.dumps(request, ensure_ascii=True)}"
+    )
+
+
+def _normalize_llm_reconciliation_payload(
+    *,
+    raw_payload: dict[str, Any],
+    expected_rows: int,
+    expected_cols: int,
+    expected_header_rows: int,
+    fallback_grid: list[list[str]],
+) -> dict[str, Any]:
+    header_count = max(1, int(expected_header_rows) if int(expected_header_rows) > 0 else 1)
+    cols = max(1, int(expected_cols))
+    fb_headers, fb_rows = _grid_to_sections(
+        fallback_grid,
+        header_rows=header_count,
+        expected_rows=max(0, int(expected_rows)),
+    )
+    fb_headers = [(row + [""] * (cols - len(row)))[:cols] for row in fb_headers]
+    fb_rows = [(row + [""] * (cols - len(row)))[:cols] for row in fb_rows]
+
+    headers_raw = raw_payload.get("corrected_header_rows_full")
+    rows_raw = raw_payload.get("corrected_rows")
+    valid_headers = isinstance(headers_raw, list) and all(isinstance(row, list) for row in headers_raw)
+    valid_rows = isinstance(rows_raw, list) and all(isinstance(row, list) for row in rows_raw)
+    if not valid_headers or not valid_rows:
+        out_headers = fb_headers
+        out_rows = fb_rows
+        return {
+            "valid": False,
+            "reason": "invalid_schema",
+            "header_rows_full": out_headers,
+            "rows": out_rows,
+            "final_grid": [*out_headers, *out_rows],
+            "applied_corrections": False,
+            "notes": "invalid_llm_output; fallback_to_prefilled",
+        }
+
+    headers: list[list[str]] = []
+    for row in headers_raw:
+        headers.append([str(cell).strip() for cell in row][:cols] + [""] * max(0, cols - len(row)))
+    rows: list[list[str]] = []
+    for row in rows_raw:
+        rows.append([str(cell).strip() for cell in row][:cols] + [""] * max(0, cols - len(row)))
+
+    headers = headers[:header_count]
+    while len(headers) < header_count:
+        headers.append([""] * cols)
+    target_rows = max(0, int(expected_rows))
+    if target_rows > 0:
+        rows = rows[:target_rows]
+        while len(rows) < target_rows:
+            rows.append([""] * cols)
+
+    notes = str(raw_payload.get("notes", "")).strip()
+    applied_corrections = bool(raw_payload.get("applied_corrections", False))
+    return {
+        "valid": True,
+        "reason": "",
+        "header_rows_full": headers,
+        "rows": rows,
+        "final_grid": [*headers, *rows],
+        "applied_corrections": applied_corrections,
+        "notes": notes,
+    }
+
+
+def _build_llm_json_repair_prompt(raw_text: str) -> str:
+    return (
+        "Convert the following output into one strict JSON object and output JSON only.\n"
+        "Schema:\n"
+        "{\n"
+        '  "corrected_header_rows_full": [["..."]],\n'
+        '  "corrected_rows": [["..."]],\n'
+        '  "applied_corrections": true,\n'
+        '  "notes": "string"\n'
+        "}\n"
+        "Do not include markdown fences.\n\n"
+        f"Source output:\n{raw_text[:24000]}"
+    )
+
+
 def _bbox_from_marker_row(row: dict[str, Any]) -> list[float]:
     bbox = row.get("bbox")
     if isinstance(bbox, list) and len(bbox) >= 4:
@@ -600,6 +742,151 @@ async def _ocr_cells_for_table(
     return await asyncio.gather(*tasks)
 
 
+async def _ocr_full_table(
+    *,
+    client: AsyncOpenAI,
+    model: str,
+    max_tokens: int,
+    table_image: Image.Image,
+) -> tuple[str, str]:
+    prompt = (
+        "Extract this full table as one HTML table. "
+        "Preserve headers, merged semantics, symbols, units, and all cell values. "
+        "Return only one <table>...</table> block."
+    )
+    buf = BytesIO()
+    table_image.save(buf, format="PNG", optimize=True)
+    image_bytes = buf.getvalue()
+    try:
+        response = await call_olmocr(
+            client=client,
+            model=model,
+            prompt=prompt,
+            image_bytes=image_bytes,
+            mime_type="image/png",
+            max_tokens=max_tokens,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return "", str(exc)
+    return str(response.content or "").strip(), ""
+
+
+def _compact_cell_rows_for_prompt(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for cell in cells:
+        out.append(
+            {
+                "row_start": int(cell.get("row_start", 0)),
+                "row_end": int(cell.get("row_end", 0)),
+                "col_start": int(cell.get("col_start", 0)),
+                "col_end": int(cell.get("col_end", 0)),
+                "bbox": [int(x) for x in list(cell.get("bbox", []))[:4]] if isinstance(cell.get("bbox"), list) else [],
+                "text": str(cell.get("text", "")),
+                "error": str(cell.get("error", "")),
+            }
+        )
+    return out
+
+
+async def _run_llm_reconciliation(
+    *,
+    client: AsyncOpenAI,
+    model: str,
+    max_tokens: int,
+    table_id: str,
+    structure: dict[str, Any],
+    prefilled_grid: list[list[str]],
+    ocr_cells: list[dict[str, Any]],
+    full_table_ocr: str,
+    expected_rows: int,
+    expected_cols: int,
+    expected_header_rows: int,
+) -> dict[str, Any]:
+    async def _call_json_mode(prompt_text: str, token_limit: int) -> tuple[str, str]:
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                max_tokens=token_limit,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": prompt_text}],
+            )
+            message = response.choices[0].message
+            content = str(message.content or "").strip()
+            if content:
+                return content, ""
+            return "", "empty_json_mode_content"
+        except Exception as exc:  # noqa: BLE001
+            return "", str(exc)
+
+    prompt = _build_llm_reconciliation_prompt(
+        table_id=table_id,
+        structure=structure,
+        prefilled_grid=prefilled_grid,
+        cell_ocr_rows=_compact_cell_rows_for_prompt(ocr_cells),
+        full_table_ocr=full_table_ocr,
+    )
+    raw_text = ""
+    repair_text = ""
+    raw_payload: dict[str, Any] = {}
+    error = ""
+    try:
+        raw_text, error = await _call_json_mode(prompt, int(max_tokens))
+        if not raw_text:
+            response = await call_text_model(
+                client=client,
+                model=model,
+                prompt=prompt,
+                max_tokens=max_tokens,
+            )
+            raw_text = str(response.content or response.reasoning_content or "")
+        raw_payload = extract_json_object(raw_text)
+        if not raw_payload:
+            repair_prompt = _build_llm_json_repair_prompt(raw_text)
+            repair_text, repair_error = await _call_json_mode(
+                repair_prompt,
+                max(600, int(max_tokens // 2)),
+            )
+            if not repair_text:
+                repair_response = await call_text_model(
+                    client=client,
+                    model=model,
+                    prompt=repair_prompt,
+                    max_tokens=max(600, int(max_tokens // 2)),
+                )
+                repair_text = str(repair_response.content or repair_response.reasoning_content or "")
+                if repair_error and not error:
+                    error = repair_error
+            raw_payload = extract_json_object(repair_text)
+            if not raw_payload:
+                error = "empty_or_unparseable_json"
+    except Exception as exc:  # noqa: BLE001
+        error = str(exc)
+
+    normalized = _normalize_llm_reconciliation_payload(
+        raw_payload=raw_payload,
+        expected_rows=expected_rows,
+        expected_cols=expected_cols,
+        expected_header_rows=expected_header_rows,
+        fallback_grid=prefilled_grid,
+    )
+    if error and normalized.get("valid"):
+        normalized["valid"] = False
+        normalized["reason"] = f"llm_call_failed:{error}"
+        normalized["applied_corrections"] = False
+        normalized["notes"] = str(normalized.get("notes", "") or f"llm_call_failed:{error}")
+
+    return {
+        "model": model,
+        "prompt": prompt,
+        "raw_text": raw_text,
+        "repair_text": repair_text,
+        "raw_payload": raw_payload,
+        "error": error,
+        "normalized": normalized,
+    }
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
@@ -766,13 +1053,69 @@ async def run_table_cell_ocr_experiment(args: argparse.Namespace) -> int:
                         padding_px=int(args.cell_padding_px),
                     )
 
-                grid = _apply_cell_text_to_grid(
+                prefilled_grid = _apply_cell_text_to_grid(
                     rows=int(normalized["rows"]),
                     cols=int(normalized["cols"]),
                     cells=ocr_cells,
                 )
-                markdown = _grid_to_markdown(grid, header_rows=int(normalized.get("header_rows", 1) or 1))
-                (table_dir / "table.md").write_text(markdown + ("\n" if markdown else ""))
+                prefilled_markdown = _grid_to_markdown(
+                    prefilled_grid,
+                    header_rows=int(normalized.get("header_rows", 1) or 1),
+                )
+                (table_dir / "table.md").write_text(prefilled_markdown + ("\n" if prefilled_markdown else ""))
+
+                full_table_ocr_text = ""
+                full_table_ocr_error = ""
+                if not args.dry_run and bool(args.full_table_ocr):
+                    assert client is not None
+                    full_table_ocr_text, full_table_ocr_error = await _ocr_full_table(
+                        client=client,
+                        model=str(args.full_table_ocr_model),
+                        max_tokens=int(args.full_table_ocr_max_tokens),
+                        table_image=table_image,
+                    )
+                if full_table_ocr_text or full_table_ocr_error:
+                    (table_dir / "full_table_ocr.md").write_text(
+                        (
+                            f"<!-- error: {full_table_ocr_error} -->\n" if full_table_ocr_error else ""
+                        )
+                        + f"{full_table_ocr_text}\n"
+                    )
+
+                llm_result: dict[str, Any] = {}
+                final_grid = prefilled_grid
+                final_header_rows = int(normalized.get("header_rows", 1) or 1)
+                llm_reconciled = False
+                llm_applied_corrections = False
+                if not args.dry_run and bool(args.llm_reconcile):
+                    assert client is not None
+                    llm_result = await _run_llm_reconciliation(
+                        client=client,
+                        model=str(args.llm_model),
+                        max_tokens=int(args.llm_max_tokens),
+                        table_id=table_id,
+                        structure=normalized,
+                        prefilled_grid=prefilled_grid,
+                        ocr_cells=ocr_cells,
+                        full_table_ocr=full_table_ocr_text,
+                        expected_rows=max(
+                            0,
+                            int(normalized["rows"]) - int(normalized.get("header_rows", 1) or 1),
+                        ),
+                        expected_cols=int(normalized["cols"]),
+                        expected_header_rows=int(normalized.get("header_rows", 1) or 1),
+                    )
+                    normalized_out = llm_result.get("normalized", {})
+                    if isinstance(normalized_out, dict):
+                        final_grid = [list(row) for row in normalized_out.get("final_grid", prefilled_grid)]
+                        llm_reconciled = bool(normalized_out.get("valid", False))
+                        llm_applied_corrections = bool(normalized_out.get("applied_corrections", False))
+                        llm_header_rows = _as_int(normalized.get("header_rows"), 1)
+                        final_header_rows = max(1, llm_header_rows if llm_header_rows > 0 else 1)
+                    _write_json(table_dir / "llm_reconciliation.json", llm_result)
+
+                final_markdown = _grid_to_markdown(final_grid, header_rows=final_header_rows)
+                (table_dir / "table_llm.md").write_text(final_markdown + ("\n" if final_markdown else ""))
 
                 payload = {
                     "table_id": table_id,
@@ -786,8 +1129,25 @@ async def run_table_cell_ocr_experiment(args: argparse.Namespace) -> int:
                     "cols": int(normalized["cols"]),
                     "header_rows": int(normalized.get("header_rows", 0) or 0),
                     "cells": ocr_cells,
-                    "grid": grid,
+                    "prefilled_grid": prefilled_grid,
+                    "final_grid": final_grid,
+                    "full_table_ocr": {
+                        "text": full_table_ocr_text,
+                        "error": full_table_ocr_error,
+                        "path": _portable_path(table_dir / "full_table_ocr.md", out_dir)
+                        if (table_dir / "full_table_ocr.md").exists()
+                        else "",
+                    },
+                    "llm_reconciliation": {
+                        "enabled": bool(args.llm_reconcile),
+                        "reconciled": llm_reconciled,
+                        "applied_corrections": llm_applied_corrections,
+                        "path": _portable_path(table_dir / "llm_reconciliation.json", out_dir)
+                        if (table_dir / "llm_reconciliation.json").exists()
+                        else "",
+                    },
                     "markdown_path": _portable_path(table_dir / "table.md", out_dir),
+                    "markdown_llm_path": _portable_path(table_dir / "table_llm.md", out_dir),
                     "dry_run": bool(args.dry_run),
                     "bbox_mode": str(args.bbox_mode),
                 }
@@ -802,6 +1162,8 @@ async def run_table_cell_ocr_experiment(args: argparse.Namespace) -> int:
                         cols=int(normalized["cols"]),
                         cell_count=len(normalized["cells"]),
                         result_path=_portable_path(result_path, out_dir),
+                        llm_reconciled=llm_reconciled,
+                        llm_applied_corrections=llm_applied_corrections,
                     )
                 )
                 processed += 1
@@ -822,6 +1184,8 @@ async def run_table_cell_ocr_experiment(args: argparse.Namespace) -> int:
         "ok": sum(1 for row in run_rows if row.status == "ok"),
         "failed": sum(1 for row in run_rows if row.status.startswith("failed")),
         "skipped_existing": sum(1 for row in run_rows if row.status == "skipped_existing"),
+        "llm_reconciled": sum(1 for row in run_rows if row.llm_reconciled),
+        "llm_applied_corrections": sum(1 for row in run_rows if row.llm_applied_corrections),
         "dry_run": bool(args.dry_run),
         "manifest_path": str(manifest_path),
     }
@@ -883,6 +1247,38 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--dry-run", action="store_true", help="Skip OCR calls; validate structure+bbox only.")
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--full-table-ocr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run one full-table OCR pass per table crop for reconciliation evidence.",
+    )
+    parser.add_argument(
+        "--full-table-ocr-model",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_FULL_OCR_MODEL", DEFAULT_OCR_MODEL),
+    )
+    parser.add_argument(
+        "--full-table-ocr-max-tokens",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_FULL_OCR_MAX_TOKENS", "1600")),
+    )
+    parser.add_argument(
+        "--llm-reconcile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run final LLM reconciliation using structure + cell OCR + full table OCR.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_LLM_MODEL", DEFAULT_LLM_MODEL),
+    )
+    parser.add_argument(
+        "--llm-max-tokens",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_LLM_MAX_TOKENS", "1800")),
+    )
     parser.add_argument(
         "--marker-url",
         type=str,
