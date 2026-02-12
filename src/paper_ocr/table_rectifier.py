@@ -16,7 +16,9 @@ from .client import call_text_model
 SYMBOL_CHAR_RE = re.compile(r"[^\x00-\x7F]|[±≤≥≈×÷°µμδΔητσγβαΩω]")
 UNIT_TOKEN_RE = re.compile(r"(?:\bpa\b|\bwt\b|mol|g|kg|mg|ml|dl|l|%|°c|°k|ppm|\bm\b|\bs\b)", flags=re.IGNORECASE)
 TOKEN_RE = re.compile(r"[a-z0-9]+")
+NUMERICISH_RE = re.compile(r"^[0-9.,+\-−–—/%()±×*]+$")
 PROVENANCE_SOURCES = {"marker", "ocr", "context"}
+IGNORABLE_SYMBOLS = {"-", "*"}
 
 
 @dataclass
@@ -406,6 +408,47 @@ def _normalize_rectified_payload(payload: dict[str, Any]) -> tuple[bool, str, di
     )
 
 
+def _normalized_noop_from_table_payload(table_payload: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    header_rows_raw = table_payload.get("header_rows_full", [])
+    data_rows_raw = table_payload.get("data_rows", [])
+    header_rows: list[list[str]] = []
+    for row in header_rows_raw if isinstance(header_rows_raw, list) else []:
+        if isinstance(row, list):
+            header_rows.append([_normalize_cell_text(cell) for cell in row])
+    data_rows: list[list[str]] = []
+    for row in data_rows_raw if isinstance(data_rows_raw, list) else []:
+        if isinstance(row, list):
+            data_rows.append([_normalize_cell_text(cell) for cell in row])
+    target_cols = max(
+        max((len(row) for row in header_rows), default=0),
+        max((len(row) for row in data_rows), default=0),
+    )
+    if target_cols <= 0:
+        return False, "invalid_schema:empty_grid", {}
+    if not header_rows:
+        header_rows = [[""] * target_cols]
+    normalized_headers = [(list(row) + [""] * (target_cols - len(row)))[:target_cols] for row in header_rows]
+    normalized_rows = [(list(row) + [""] * (target_cols - len(row)))[:target_cols] for row in data_rows]
+    return (
+        True,
+        "",
+        {
+            "header_rows_full": normalized_headers,
+            "rows": normalized_rows,
+            "headers": _collapse_header_rows(normalized_headers),
+            "edits": [
+                {
+                    "type": "schema_fallback_noop",
+                    "description": "LLM output invalid; retained deterministic extraction.",
+                }
+            ],
+            "cell_provenance_raw": table_payload.get("cell_provenance", []),
+            "rectifier_confidence": 0.0,
+            "needs_review": True,
+        },
+    )
+
+
 def _normalize_provenance(raw: Any) -> dict[tuple[int, int], dict[str, Any]]:
     out: dict[tuple[int, int], dict[str, Any]] = {}
     if isinstance(raw, list):
@@ -511,12 +554,153 @@ def _tokenize(text: str) -> set[str]:
 
 def _canonicalize_symbol(ch: str) -> str:
     dash_chars = {"-", "−", "–", "—", "‑"}
-    degree_chars = {"°", "º"}
+    degree_chars = {"°", "º", "◦"}
+    star_chars = {"∗", "＊", "✱", "✳", "✻", "﹡", "*"}
     if ch in dash_chars:
         return "-"
     if ch in degree_chars:
         return "°"
+    if ch in star_chars:
+        return "*"
     return ch
+
+
+def _canonical_symbol_set(text: str) -> set[str]:
+    symbols = {_canonicalize_symbol(sym) for sym in _extract_symbols(text)}
+    return {sym for sym in symbols if sym not in IGNORABLE_SYMBOLS}
+
+
+def _alnum_signature(text: str) -> str:
+    return "".join(token for token in TOKEN_RE.findall(str(text or "").lower()) if token)
+
+
+def _text_supported_by_source(evidence_text: str, source_blob: str) -> bool:
+    needle = _normalize_cell_text(evidence_text)
+    hay = _normalize_cell_text(source_blob)
+    if not needle:
+        return False
+    if needle.lower() in hay.lower():
+        return True
+    compact_needle = re.sub(r"\s+", "", needle.lower())
+    compact_hay = re.sub(r"\s+", "", hay.lower())
+    compact_needle = compact_needle.replace("−", "-").replace("–", "-").replace("—", "-")
+    compact_hay = compact_hay.replace("−", "-").replace("–", "-").replace("—", "-")
+    if compact_needle and NUMERICISH_RE.match(compact_needle):
+        return compact_needle in compact_hay
+    n_sig = _alnum_signature(needle)
+    h_sig = _alnum_signature(hay)
+    alpha_chars = sum(1 for ch in n_sig if "a" <= ch <= "z")
+    if n_sig and n_sig in h_sig and (len(n_sig) >= 6 or alpha_chars >= 3):
+        return True
+    n_tokens = _tokenize(needle)
+    h_tokens = _tokenize(hay)
+    has_alpha_token = any(any("a" <= ch <= "z" for ch in token) for token in n_tokens)
+    if n_tokens and h_tokens and has_alpha_token:
+        overlap = len(n_tokens.intersection(h_tokens)) / max(len(n_tokens), 1)
+        if overlap >= 0.7:
+            return True
+    return False
+
+
+def _auto_repair_candidate_for_validation(
+    *,
+    headers: list[str],
+    rows: list[list[str]],
+    orig_headers: list[str],
+    orig_rows: list[list[str]],
+    provenance_by_cell: dict[tuple[int, int], dict[str, Any]],
+    evidence: dict[str, str],
+) -> tuple[list[str], list[list[str]], dict[tuple[int, int], dict[str, Any]]]:
+    repaired_headers = [str(x) for x in headers]
+    repaired_rows = [[str(cell) for cell in row] for row in rows]
+    repaired_provenance = dict(provenance_by_cell)
+
+    # If the model drops too much structure, retain deterministic structure.
+    orig_nonempty_headers = sum(1 for h in orig_headers if _normalize_cell_text(h))
+    new_nonempty_headers = sum(1 for h in repaired_headers if _normalize_cell_text(h))
+    if orig_nonempty_headers > 0 and new_nonempty_headers < max(1, int(0.6 * orig_nonempty_headers)):
+        repaired_headers = list(orig_headers)
+    if orig_rows and len(repaired_rows) < len(orig_rows):
+        repaired_rows = [list(row) for row in orig_rows]
+
+    target_cols = max(
+        len(repaired_headers),
+        max((len(row) for row in repaired_rows), default=0),
+        max((len(row) for row in orig_rows), default=0),
+    )
+    if target_cols > 0:
+        repaired_headers = (repaired_headers + [""] * (target_cols - len(repaired_headers)))[:target_cols]
+        normalized_rows: list[list[str]] = []
+        for row in repaired_rows:
+            normalized_rows.append((list(row) + [""] * (target_cols - len(row)))[:target_cols])
+        repaired_rows = normalized_rows
+        normalized_orig_rows: list[list[str]] = []
+        for row in orig_rows:
+            normalized_orig_rows.append((list(row) + [""] * (target_cols - len(row)))[:target_cols])
+        orig_rows = normalized_orig_rows
+        orig_headers = (list(orig_headers) + [""] * (target_cols - len(orig_headers)))[:target_cols]
+
+    # Revert per-cell changes that would drop non-ignorable symbols.
+    for col_idx in range(min(len(orig_headers), len(repaired_headers))):
+        old_cell = _normalize_cell_text(orig_headers[col_idx])
+        new_cell = _normalize_cell_text(repaired_headers[col_idx])
+        old_has_unit = bool(UNIT_TOKEN_RE.search(old_cell))
+        new_has_unit = bool(UNIT_TOKEN_RE.search(new_cell))
+        if old_has_unit and not new_has_unit:
+            repaired_headers[col_idx] = old_cell
+            continue
+        if old_cell and _canonical_symbol_set(old_cell).difference(_canonical_symbol_set(new_cell)):
+            repaired_headers[col_idx] = old_cell
+    for row_idx in range(min(len(orig_rows), len(repaired_rows))):
+        for col_idx in range(min(len(orig_rows[row_idx]), len(repaired_rows[row_idx]))):
+            old_cell = _normalize_cell_text(orig_rows[row_idx][col_idx])
+            new_cell = _normalize_cell_text(repaired_rows[row_idx][col_idx])
+            if old_cell and _canonical_symbol_set(old_cell).difference(_canonical_symbol_set(new_cell)):
+                repaired_rows[row_idx][col_idx] = old_cell
+
+    marker_text = str(evidence.get("marker_text", ""))
+    ocr_text = str(evidence.get("ocr_text", ""))
+    context_text = str(evidence.get("context_text", ""))
+    # Backfill provenance for changed substantive cells to reduce unnecessary rejections.
+    for row_idx, row in enumerate(repaired_rows):
+        for col_idx, cell in enumerate(row):
+            new_value = _normalize_cell_text(cell)
+            old_value = ""
+            if row_idx < len(orig_rows) and col_idx < len(orig_rows[row_idx]):
+                old_value = _normalize_cell_text(orig_rows[row_idx][col_idx])
+            if not _looks_substantive(new_value) or new_value == old_value:
+                continue
+            key = (row_idx, col_idx)
+            if key in repaired_provenance:
+                continue
+            source = "marker"
+            evidence_text = old_value or new_value
+            confidence = 0.62
+            if _text_supported_by_source(new_value, ocr_text):
+                source = "ocr"
+                evidence_text = new_value
+                confidence = 0.78
+            elif _text_supported_by_source(new_value, marker_text):
+                source = "marker"
+                evidence_text = new_value
+                confidence = 0.82
+            elif _text_supported_by_source(new_value, context_text):
+                source = "context"
+                evidence_text = new_value
+                confidence = 0.7
+            elif _text_supported_by_source(old_value, marker_text):
+                source = "marker"
+                evidence_text = old_value
+                confidence = 0.66
+            repaired_provenance[key] = {
+                "row": row_idx,
+                "col": col_idx,
+                "source": source,
+                "evidence_text": evidence_text,
+                "confidence": confidence,
+            }
+
+    return repaired_headers, repaired_rows, repaired_provenance
 
 
 def _validate_evidence(
@@ -524,16 +708,11 @@ def _validate_evidence(
     table_payload: dict[str, Any],
     normalized: dict[str, Any],
     evidence: dict[str, str],
-) -> tuple[bool, str, list[dict[str, Any]]]:
+) -> tuple[bool, str, list[dict[str, Any]], list[str], list[list[str]]]:
     headers = [str(x) for x in normalized.get("headers", [])]
     rows = [[str(x) for x in row] for row in normalized.get("rows", []) if isinstance(row, list)]
     if not rows:
-        return False, "evidence_violation:no_rows", []
-    target_cols = len(headers)
-    if target_cols <= 0:
-        return False, "invalid_schema:no_headers", []
-    if any(len(row) != target_cols for row in rows):
-        return False, "invalid_schema:non_rectangular_rows", []
+        return False, "evidence_violation:no_rows", [], headers, rows
 
     orig_header_rows = table_payload.get("header_rows_full", [])
     orig_headers = _collapse_header_rows(
@@ -544,13 +723,19 @@ def _validate_evidence(
         for row in table_payload.get("data_rows", [])
         if isinstance(row, list)
     ]
+    if not headers and orig_headers:
+        headers = list(orig_headers)
+    target_cols = max(
+        len(headers),
+        max((len(row) for row in rows), default=0),
+    )
+    if target_cols <= 0:
+        return False, "invalid_schema:no_headers", [], headers, rows
+    headers = (headers + [""] * (target_cols - len(headers)))[:target_cols]
+    rows = [(row + [""] * (target_cols - len(row)))[:target_cols] for row in rows]
+
     orig_nonempty_headers = sum(1 for h in orig_headers if _normalize_cell_text(h))
     new_nonempty_headers = sum(1 for h in headers if _normalize_cell_text(h))
-    if orig_nonempty_headers > 0 and new_nonempty_headers < max(1, int(0.6 * orig_nonempty_headers)):
-        return False, "evidence_violation:header_loss", []
-    if orig_rows and len(rows) < max(1, int(0.5 * len(orig_rows))):
-        return False, "evidence_violation:row_loss", []
-
     provenance_by_cell = _normalize_provenance(normalized.get("cell_provenance_raw"))
     provenance_by_cell = _infer_provenance_for_changed_cells(
         provenance_by_cell=provenance_by_cell,
@@ -558,6 +743,21 @@ def _validate_evidence(
         orig_rows=orig_rows,
         evidence=evidence,
     )
+    headers, rows, provenance_by_cell = _auto_repair_candidate_for_validation(
+        headers=headers,
+        rows=rows,
+        orig_headers=orig_headers,
+        orig_rows=orig_rows,
+        provenance_by_cell=provenance_by_cell,
+        evidence=evidence,
+    )
+    orig_nonempty_headers = sum(1 for h in orig_headers if _normalize_cell_text(h))
+    new_nonempty_headers = sum(1 for h in headers if _normalize_cell_text(h))
+    if orig_nonempty_headers > 0 and new_nonempty_headers < max(1, int(0.6 * orig_nonempty_headers)):
+        return False, "evidence_violation:header_loss", [], headers, rows
+    if orig_rows and len(rows) < max(1, int(0.5 * len(orig_rows))):
+        return False, "evidence_violation:row_loss", [], headers, rows
+
     normalized_provenance = sorted(provenance_by_cell.values(), key=lambda row: (int(row["row"]), int(row["col"])))
     marker_lower = evidence.get("marker_text", "").lower()
     ocr_lower = evidence.get("ocr_text", "").lower()
@@ -571,23 +771,61 @@ def _validate_evidence(
             if _looks_substantive(new_value) and new_value != old_value:
                 provenance = provenance_by_cell.get((row_idx, col_idx))
                 if provenance is None:
-                    return False, f"evidence_violation:missing_provenance:{row_idx}:{col_idx}", []
-    for key, provenance in provenance_by_cell.items():
+                    return False, f"evidence_violation:missing_provenance:{row_idx}:{col_idx}", [], headers, rows
+    for key, provenance in list(provenance_by_cell.items()):
         source = str(provenance.get("source", "")).lower()
         evidence_text = str(provenance.get("evidence_text", "")).strip()
         confidence = float(provenance.get("confidence", 0.0) or 0.0)
         if source not in PROVENANCE_SOURCES:
-            return False, f"evidence_violation:bad_source:{key[0]}:{key[1]}", []
+            row_idx, col_idx = key
+            new_text = ""
+            old_text = ""
+            if row_idx < len(rows) and col_idx < len(rows[row_idx]):
+                new_text = _normalize_cell_text(rows[row_idx][col_idx])
+            if row_idx < len(orig_rows) and col_idx < len(orig_rows[row_idx]):
+                old_text = _normalize_cell_text(orig_rows[row_idx][col_idx])
+            if (not _looks_substantive(new_text)) or new_text == old_text:
+                provenance_by_cell.pop(key, None)
+                continue
+            candidates = [evidence_text, new_text, old_text]
+            source = ""
+            for candidate in candidates:
+                if candidate and _text_supported_by_source(candidate, marker_lower):
+                    source = "marker"
+                    evidence_text = candidate
+                    break
+                if candidate and _text_supported_by_source(candidate, ocr_lower):
+                    source = "ocr"
+                    evidence_text = candidate
+                    break
+                if candidate and _text_supported_by_source(candidate, context_lower):
+                    source = "context"
+                    evidence_text = candidate
+                    break
+            if source not in PROVENANCE_SOURCES:
+                return False, f"evidence_violation:bad_source:{key[0]}:{key[1]}", [], headers, rows
+            provenance["source"] = source
+            provenance["evidence_text"] = evidence_text
         if not evidence_text:
-            return False, f"evidence_violation:missing_evidence_text:{key[0]}:{key[1]}", []
-        if confidence <= 0.0:
-            return False, f"evidence_violation:bad_confidence:{key[0]}:{key[1]}", []
+            return False, f"evidence_violation:missing_evidence_text:{key[0]}:{key[1]}", [], headers, rows
         evidence_text_lower = evidence_text.lower()
         source_blob = marker_lower if source == "marker" else (ocr_lower if source == "ocr" else context_lower)
-        if source_blob and evidence_text_lower not in source_blob:
-            return False, f"evidence_violation:provenance_mismatch:{key[0]}:{key[1]}", []
+        if source_blob and (evidence_text_lower not in source_blob) and (not _text_supported_by_source(evidence_text, source_blob)):
+            return False, f"evidence_violation:provenance_mismatch:{key[0]}:{key[1]}", [], headers, rows
+        if confidence <= 0.0:
+            row_idx, col_idx = key
+            new_text = ""
+            old_text = ""
+            if row_idx < len(rows) and col_idx < len(rows[row_idx]):
+                new_text = _normalize_cell_text(rows[row_idx][col_idx])
+            if row_idx < len(orig_rows) and col_idx < len(orig_rows[row_idx]):
+                old_text = _normalize_cell_text(orig_rows[row_idx][col_idx])
+            if (not _looks_substantive(new_text)) or new_text == old_text:
+                provenance_by_cell.pop(key, None)
+                continue
+            provenance["confidence"] = 0.55
 
-    original_union_symbols_raw = _extract_symbols(
+    original_union_symbols = _canonical_symbol_set(
         "\n".join(
             [
                 " | ".join(orig_headers),
@@ -596,28 +834,37 @@ def _validate_evidence(
             ]
         )
     )
-    rectified_symbols_raw = _extract_symbols(
+    rectified_symbols = _canonical_symbol_set(
         "\n".join([" | ".join(headers), "\n".join(" | ".join(row) for row in rows)])
     )
-    original_union_symbols = {_canonicalize_symbol(sym) for sym in original_union_symbols_raw}
-    rectified_symbols = {_canonicalize_symbol(sym) for sym in rectified_symbols_raw}
-    missing_symbols = "".join(sorted(sym for sym in original_union_symbols if sym not in rectified_symbols))
+    missing_symbols_set = {sym for sym in original_union_symbols if sym not in rectified_symbols}
+    original_table_symbols = _canonical_symbol_set(
+        "\n".join(
+            [
+                " | ".join(orig_headers),
+                "\n".join(" | ".join(row) for row in orig_rows),
+            ]
+        )
+    )
+    missing_symbols = "".join(sorted(missing_symbols_set))
     if missing_symbols:
-        return False, f"evidence_violation:symbol_loss:{missing_symbols}", []
+        # OCR-only symbols are informative but should not hard-fail otherwise valid rectifications.
+        if missing_symbols_set.intersection(original_table_symbols):
+            return False, f"evidence_violation:symbol_loss:{missing_symbols}", [], headers, rows
 
     header_text = " ".join(headers)
     original_units = bool(UNIT_TOKEN_RE.search(" ".join(orig_headers + [_normalize_cell_text(table_payload.get("caption_text", ""))])))
     rectified_units = bool(UNIT_TOKEN_RE.search(header_text))
     if original_units and not rectified_units:
-        return False, "evidence_violation:unit_loss", []
+        return False, "evidence_violation:unit_loss", [], headers, rows
 
     evidence_tokens = _tokenize(evidence.get("combined_text", ""))
     rectified_tokens = _tokenize(" ".join(headers + [cell for row in rows for cell in row]))
     novel_tokens = rectified_tokens.difference(evidence_tokens)
     if novel_tokens and len(novel_tokens) > max(3, int(0.2 * max(len(rectified_tokens), 1))):
-        return False, "evidence_violation:hallucinated_tokens", []
+        return False, "evidence_violation:hallucinated_tokens", [], headers, rows
 
-    return True, "", normalized_provenance
+    return True, "", normalized_provenance, headers, rows
 
 
 def _write_table_csv(path: Path, headers: list[str], rows: list[list[str]]) -> None:
@@ -830,7 +1077,7 @@ async def run_table_rectification_for_doc(
 
         schema_retry_count = 0
         ok_schema, schema_reason, normalized = _normalize_rectified_payload(parsed)
-        while (not ok_schema) and schema_retry_count < 1 and schema_reason in {
+        while (not ok_schema) and schema_retry_count < 2 and schema_reason in {
             "invalid_schema:missing_grid",
             "invalid_schema:empty_grid",
         }:
@@ -853,6 +1100,13 @@ async def run_table_rectification_for_doc(
                 break
             parsed = retry_parsed
             ok_schema, schema_reason, normalized = _normalize_rectified_payload(parsed)
+        used_schema_noop_fallback = False
+        if (not ok_schema) and schema_reason in {"invalid_schema:missing_grid", "invalid_schema:empty_grid"}:
+            ok_noop, _, normalized_noop = _normalized_noop_from_table_payload(table_payload)
+            if ok_noop:
+                ok_schema = True
+                normalized = normalized_noop
+                used_schema_noop_fallback = True
         if not ok_schema:
             result.fallbacked += 1
             result.invalid_schema += 1
@@ -876,7 +1130,7 @@ async def run_table_rectification_for_doc(
             )
             continue
 
-        ok_evidence, evidence_reason, normalized_provenance = _validate_evidence(
+        ok_evidence, evidence_reason, normalized_provenance, repaired_headers, repaired_rows = _validate_evidence(
             table_payload=table_payload,
             normalized=normalized,
             evidence=evidence,
@@ -918,6 +1172,9 @@ async def run_table_rectification_for_doc(
             )
             continue
 
+        normalized["headers"] = repaired_headers
+        normalized["rows"] = repaired_rows
+        normalized["header_rows_full"] = [list(repaired_headers)]
         normalized["cell_provenance"] = normalized_provenance
         updated_payload, headers, rows = _apply_rectification(
             doc_dir=doc_dir,
@@ -948,6 +1205,16 @@ async def run_table_rectification_for_doc(
             canonical_by_id[table_id] = crow
 
         result.applied += 1
+        if used_schema_noop_fallback:
+            _append_flag(
+                qa_rows=qa_rows,
+                existing_flag_ids=existing_flag_ids,
+                table_id=table_id,
+                page=page,
+                flag_type="llm_rectification_schema_fallback_noop",
+                severity="warn",
+                details="invalid_schema_empty_or_missing_grid",
+            )
         _append_flag(
             qa_rows=qa_rows,
             existing_flag_ids=existing_flag_ids,

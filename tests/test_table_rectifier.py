@@ -264,3 +264,78 @@ def test_rectifier_retries_on_invalid_schema_before_fallback(tmp_path: Path):
     )
     assert calls["count"] == 2
     assert result.applied == 1
+
+
+def test_rectifier_repairs_symbol_loss_by_restoring_original_header_symbol(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
+    table_payload = json.loads(table_json_path.read_text())
+    table_payload["header_rows_full"] = [["Polymer", "η (mPa·s)"]]
+    table_payload["data_rows"] = [["A", "1.2 ± 0.1"]]
+    table_json_path.write_text(json.dumps(table_payload, indent=2, ensure_ascii=True))
+    manifest_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    manifest = json.loads(manifest_path.read_text().strip())
+    manifest["headers"] = ["Polymer", "η (mPa·s)"]
+    manifest["rows"] = [["A", "1.2 ± 0.1"]]
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+
+    payload = {
+        "rectified_header_rows_full": [["Polymer", "(mPa·s)"]],
+        "rectified_rows": [["A", "1.2 ± 0.1"]],
+        "edits": [{"type": "header_cleanup", "description": "drop greek symbol"}],
+        "cell_provenance": [],
+        "rectifier_confidence": 0.7,
+        "needs_review": False,
+    }
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        return _FakeTextResponse(json.dumps(payload))
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.applied == 1
+    after = json.loads(table_json_path.read_text())
+    assert "η" in after["header_rows_full"][0][1]
+
+
+def test_rectifier_repairs_row_loss_by_restoring_missing_rows(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
+    table_payload = json.loads(table_json_path.read_text())
+    table_payload["data_rows"] = [["A", "1.2 ± 0.1"], ["B", "2.4 ± 0.2"]]
+    table_json_path.write_text(json.dumps(table_payload, indent=2, ensure_ascii=True))
+
+    manifest_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    manifest = json.loads(manifest_path.read_text().strip())
+    manifest["rows"] = [["A", "1.2 ± 0.1"], ["B", "2.4 ± 0.2"]]
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+
+    payload = {
+        "rectified_header_rows_full": [["Polymer", "Value"]],
+        "rectified_rows": [["A", "1.2 ± 0.1"]],
+        "edits": [{"type": "dedupe_rows", "description": "incorrectly dropped row"}],
+        "cell_provenance": [],
+        "rectifier_confidence": 0.6,
+        "needs_review": True,
+    }
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        return _FakeTextResponse(json.dumps(payload))
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.applied == 1
+    after = json.loads(table_json_path.read_text())
+    assert len(after["data_rows"]) == 2
