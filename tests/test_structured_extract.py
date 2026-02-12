@@ -9,6 +9,7 @@ import pytest
 
 from paper_ocr.inspect import TextHeuristics
 from paper_ocr.structured_extract import (
+    _marker_service_llm_form_fields,
     build_render_contract,
     grobid_coords_to_px,
     is_structured_candidate_doc,
@@ -350,6 +351,28 @@ def test_run_marker_page_allows_local_when_override_enabled(monkeypatch: pytest.
     )
     assert result.success
     assert called["subprocess"] > 0
+
+
+def test_marker_service_llm_form_fields_disabled_by_default():
+    fields = _marker_service_llm_form_fields(env={})
+    assert fields == {}
+
+
+def test_marker_service_llm_form_fields_include_openai_defaults_from_env():
+    fields = _marker_service_llm_form_fields(
+        env={
+            "PAPER_OCR_MARKER_SERVICE_USE_LLM": "1",
+            "PAPER_OCR_MARKER_SERVICE_LLM_SERVICE": "marker.services.openai.OpenAIService",
+            "PAPER_OCR_MARKER_SERVICE_OPENAI_BASE_URL": "https://api.deepinfra.com/v1/openai",
+            "PAPER_OCR_MARKER_SERVICE_OPENAI_MODEL": "openai/gpt-oss-120b",
+            "DEEPINFRA_API_KEY": "test-key",
+        }
+    )
+    assert fields["use_llm"] == "true"
+    assert fields["llm_service"] == "marker.services.openai.OpenAIService"
+    assert fields["openai_base_url"] == "https://api.deepinfra.com/v1/openai"
+    assert fields["openai_model"] == "openai/gpt-oss-120b"
+    assert fields["openai_api_key"] == "test-key"
 
 
 def test_run_grobid_doc_success(monkeypatch, tmp_path: Path):

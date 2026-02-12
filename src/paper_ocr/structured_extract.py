@@ -65,6 +65,31 @@ def _resolve_marker_url(marker_url: str, env: dict[str, str] | None = None) -> s
     return str(env_map.get("PAPER_OCR_MARKER_URL", "") or "").strip()
 
 
+def _marker_service_llm_form_fields(env: dict[str, str] | None = None) -> dict[str, str]:
+    env_map = env or dict(os.environ)
+    if not _truthy_env(env_map.get("PAPER_OCR_MARKER_SERVICE_USE_LLM")):
+        return {}
+
+    fields: dict[str, str] = {"use_llm": "true"}
+    llm_service = str(env_map.get("PAPER_OCR_MARKER_SERVICE_LLM_SERVICE", "") or "").strip()
+    if llm_service:
+        fields["llm_service"] = llm_service
+
+    openai_base_url = str(env_map.get("PAPER_OCR_MARKER_SERVICE_OPENAI_BASE_URL", "") or "").strip()
+    openai_model = str(env_map.get("PAPER_OCR_MARKER_SERVICE_OPENAI_MODEL", "") or "").strip()
+    if openai_base_url:
+        fields["openai_base_url"] = openai_base_url
+    if openai_model:
+        fields["openai_model"] = openai_model
+
+    openai_api_key = str(env_map.get("PAPER_OCR_MARKER_SERVICE_OPENAI_API_KEY", "") or "").strip()
+    if not openai_api_key:
+        openai_api_key = str(env_map.get("DEEPINFRA_API_KEY", "") or "").strip()
+    if openai_api_key:
+        fields["openai_api_key"] = openai_api_key
+    return fields
+
+
 def _local_marker_cli_block_reason(*, marker_url: str, env: dict[str, str] | None = None) -> str:
     env_map = env or dict(os.environ)
     if _truthy_env(env_map.get("PAPER_OCR_ALLOW_LOCAL_HEAVY")):
@@ -282,16 +307,18 @@ def _run_marker_page_via_service(
     page_index: int,
 ) -> StructuredPageResult:
     endpoint = marker_url.rstrip("/") + "/marker/upload"
+    form_fields = {
+        "output_format": "markdown",
+        "force_ocr": "false",
+        "paginate_output": "false",
+        **_marker_service_llm_form_fields(),
+    }
     req = _multipart_upload_request(
         url=endpoint,
         file_field="file",
         file_path=single_pdf,
         content_type="application/pdf",
-        form_fields={
-            "output_format": "markdown",
-            "force_ocr": "false",
-            "paginate_output": "false",
-        },
+        form_fields=form_fields,
     )
     try:
         with request.urlopen(req, timeout=timeout) as resp:
@@ -930,16 +957,18 @@ def run_marker_doc(
 
         if resolved_marker_url:
             endpoint = resolved_marker_url.rstrip("/") + "/marker/upload"
+            form_fields = {
+                "output_format": "json" if profile == "full_json" else "markdown",
+                "force_ocr": "false",
+                "paginate_output": "true",
+                **_marker_service_llm_form_fields(),
+            }
             req = _multipart_upload_request(
                 url=endpoint,
                 file_field="file",
                 file_path=pdf_path,
                 content_type="application/pdf",
-                form_fields={
-                    "output_format": "json" if profile == "full_json" else "markdown",
-                    "force_ocr": "false",
-                    "paginate_output": "true",
-                },
+                form_fields=form_fields,
             )
             try:
                 with request.urlopen(req, timeout=timeout) as resp:
