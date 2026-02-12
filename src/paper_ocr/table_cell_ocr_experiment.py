@@ -802,6 +802,64 @@ async def _run_llm_reconciliation(
     expected_cols: int,
     expected_header_rows: int,
 ) -> dict[str, Any]:
+    async def _call_tool_mode(prompt_text: str, token_limit: int) -> tuple[dict[str, Any], str, str]:
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "submit_reconciled_table",
+                "description": "Submit reconciled table output as strict JSON arguments.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "corrected_header_rows_full": {
+                            "type": "array",
+                            "items": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "corrected_rows": {
+                            "type": "array",
+                            "items": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "applied_corrections": {"type": "boolean"},
+                        "notes": {"type": "string"},
+                    },
+                    "required": [
+                        "corrected_header_rows_full",
+                        "corrected_rows",
+                        "applied_corrections",
+                        "notes",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                max_tokens=token_limit,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt_text}],
+                tools=[tool_schema],
+                tool_choice={"type": "function", "function": {"name": "submit_reconciled_table"}},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {}, "", str(exc)
+
+        message = response.choices[0].message
+        tool_calls = getattr(message, "tool_calls", None) or []
+        finish_reason = str(response.choices[0].finish_reason or "")
+        if not tool_calls:
+            return {}, str(message.content or ""), f"missing_tool_calls:finish={finish_reason or 'unknown'}"
+        first = tool_calls[0]
+        fn = getattr(first, "function", None)
+        args = str(getattr(fn, "arguments", "") or "").strip()
+        if not args:
+            return {}, str(message.content or ""), "empty_tool_arguments"
+        try:
+            parsed = json.loads(args)
+        except Exception as exc:  # noqa: BLE001
+            return {}, args, f"invalid_tool_arguments_json:{exc}"
+        return (parsed if isinstance(parsed, dict) else {}), args, ""
+
     async def _call_json_mode(prompt_text: str, token_limit: int) -> tuple[str, str]:
         try:
             response = await client.chat.completions.create(
@@ -829,35 +887,58 @@ async def _run_llm_reconciliation(
     raw_text = ""
     repair_text = ""
     raw_payload: dict[str, Any] = {}
+    source = ""
     error = ""
     try:
-        raw_text, error = await _call_json_mode(prompt, int(max_tokens))
-        if not raw_text:
-            response = await call_text_model(
-                client=client,
-                model=model,
-                prompt=prompt,
-                max_tokens=max_tokens,
-            )
-            raw_text = str(response.content or response.reasoning_content or "")
-        raw_payload = extract_json_object(raw_text)
-        if not raw_payload:
-            repair_prompt = _build_llm_json_repair_prompt(raw_text)
-            repair_text, repair_error = await _call_json_mode(
-                repair_prompt,
-                max(600, int(max_tokens // 2)),
-            )
-            if not repair_text:
-                repair_response = await call_text_model(
+        raw_payload, raw_text, error = await _call_tool_mode(prompt, int(max_tokens))
+        if not raw_payload and ("missing_tool_calls:finish=length" in error or "empty_tool_arguments" in error):
+            retry_limit = max(4096, int(max_tokens) * 2)
+            retry_limit = min(retry_limit, 8192)
+            if retry_limit > int(max_tokens):
+                raw_payload, raw_text, retry_error = await _call_tool_mode(prompt, retry_limit)
+                if raw_payload:
+                    error = ""
+                elif retry_error:
+                    error = retry_error
+        if raw_payload:
+            source = "tool_call"
+            error = ""
+        else:
+            if error:
+                raw_text = f"tool_mode_error:{error}\n{raw_text}".strip()
+            else:
+                raw_text = raw_text.strip()
+            raw_text, error = await _call_json_mode(prompt, int(max_tokens))
+            if not raw_text:
+                response = await call_text_model(
                     client=client,
                     model=model,
-                    prompt=repair_prompt,
-                    max_tokens=max(600, int(max_tokens // 2)),
+                    prompt=prompt,
+                    max_tokens=max_tokens,
                 )
-                repair_text = str(repair_response.content or repair_response.reasoning_content or "")
-                if repair_error and not error:
-                    error = repair_error
-            raw_payload = extract_json_object(repair_text)
+                raw_text = str(response.content or response.reasoning_content or "")
+            raw_payload = extract_json_object(raw_text)
+            if raw_payload:
+                source = "json_mode_or_text"
+            if not raw_payload:
+                repair_prompt = _build_llm_json_repair_prompt(raw_text)
+                repair_text, repair_error = await _call_json_mode(
+                    repair_prompt,
+                    max(600, int(max_tokens // 2)),
+                )
+                if not repair_text:
+                    repair_response = await call_text_model(
+                        client=client,
+                        model=model,
+                        prompt=repair_prompt,
+                        max_tokens=max(600, int(max_tokens // 2)),
+                    )
+                    repair_text = str(repair_response.content or repair_response.reasoning_content or "")
+                    if repair_error and not error:
+                        error = repair_error
+                raw_payload = extract_json_object(repair_text)
+                if raw_payload:
+                    source = "repair"
             if not raw_payload:
                 error = "empty_or_unparseable_json"
     except Exception as exc:  # noqa: BLE001
@@ -870,7 +951,7 @@ async def _run_llm_reconciliation(
         expected_header_rows=expected_header_rows,
         fallback_grid=prefilled_grid,
     )
-    if error and normalized.get("valid"):
+    if error and normalized.get("valid") and not raw_payload:
         normalized["valid"] = False
         normalized["reason"] = f"llm_call_failed:{error}"
         normalized["applied_corrections"] = False
@@ -881,6 +962,7 @@ async def _run_llm_reconciliation(
         "prompt": prompt,
         "raw_text": raw_text,
         "repair_text": repair_text,
+        "source": source,
         "raw_payload": raw_payload,
         "error": error,
         "normalized": normalized,
@@ -1277,7 +1359,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm-max-tokens",
         type=int,
-        default=int(os.getenv("PAPER_OCR_TABLE_LLM_MAX_TOKENS", "1800")),
+        default=int(os.getenv("PAPER_OCR_TABLE_LLM_MAX_TOKENS", "4200")),
     )
     parser.add_argument(
         "--marker-url",
