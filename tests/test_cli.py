@@ -1,10 +1,12 @@
 import argparse
 import asyncio
 import json
+from io import BytesIO
 from pathlib import Path
 
 import fitz
 import pytest
+from PIL import Image
 
 from paper_ocr import cli
 from paper_ocr.inspect import TextHeuristics
@@ -1538,12 +1540,16 @@ def test_ensure_header_ocr_artifacts_generates_only_missing(monkeypatch, tmp_pat
     manifest_path.write_text(json.dumps({"source_path": str(src_pdf)}))
     qa_out = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
     qa_out.mkdir(parents=True, exist_ok=True)
-    (qa_out / "table_01_page_0001.md").write_text("<table></table>")
+    (qa_out / "table_01_page_0001.md").write_text(
+        f"<!-- ocr_mode:{cli.TABLE_OCR_ARTIFACT_VERSION} -->\n<table></table>"
+    )
+    call_count = {"count": 0}
 
     class _Resp:
         content = "<table><tr><th>A</th></tr></table>"
 
     async def _fake_ocr(**kwargs):  # noqa: ANN001
+        call_count["count"] += 1
         return _Resp()
 
     monkeypatch.setattr(cli, "call_olmocr", _fake_ocr)
@@ -1559,6 +1565,54 @@ def test_ensure_header_ocr_artifacts_generates_only_missing(monkeypatch, tmp_pat
     assert summary["generated"] == 1
     assert summary["skipped_existing"] == 1
     assert summary["failed"] == 0
+    assert call_count["count"] == 1
+
+
+def test_ensure_header_ocr_artifacts_regenerates_legacy_and_uses_full_crop(monkeypatch, tmp_path: Path):
+    doc_dir = tmp_path / "doc"
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps({"page": 1, "bbox": [10, 10, 100, 100]}) + "\n")
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    src_pdf = tmp_path / "source.pdf"
+    with fitz.open() as out:
+        out.new_page(width=300, height=300)
+        out.save(src_pdf)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps({"source_path": str(src_pdf)}))
+    qa_out = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    qa_out.mkdir(parents=True, exist_ok=True)
+    legacy_path = qa_out / "table_01_page_0001.md"
+    legacy_path.write_text("<table><tr><th>legacy</th></tr></table>")
+
+    image_dims: list[tuple[int, int]] = []
+
+    class _Resp:
+        content = "<table><tr><th>H</th></tr><tr><td>1</td></tr></table>"
+
+    async def _fake_ocr(**kwargs):  # noqa: ANN001
+        image_bytes = kwargs.get("image_bytes", b"")
+        with Image.open(BytesIO(image_bytes)) as img:
+            image_dims.append((img.width, img.height))
+        return _Resp()
+
+    monkeypatch.setattr(cli, "call_olmocr", _fake_ocr)
+    summary = asyncio.run(
+        cli._ensure_header_ocr_artifacts(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            model="m",
+            max_tokens=100,
+        )
+    )
+    assert summary["expected"] == 1
+    assert summary["generated"] == 1
+    assert summary["skipped_existing"] == 0
+    assert summary["failed"] == 0
+    assert image_dims and image_dims[0][0] > 300
+    assert image_dims[0][1] > 300
+    written = legacy_path.read_text()
+    assert f"ocr_mode:{cli.TABLE_OCR_ARTIFACT_VERSION}" in written
 
 
 def test_process_page_structured_success_skips_fallback(monkeypatch, tmp_path: Path):

@@ -77,6 +77,7 @@ GROBID_TIMEOUT_DEFAULT = "60"
 DEPLOT_TIMEOUT_DEFAULT = "90"
 TABLE_HEADER_OCR_MODEL_DEFAULT = "allenai/olmOCR-2-7B-1025"
 TABLE_HEADER_OCR_MAX_TOKENS_DEFAULT = 1400
+TABLE_OCR_ARTIFACT_VERSION = "full_table_v2"
 TABLE_LLM_RECTIFIER_MODEL_DEFAULT = "openai/gpt-oss-120b"
 TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT = 2000
 TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT = 0.45
@@ -778,6 +779,16 @@ def _disabled_table_rectifier_summary(
     )
 
 
+def _is_current_ocr_artifact(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text()
+    except Exception:
+        return False
+    return f"ocr_mode:{TABLE_OCR_ARTIFACT_VERSION}" in text[:500]
+
+
 async def _ensure_header_ocr_artifacts(
     *,
     doc_dir: Path,
@@ -822,6 +833,7 @@ async def _ensure_header_ocr_artifacts(
     expected = 0
     generated = 0
     skipped_existing = 0
+    regenerated_legacy = 0
     failed = 0
     with fitz.open(source_path) as pdf:
         by_page_counter: dict[int, int] = {}
@@ -840,16 +852,17 @@ async def _ensure_header_ocr_artifacts(
             ordinal = by_page_counter[page]
             expected += 1
             out_md = ocr_out / f"table_{ordinal:02d}_page_{page:04d}.md"
-            if out_md.exists():
+            if _is_current_ocr_artifact(out_md):
                 skipped_existing += 1
                 continue
+            if out_md.exists():
+                regenerated_legacy += 1
 
             x0, y0, x1, y1 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
             if x1 <= x0 or y1 <= y0:
                 failed += 1
                 continue
-            header_h = max(72.0, min(180.0, (y1 - y0) * 0.33))
-            clip = fitz.Rect(x0, y0, x1, min(y1, y0 + header_h))
+            clip = fitz.Rect(x0, y0, x1, y1)
             page_obj = pdf.load_page(page - 1)
             pix = page_obj.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72), clip=clip, alpha=False)
             image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -859,9 +872,9 @@ async def _ensure_header_ocr_artifacts(
             (ocr_crops / f"table_{ordinal:02d}_page_{page:04d}.png").write_bytes(image_bytes)
 
             prompt = (
-                "Extract only table header rows from this image crop as HTML table markup. "
-                "Preserve Greek letters, superscripts/subscripts, symbols, and column grouping. "
-                "Return only <table>...</table> with <th> cells."
+                "Extract the full table from this image crop as HTML table markup. "
+                "Preserve all rows and columns, merged headers, symbols, superscripts/subscripts, and units. "
+                "Return only one <table>...</table> using <th> and <td> as needed."
             )
             try:
                 response = await call_olmocr(
@@ -876,7 +889,9 @@ async def _ensure_header_ocr_artifacts(
                 out_md.write_text(f"<!-- header_ocr_error: {exc} -->")
                 failed += 1
                 continue
-            out_md.write_text(str(response.content or "").strip())
+            out_md.write_text(
+                f"<!-- ocr_mode:{TABLE_OCR_ARTIFACT_VERSION} -->\n{str(response.content or '').strip()}\n"
+            )
             generated += 1
 
     status = "ok" if failed == 0 else "partial"
@@ -884,6 +899,7 @@ async def _ensure_header_ocr_artifacts(
         "expected": expected,
         "generated": generated,
         "skipped_existing": skipped_existing,
+        "regenerated_legacy": regenerated_legacy,
         "failed": failed,
         "status": status,
     }
