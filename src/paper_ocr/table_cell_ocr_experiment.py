@@ -822,7 +822,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bbox-mode", choices=["auto", "normalized", "pixels"], default="auto")
     parser.add_argument("--render-dpi", type=int, default=300)
     parser.add_argument("--cell-padding-px", type=int, default=2)
-    parser.add_argument("--workers", type=int, default=12)
+    parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--dry-run", action="store_true", help="Skip OCR calls; validate structure+bbox only.")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument(
