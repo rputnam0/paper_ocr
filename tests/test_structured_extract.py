@@ -325,6 +325,33 @@ def test_run_marker_page_uses_marker_url_from_env_when_arg_missing(monkeypatch: 
     assert called["subprocess"] == 0
 
 
+def test_run_marker_page_allows_local_when_override_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    monkeypatch.setenv("PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED", "1")
+    monkeypatch.setenv("PAPER_OCR_ALLOW_LOCAL_HEAVY", "1")
+    called = {"subprocess": 0}
+
+    def _fake_run(cmd, check, env, stdout, stderr, timeout):  # noqa: ANN001
+        called["subprocess"] += 1
+        out_dir = Path(cmd[cmd.index("--output_dir") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "doc.md").write_text("# Local override\n")
+        return 0
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    result = run_marker_page(
+        pdf_path=pdf_path,
+        page_index=0,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=tmp_path / "assets",
+        asset_level="standard",
+    )
+    assert result.success
+    assert called["subprocess"] > 0
+
+
 def test_run_grobid_doc_success(monkeypatch, tmp_path: Path):
     pdf_path = tmp_path / "doc.pdf"
     _make_pdf(pdf_path)
