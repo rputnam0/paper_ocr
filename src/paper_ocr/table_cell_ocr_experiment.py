@@ -89,6 +89,13 @@ def _normalize_cell_text(value: Any) -> str:
     return text
 
 
+def _normalize_ocr_cell_output(value: Any) -> str:
+    text = _normalize_cell_text(value)
+    if text in {'""', "''"}:
+        return ""
+    return text
+
+
 def _portable_path(path: Path, root: Path) -> str:
     try:
         return str(path.relative_to(root))
@@ -925,11 +932,7 @@ async def _ocr_single_cell(
     max_tokens: int,
     crop: Image.Image,
 ) -> tuple[str, str]:
-    prompt = (
-        "Read this single table cell exactly. "
-        "Preserve symbols, punctuation, superscripts/subscripts, and units. "
-        "Return plain text only. If empty, return an empty string."
-    )
+    prompt = 'Transcribe the visible text. If there is no text emit "".'
     buf = BytesIO()
     crop.save(buf, format="PNG", optimize=True)
     image_bytes = buf.getvalue()
@@ -945,7 +948,7 @@ async def _ocr_single_cell(
             )
         except Exception as exc:  # noqa: BLE001
             return "", str(exc)
-    return _normalize_cell_text(response.content or ""), ""
+    return _normalize_ocr_cell_output(response.content or ""), ""
 
 
 async def _ocr_cells_for_table(

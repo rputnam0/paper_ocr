@@ -3,6 +3,7 @@ from __future__ import annotations
 from paper_ocr.table_cell_ocr_experiment import (
     _apply_cell_text_to_grid,
     _build_llm_reconciliation_prompt,
+    _normalize_ocr_cell_output,
     _normalize_llm_reconciliation_payload,
     _normalize_structure_payload_with_bboxes,
 )
@@ -164,3 +165,10 @@ def test_normalize_llm_reconciliation_payload_rejects_drop_and_falls_back():
     assert normalized["valid"] is False
     assert normalized["reason"] == "no_drop_violation"
     assert normalized["rows"] == [["1", "X"], ["3", "4"]]
+
+
+def test_normalize_ocr_cell_output_maps_quoted_empty_to_empty_string():
+    assert _normalize_ocr_cell_output('""') == ""
+    assert _normalize_ocr_cell_output("''") == ""
+    assert _normalize_ocr_cell_output("  <empty>  ") == ""
+    assert _normalize_ocr_cell_output("ABC") == "ABC"
