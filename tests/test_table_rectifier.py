@@ -339,3 +339,113 @@ def test_rectifier_repairs_row_loss_by_restoring_missing_rows(tmp_path: Path):
     assert result.applied == 1
     after = json.loads(table_json_path.read_text())
     assert len(after["data_rows"]) == 2
+
+
+def test_rectifier_retries_after_evidence_violation_with_validation_feedback(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    validation_dir = doc_dir / "metadata" / "assets" / "structured" / "validation"
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    validation_row = {
+        "table_id": "p0001_t01",
+        "model_review": {
+            "recommended_action": "review",
+            "failure_modes": ["row_shift_or_merge", "symbol_or_unit_loss"],
+            "issues": ["Mean and std-dev were split across rows."],
+            "llm_extraction_instructions": ["Merge vertically stacked continuation values into a single logical row."],
+            "final_action": "reject",
+        },
+    }
+    (validation_dir / "gemini_table_review.jsonl").write_text(json.dumps(validation_row) + "\n")
+
+    calls = {"count": 0}
+    prompts: list[str] = []
+
+    bad_payload = {
+        "rectified_header_rows_full": [["Polymer", "Value"]],
+        "rectified_rows": [["A", "FABRICATED 99"]],
+        "edits": [{"type": "replace_cell", "description": "hallucinated replacement"}],
+        "cell_provenance": [{"row": 0, "col": 1, "source": "context", "evidence_text": "fabricated", "confidence": 0.9}],
+        "rectifier_confidence": 0.6,
+        "needs_review": True,
+    }
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        calls["count"] += 1
+        prompts.append(str(kwargs.get("prompt", "")))
+        if calls["count"] == 1:
+            return _FakeTextResponse(json.dumps(bad_payload))
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.applied == 1
+    assert calls["count"] == 2
+    assert any("Merge vertically stacked continuation values" in prompt for prompt in prompts)
+
+
+def test_rectifier_target_reject_uses_validation_final_action(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    validation_dir = doc_dir / "metadata" / "assets" / "structured" / "validation"
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    validation_row = {
+        "table_id": "p0001_t01",
+        "model_review": {
+            "recommended_action": "review",
+            "final_action": "reject",
+            "failure_modes": ["multi_level_header_loss"],
+        },
+    }
+    (validation_dir / "gemini_table_review.jsonl").write_text(json.dumps(validation_row) + "\n")
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="reject"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.selected == 1
+    assert result.applied == 1
+
+
+def test_rectifier_preserves_multilevel_header_rows_full(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
+    table_payload = json.loads(table_json_path.read_text())
+    table_payload["header_rows_full"] = [["Condition", "Condition"], ["Polymer", "Value"]]
+    table_payload["data_rows"] = [["A", "1.2 ± 0.1"]]
+    table_json_path.write_text(json.dumps(table_payload, indent=2, ensure_ascii=True))
+
+    payload = {
+        "rectified_header_rows_full": [["Condition", "Condition"], ["Polymer", "Value"]],
+        "rectified_rows": [["A", "1.2 ± 0.1"]],
+        "edits": [{"type": "preserve", "description": "keep hierarchical headers"}],
+        "cell_provenance": [],
+        "rectifier_confidence": 0.9,
+        "needs_review": False,
+    }
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        return _FakeTextResponse(json.dumps(payload))
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.applied == 1
+    after = json.loads(table_json_path.read_text())
+    assert len(after["header_rows_full"]) == 2

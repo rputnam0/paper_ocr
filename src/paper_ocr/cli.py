@@ -236,7 +236,7 @@ def _parse_args() -> argparse.Namespace:
     )
     run.add_argument(
         "--table-llm-target",
-        choices=["risk", "all", "nonaccept"],
+        choices=["risk", "all", "nonaccept", "reject"],
         default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
     )
     run.add_argument(
@@ -437,7 +437,7 @@ def _parse_args() -> argparse.Namespace:
     )
     export.add_argument(
         "--table-llm-target",
-        choices=["risk", "all", "nonaccept"],
+        choices=["risk", "all", "nonaccept", "reject"],
         default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
     )
     export.add_argument(

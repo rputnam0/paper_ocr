@@ -19,6 +19,7 @@ TOKEN_RE = re.compile(r"[a-z0-9]+")
 NUMERICISH_RE = re.compile(r"^[0-9.,+\-−–—/%()±×*]+$")
 PROVENANCE_SOURCES = {"marker", "ocr", "context"}
 IGNORABLE_SYMBOLS = {"-", "*"}
+GROUP_PAGE_TABLE_RE = re.compile(r"page_(\d+)_table_(\d+)$")
 
 
 @dataclass
@@ -228,60 +229,228 @@ def _compute_risk_score(table_payload: dict[str, Any], qa_rows: list[dict[str, A
     return round(max(0.0, min(1.0, risk)), 4)
 
 
-def _collect_nonaccept_table_ids(validation_path: Path) -> set[str]:
+def _collect_target_table_ids(validation_path: Path, *, target: str) -> set[str]:
     out: set[str] = set()
     for row in _load_jsonl(validation_path):
         table_id = str(row.get("table_id", "")).strip()
         review = row.get("model_review", {})
-        if not isinstance(review, dict):
+        if not table_id or not isinstance(review, dict):
             continue
-        action = str(review.get("recommended_action", "")).strip().lower()
-        if table_id and action in {"review", "reject"}:
-            out.add(table_id)
+        recommended_action = str(review.get("recommended_action", "")).strip().lower()
+        final_action = str(review.get("final_action", "")).strip().lower()
+        if target == "nonaccept":
+            if final_action == "reject" or recommended_action in {"review", "reject"}:
+                out.add(table_id)
+            continue
+        if target == "reject":
+            if final_action == "reject" or (not final_action and recommended_action == "reject"):
+                out.add(table_id)
+            continue
     return out
 
 
-def _read_ocr_evidence(doc_dir: Path, table_payload: dict[str, Any], page: int) -> str:
+def _collect_validation_feedback_map(validation_path: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for row in _load_jsonl(validation_path):
+        table_id = str(row.get("table_id", "")).strip()
+        review = row.get("model_review", {})
+        if not table_id or not isinstance(review, dict):
+            continue
+        feedback = {
+            "recommended_action": str(review.get("recommended_action", "")).strip().lower(),
+            "final_action": str(review.get("final_action", "")).strip().lower(),
+            "failure_modes": [str(x).strip() for x in review.get("failure_modes", []) if str(x).strip()]
+            if isinstance(review.get("failure_modes", []), list)
+            else [],
+            "issues": [str(x).strip() for x in review.get("issues", []) if str(x).strip()]
+            if isinstance(review.get("issues", []), list)
+            else [],
+            "llm_extraction_instructions": [
+                str(x).strip() for x in review.get("llm_extraction_instructions", []) if str(x).strip()
+            ]
+            if isinstance(review.get("llm_extraction_instructions", []), list)
+            else [],
+            "missing_required_information": [
+                str(x).strip() for x in review.get("missing_required_information", []) if str(x).strip()
+            ]
+            if isinstance(review.get("missing_required_information", []), list)
+            else [],
+            "formatting_issues": [str(x).strip() for x in review.get("formatting_issues", []) if str(x).strip()]
+            if isinstance(review.get("formatting_issues", []), list)
+            else [],
+            "root_cause_hypothesis": str(review.get("root_cause_hypothesis", "") or "").strip(),
+        }
+        out[table_id] = feedback
+    return out
+
+
+def _resolve_fragment_index(doc_dir: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    fragments_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "table_fragments.jsonl"
+    for row in _load_jsonl(fragments_path):
+        fid = str(row.get("fragment_id", "")).strip()
+        if fid:
+            out[fid] = row
+    return out
+
+
+def _read_ocr_evidence(
+    doc_dir: Path,
+    table_payload: dict[str, Any],
+    page: int,
+    fragment_rows: list[dict[str, Any]],
+) -> str:
+    snippets: list[str] = []
+    seen_paths: set[str] = set()
+
+    def _append_if_exists(path: Path) -> None:
+        key = str(path)
+        if key in seen_paths or not path.exists() or not path.is_file():
+            return
+        try:
+            text = path.read_text()
+        except Exception:
+            return
+        seen_paths.add(key)
+        snippets.append(f"[{path.name}]\n{text}")
+
     ocr_merge = table_payload.get("ocr_merge", {})
     if isinstance(ocr_merge, dict):
         rel_path = str(ocr_merge.get("ocr_html_path", "")).strip()
         if rel_path:
-            candidate = doc_dir / rel_path
-            if candidate.exists():
-                return candidate.read_text()
+            _append_if_exists(doc_dir / rel_path)
     qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
     if qa_root.exists():
-        for path in sorted(qa_root.glob(f"table_*_page_{int(page):04d}.md")):
+        for frag in fragment_rows:
+            if not isinstance(frag, dict):
+                continue
+            group = str(frag.get("table_group_id", "")).strip()
+            m = GROUP_PAGE_TABLE_RE.search(group)
+            if not m:
+                continue
+            frag_page = int(m.group(1))
+            ordinal = int(m.group(2))
+            _append_if_exists(qa_root / f"table_{ordinal:02d}_page_{frag_page:04d}.md")
+        pages = table_payload.get("pages", [])
+        if not isinstance(pages, list):
+            pages = []
+        candidate_pages = {int(page)}
+        for item in pages:
             try:
-                return path.read_text()
+                p = int(item)
             except Exception:
                 continue
-    return ""
+            if p > 0:
+                candidate_pages.add(p)
+        for p in sorted(candidate_pages):
+            for path in sorted(qa_root.glob(f"table_*_page_{p:04d}.md"))[:6]:
+                _append_if_exists(path)
+    return "\n\n".join(snippets)
 
 
-def _collect_evidence_bundle(doc_dir: Path, table_payload: dict[str, Any], page: int) -> dict[str, str]:
+def _collect_fragment_rows(
+    *,
+    table_payload: dict[str, Any],
+    fragment_index: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    fragment_ids = table_payload.get("fragment_ids", [])
+    if not isinstance(fragment_ids, list):
+        fragment_ids = []
+    for item in fragment_ids:
+        fid = str(item).strip()
+        if not fid:
+            continue
+        frag = fragment_index.get(fid)
+        if isinstance(frag, dict):
+            rows.append(frag)
+    if rows:
+        return rows
+    row_lineage = table_payload.get("row_lineage", [])
+    if isinstance(row_lineage, list):
+        seen_fids: set[str] = set()
+        for item in row_lineage:
+            if not isinstance(item, dict):
+                continue
+            fid = str(item.get("fragment_id", "")).strip()
+            if not fid or fid in seen_fids:
+                continue
+            seen_fids.add(fid)
+            frag = fragment_index.get(fid)
+            if isinstance(frag, dict):
+                rows.append(frag)
+    return rows
+
+
+def _collect_evidence_bundle(
+    doc_dir: Path,
+    table_payload: dict[str, Any],
+    page: int,
+    *,
+    fragment_index: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    fragment_rows = _collect_fragment_rows(table_payload=table_payload, fragment_index=fragment_index)
     snippets: list[str] = []
     pages_dir = doc_dir / "pages"
-    for candidate_page in (page - 1, page, page + 1):
-        if candidate_page <= 0:
-            continue
+    candidate_pages: set[int] = {int(page)}
+    raw_pages = table_payload.get("pages", [])
+    if isinstance(raw_pages, list):
+        for item in raw_pages:
+            try:
+                p = int(item)
+            except Exception:
+                continue
+            if p > 0:
+                candidate_pages.add(p)
+    expanded_pages: set[int] = set()
+    for p in candidate_pages:
+        for delta in (-2, -1, 0, 1, 2):
+            cp = p + delta
+            if cp > 0:
+                expanded_pages.add(cp)
+    for candidate_page in sorted(expanded_pages):
         page_path = pages_dir / f"{int(candidate_page):04d}.md"
-        if page_path.exists():
-            snippets.append(page_path.read_text())
+        if not page_path.exists():
+            continue
+        try:
+            snippets.append(f"[page_{candidate_page:04d}.md]\n{page_path.read_text()}")
+        except Exception:
+            continue
     context_text = "\n\n".join(snippets)
     headers = [str(x) for row in table_payload.get("header_rows_full", []) if isinstance(row, list) for x in row]
     rows = [str(x) for row in table_payload.get("data_rows", []) if isinstance(row, list) for x in row]
-    marker_text = "\n".join(headers + rows + [str(table_payload.get("caption_text", ""))])
-    ocr_text = _read_ocr_evidence(doc_dir, table_payload, page)
+    fragment_text_parts: list[str] = []
+    for frag in fragment_rows:
+        header_rows = frag.get("header_rows", [])
+        data_rows = frag.get("data_rows", [])
+        frag_caption = str(frag.get("caption_text", "")).strip()
+        frag_page = int(frag.get("page", 0) or 0)
+        frag_group = str(frag.get("table_group_id", "")).strip()
+        header_blob = json.dumps(header_rows, ensure_ascii=True) if isinstance(header_rows, list) else "[]"
+        data_blob = json.dumps(data_rows, ensure_ascii=True) if isinstance(data_rows, list) else "[]"
+        fragment_text_parts.append(
+            f"[fragment page={frag_page} group={frag_group} caption={frag_caption}] headers={header_blob} rows={data_blob}"
+        )
+    marker_fragment_text = "\n".join(fragment_text_parts)
+    marker_text = "\n".join(headers + rows + [str(table_payload.get("caption_text", "")), marker_fragment_text])
+    ocr_text = _read_ocr_evidence(doc_dir, table_payload, page, fragment_rows)
     return {
         "context_text": context_text,
         "marker_text": marker_text,
+        "marker_fragment_text": marker_fragment_text,
         "ocr_text": ocr_text,
         "combined_text": "\n".join([marker_text, ocr_text, context_text]),
     }
 
 
-def _build_prompt(*, table_payload: dict[str, Any], manifest_row: dict[str, Any], risk_score: float, evidence: dict[str, str]) -> str:
+def _build_prompt(
+    *,
+    table_payload: dict[str, Any],
+    manifest_row: dict[str, Any],
+    risk_score: float,
+    evidence: dict[str, str],
+    validation_feedback: dict[str, Any],
+) -> str:
     request = {
         "table_id": str(table_payload.get("table_id", manifest_row.get("table_id", ""))),
         "page": int(manifest_row.get("page", 0) or 0),
@@ -295,10 +464,12 @@ def _build_prompt(*, table_payload: dict[str, Any], manifest_row: dict[str, Any]
             "required_fields_missing": table_payload.get("required_fields_missing", []),
             "quality_metrics": table_payload.get("quality_metrics", {}),
         },
-        "ocr_table_raw": evidence["ocr_text"][:12000],
+        "validation_feedback": validation_feedback,
+        "ocr_table_raw": evidence["ocr_text"][:24000],
         "evidence": {
-            "marker_and_caption": evidence["marker_text"][:8000],
-            "nearby_pages_text": evidence["context_text"][:12000],
+            "marker_and_caption": evidence["marker_text"][:18000],
+            "marker_fragment_rows": evidence.get("marker_fragment_text", "")[:22000],
+            "nearby_pages_text": evidence["context_text"][:24000],
         },
     }
     return (
@@ -307,6 +478,9 @@ def _build_prompt(*, table_payload: dict[str, Any], manifest_row: dict[str, Any]
         "Rules:\n"
         "- Evidence-bounded: do not invent values not supported by marker, OCR, or nearby context evidence.\n"
         "- Preserve units/symbols and table semantics.\n"
+        "- Prioritize column alignment, multi-level header integrity, and row-to-column correctness over preserving superficial layout.\n"
+        "- If values are vertically stacked across lines, merge them into their logical cell.\n"
+        "- If previous validation feedback lists specific failure modes or instructions, address them explicitly.\n"
         "- Keep output rectangular.\n"
         "- Every non-empty changed cell must include provenance.\n"
         "Output schema keys (all required):\n"
@@ -348,6 +522,41 @@ def _build_schema_retry_prompt(*, schema_reason: str, raw_payload: dict[str, Any
         "previous_output": raw_payload,
     }
     return "Your previous rectification output was invalid. Return corrected JSON only.\n" + json.dumps(request, ensure_ascii=True)
+
+
+def _build_evidence_retry_prompt(
+    *,
+    evidence_reason: str,
+    previous_output: dict[str, Any],
+    table_payload: dict[str, Any],
+    manifest_row: dict[str, Any],
+    evidence: dict[str, str],
+    validation_feedback: dict[str, Any],
+) -> str:
+    request = {
+        "evidence_violation": evidence_reason,
+        "table_id": str(table_payload.get("table_id", manifest_row.get("table_id", ""))),
+        "expected_fixes": validation_feedback,
+        "previous_output": previous_output,
+        "source_table": {
+            "caption": str(table_payload.get("caption_text", manifest_row.get("caption", ""))),
+            "header_rows_full": table_payload.get("header_rows_full", []),
+            "data_rows": table_payload.get("data_rows", []),
+        },
+        "evidence": {
+            "marker_and_caption": evidence.get("marker_text", "")[:18000],
+            "marker_fragment_rows": evidence.get("marker_fragment_text", "")[:22000],
+            "ocr_table_raw": evidence.get("ocr_text", "")[:24000],
+            "nearby_pages_text": evidence.get("context_text", "")[:24000],
+        },
+    }
+    return (
+        "Your previous rectification failed evidence validation.\n"
+        "Return corrected JSON only.\n"
+        "Focus on: preserving headers/units/symbols, fixing row/column alignment, and grounding every changed cell in evidence.\n"
+        "Do not hallucinate values.\n\n"
+        f"Input:\n{json.dumps(request, ensure_ascii=True)}"
+    )
 
 
 def _normalize_rectified_payload(payload: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
@@ -876,6 +1085,44 @@ def _write_table_csv(path: Path, headers: list[str], rows: list[list[str]]) -> N
             writer.writerow([_normalize_cell_text(cell) for cell in row])
 
 
+def _coerce_header_rows_full(value: Any) -> list[list[str]]:
+    out: list[list[str]] = []
+    if not isinstance(value, list):
+        return out
+    for row in value:
+        if not isinstance(row, list):
+            continue
+        out.append([_normalize_cell_text(cell) for cell in row])
+    return out
+
+
+def _normalize_header_rows_shape(header_rows_full: list[list[str]], target_cols: int) -> list[list[str]]:
+    if target_cols <= 0:
+        return []
+    out: list[list[str]] = []
+    for row in header_rows_full:
+        out.append((list(row) + [""] * (target_cols - len(row)))[:target_cols])
+    return out
+
+
+def _resolve_header_rows_full_for_apply(
+    *,
+    candidate_header_rows_full: Any,
+    fallback_header_rows_full: Any,
+    headers: list[str],
+) -> list[list[str]]:
+    target_cols = len(headers)
+    if target_cols <= 0:
+        return []
+    candidate = _normalize_header_rows_shape(_coerce_header_rows_full(candidate_header_rows_full), target_cols)
+    fallback = _normalize_header_rows_shape(_coerce_header_rows_full(fallback_header_rows_full), target_cols)
+    if candidate and _collapse_header_rows(candidate) == headers:
+        return candidate
+    if fallback and _collapse_header_rows(fallback) == headers:
+        return fallback
+    return [list(headers)]
+
+
 def _apply_rectification(
     *,
     doc_dir: Path,
@@ -954,7 +1201,9 @@ async def run_table_rectification_for_doc(
     existing_flag_ids = {str(row.get("flag_id", "")) for row in qa_rows if str(row.get("flag_id", ""))}
 
     validation_path = doc_dir / "metadata" / "assets" / "structured" / "validation" / "gemini_table_review.jsonl"
-    nonaccept_table_ids = _collect_nonaccept_table_ids(validation_path)
+    target_table_ids = _collect_target_table_ids(validation_path, target=config.target)
+    validation_feedback_by_id = _collect_validation_feedback_map(validation_path)
+    fragment_index = _resolve_fragment_index(doc_dir)
 
     table_payloads: dict[str, dict[str, Any]] = {}
     for row in manifest_rows:
@@ -991,7 +1240,13 @@ async def run_table_rectification_for_doc(
             candidates.append({**base_row, "manifest_row": manifest_row, "table_payload": payload})
             continue
         if config.target == "nonaccept":
-            if table_id in nonaccept_table_ids:
+            if table_id in target_table_ids:
+                candidates.append({**base_row, "manifest_row": manifest_row, "table_payload": payload})
+                continue
+            result.table_results.append({**base_row, "status": "skipped_target_filter"})
+            continue
+        if config.target == "reject":
+            if table_id in target_table_ids:
                 candidates.append({**base_row, "manifest_row": manifest_row, "table_payload": payload})
                 continue
             result.table_results.append({**base_row, "status": "skipped_target_filter"})
@@ -1032,8 +1287,20 @@ async def run_table_rectification_for_doc(
         risk_score = float(candidate.get("risk_score", 0.0) or 0.0)
         manifest_row = dict(candidate.get("manifest_row", {}))
         table_payload = dict(candidate.get("table_payload", {}))
-        evidence = _collect_evidence_bundle(doc_dir, table_payload, page)
-        prompt = _build_prompt(table_payload=table_payload, manifest_row=manifest_row, risk_score=risk_score, evidence=evidence)
+        validation_feedback = dict(validation_feedback_by_id.get(table_id, {}))
+        evidence = _collect_evidence_bundle(
+            doc_dir,
+            table_payload,
+            page,
+            fragment_index=fragment_index,
+        )
+        prompt = _build_prompt(
+            table_payload=table_payload,
+            manifest_row=manifest_row,
+            risk_score=risk_score,
+            evidence=evidence,
+            validation_feedback=validation_feedback,
+        )
         parsed: dict[str, Any] = {}
         parse_status = "ok"
         try:
@@ -1135,6 +1402,45 @@ async def run_table_rectification_for_doc(
             normalized=normalized,
             evidence=evidence,
         )
+        if not ok_evidence and evidence_reason.startswith("evidence_violation:"):
+            retry_raw: dict[str, Any] = dict(parsed)
+            retry_prompt = _build_evidence_retry_prompt(
+                evidence_reason=evidence_reason,
+                previous_output=retry_raw,
+                table_payload=table_payload,
+                manifest_row=manifest_row,
+                evidence=evidence,
+                validation_feedback=validation_feedback,
+            )
+            try:
+                retry_response = await call_model(
+                    client=client,
+                    model=config.model,
+                    prompt=retry_prompt,
+                    max_tokens=int(config.max_tokens),
+                )
+                retry_parsed = _extract_json_object(getattr(retry_response, "content", ""))
+                if not retry_parsed:
+                    repair = await call_model(
+                        client=client,
+                        model=config.model,
+                        prompt=_build_repair_prompt(getattr(retry_response, "content", "")),
+                        max_tokens=int(config.max_tokens),
+                    )
+                    retry_parsed = _extract_json_object(getattr(repair, "content", ""))
+                if retry_parsed:
+                    ok_schema_retry, schema_reason_retry, normalized_retry = _normalize_rectified_payload(retry_parsed)
+                    if ok_schema_retry:
+                        ok_evidence, evidence_reason, normalized_provenance, repaired_headers, repaired_rows = _validate_evidence(
+                            table_payload=table_payload,
+                            normalized=normalized_retry,
+                            evidence=evidence,
+                        )
+                        if ok_evidence:
+                            normalized = normalized_retry
+            except Exception:
+                pass
+
         if not ok_evidence:
             result.fallbacked += 1
             if evidence_reason.startswith("evidence_violation:"):
@@ -1174,7 +1480,11 @@ async def run_table_rectification_for_doc(
 
         normalized["headers"] = repaired_headers
         normalized["rows"] = repaired_rows
-        normalized["header_rows_full"] = [list(repaired_headers)]
+        normalized["header_rows_full"] = _resolve_header_rows_full_for_apply(
+            candidate_header_rows_full=normalized.get("header_rows_full", []),
+            fallback_header_rows_full=table_payload.get("header_rows_full", []),
+            headers=repaired_headers,
+        )
         normalized["cell_provenance"] = normalized_provenance
         updated_payload, headers, rows = _apply_rectification(
             doc_dir=doc_dir,
