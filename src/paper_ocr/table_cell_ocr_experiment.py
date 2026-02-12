@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+from html import unescape
+from html.parser import HTMLParser
 import json
 import math
 import os
@@ -27,6 +29,7 @@ GROUP_PAGE_TABLE_RE = re.compile(r"page_(\d+)_table_(\d+)$")
 DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai"
 DEFAULT_OCR_MODEL = "allenai/olmOCR-2-7B-1025"
 DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
+EMPTY_SENTINELS = {"<empty>", "[empty]", "(empty)"}
 
 
 @dataclass
@@ -77,6 +80,13 @@ def _as_int(value: Any, default: int = 0) -> int:
     except Exception:
         return default
     return out
+
+
+def _normalize_cell_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in EMPTY_SENTINELS:
+        return ""
+    return text
 
 
 def _portable_path(path: Path, root: Path) -> str:
@@ -323,7 +333,7 @@ def _apply_cell_text_to_grid(rows: int, cols: int, cells: list[dict[str, Any]]) 
             col_end = max(0, int(cell.get("col_end", col_start)))
         except Exception:
             continue
-        text = str(cell.get("text", "")).strip()
+        text = _normalize_cell_text(cell.get("text", ""))
         for row_idx in range(row_start, min(row_end + 1, rows)):
             for col_idx in range(col_start, min(col_end + 1, cols)):
                 current = grid[row_idx][col_idx]
@@ -380,13 +390,197 @@ def _grid_to_sections(grid: list[list[str]], *, header_rows: int, expected_rows:
     return headers, rows
 
 
+class _HTMLTableEvidenceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_row = False
+        self.in_cell = False
+        self.cell_buf: list[str] = []
+        self.cell_colspan = 1
+        self.cell_rowspan = 1
+        self.current_row: list[dict[str, Any]] = []
+        self.rows: list[list[dict[str, Any]]] = []
+
+    @staticmethod
+    def _int_attr(attrs: list[tuple[str, str | None]], key: str, default: int = 1) -> int:
+        for name, value in attrs:
+            if name.lower() != key.lower():
+                continue
+            try:
+                parsed = int(str(value or default))
+            except Exception:
+                return default
+            return max(1, parsed)
+        return default
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        if t == "tr":
+            self.in_row = True
+            self.current_row = []
+            return
+        if t in {"th", "td"} and self.in_row:
+            self.in_cell = True
+            self.cell_buf = []
+            self.cell_colspan = self._int_attr(attrs, "colspan", 1)
+            self.cell_rowspan = self._int_attr(attrs, "rowspan", 1)
+            return
+        if t == "br" and self.in_cell:
+            self.cell_buf.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in {"th", "td"} and self.in_cell:
+            text = _normalize_cell_text(unescape("".join(self.cell_buf)))
+            self.current_row.append(
+                {
+                    "text": text,
+                    "colspan": self.cell_colspan,
+                    "rowspan": self.cell_rowspan,
+                }
+            )
+            self.in_cell = False
+            self.cell_buf = []
+            self.cell_colspan = 1
+            self.cell_rowspan = 1
+            return
+        if t == "tr" and self.in_row:
+            if self.current_row:
+                self.rows.append(self.current_row)
+            self.current_row = []
+            self.in_row = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_cell:
+            self.cell_buf.append(data)
+
+
+def _extract_full_table_text_and_join_hints(
+    *,
+    full_table_ocr: str,
+    expected_rows: int,
+    expected_cols: int,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    raw = str(full_table_ocr or "").strip()
+    if not raw:
+        return [], []
+    if "<table" not in raw.lower():
+        lines = [_normalize_cell_text(line) for line in raw.splitlines()]
+        return [line for line in lines if line], []
+
+    parser = _HTMLTableEvidenceParser()
+    try:
+        parser.feed(raw)
+    except Exception:
+        lines = [_normalize_cell_text(line) for line in raw.splitlines()]
+        return [line for line in lines if line], []
+
+    text_lines: list[str] = []
+    join_hints: list[dict[str, Any]] = []
+    active_rowspans: dict[int, int] = {}
+    max_rows = max(0, int(expected_rows))
+    max_cols = max(0, int(expected_cols))
+
+    for row_idx, row_cells in enumerate(parser.rows):
+        if max_rows and row_idx >= max_rows:
+            break
+        line_parts = [_normalize_cell_text(cell.get("text", "")) for cell in row_cells]
+        if any(line_parts):
+            text_lines.append(" | ".join(line_parts))
+
+        col_ptr = 0
+        for cell in row_cells:
+            while active_rowspans.get(col_ptr, 0) > 0:
+                col_ptr += 1
+            colspan = max(1, _as_int(cell.get("colspan"), 1))
+            rowspan = max(1, _as_int(cell.get("rowspan"), 1))
+            cell_text = _normalize_cell_text(cell.get("text", ""))
+
+            if colspan > 1 and cell_text and max_cols:
+                cells = [[row_idx, col] for col in range(col_ptr, min(col_ptr + colspan, max_cols))]
+                if len(cells) > 1:
+                    join_hints.append({"cells": cells, "text": cell_text})
+
+            if rowspan > 1:
+                for col in range(col_ptr, col_ptr + colspan):
+                    if max_cols and col >= max_cols:
+                        break
+                    active_rowspans[col] = max(active_rowspans.get(col, 0), rowspan - 1)
+            col_ptr += colspan
+
+        for col in list(active_rowspans.keys()):
+            next_count = int(active_rowspans[col]) - 1
+            if next_count <= 0:
+                active_rowspans.pop(col, None)
+            else:
+                active_rowspans[col] = next_count
+
+    return text_lines, join_hints
+
+
+def _is_note_marker(text: str) -> bool:
+    return bool(re.fullmatch(r"\(\s*\d+[A-Za-z]?\s*\)", _normalize_cell_text(text)))
+
+
+def _is_numeric_like(text: str) -> bool:
+    token = _normalize_cell_text(text).replace(",", "")
+    return bool(re.fullmatch(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", token))
+
+
+def _infer_row_kinds(grid: list[list[str]], *, header_rows: int) -> list[str]:
+    out: list[str] = []
+    for idx, row in enumerate(grid):
+        if idx < max(0, int(header_rows)):
+            out.append("header")
+            continue
+        values = [_normalize_cell_text(cell) for cell in row]
+        nonempty = [cell for cell in values if cell]
+        if not nonempty:
+            out.append("empty")
+            continue
+        first = values[0] if values else ""
+        tail = [cell for cell in values[1:] if cell]
+        if first and re.search(r"[A-Za-z]", first):
+            if not tail or all(_is_note_marker(cell) for cell in tail):
+                out.append("group")
+                continue
+            numeric_tail = sum(1 for cell in tail if _is_numeric_like(cell))
+            if numeric_tail <= max(1, len(tail) // 3):
+                out.append("group")
+                continue
+        out.append("data")
+    return out
+
+
+def _missing_prefilled_values(prefilled_grid: list[list[str]], corrected_grid: list[list[str]]) -> list[str]:
+    src: list[str] = []
+    seen: set[str] = set()
+    for row in prefilled_grid:
+        for cell in row:
+            token = _normalize_cell_text(cell)
+            if token and token not in seen:
+                seen.add(token)
+                src.append(token)
+    outputs = [_normalize_cell_text(cell) for row in corrected_grid for cell in row if _normalize_cell_text(cell)]
+    missing: list[str] = []
+    for token in src:
+        if token in outputs:
+            continue
+        if any((token in out) or (out in token) for out in outputs if out):
+            continue
+        missing.append(token)
+    return missing
+
+
 def _build_llm_reconciliation_prompt(
     *,
     table_id: str,
     structure: dict[str, Any],
     prefilled_grid: list[list[str]],
-    cell_ocr_rows: list[dict[str, Any]],
-    full_table_ocr: str,
+    full_table_text_lines: list[str],
+    join_hints: list[dict[str, Any]],
+    row_kinds: list[str],
+    cell_level_debug: dict[str, Any],
 ) -> str:
     request = {
         "table_id": table_id,
@@ -406,15 +600,29 @@ def _build_llm_reconciliation_prompt(
             ],
         },
         "prefilled_grid_from_cell_ocr": prefilled_grid,
-        "cell_level_ocr": cell_ocr_rows,
-        "full_table_ocr": str(full_table_ocr or "")[:32000],
+        "cell_level_ocr_debug": cell_level_debug,
+        "full_table_text_lines": full_table_text_lines[:400],
+        "join_hints": join_hints[:200],
+        "row_kinds": row_kinds[: int(structure.get("rows", 0) or 0)],
     }
     return (
         "You reconcile table extraction outputs.\n"
         "Return JSON only.\n"
-        "Use table_structure as the topology lock for row/column layout.\n"
-        "Prefer cell-level OCR values, but correct cutoffs/splits using full_table_ocr evidence.\n"
-        "Do not hallucinate values not present in either OCR source.\n"
+        "table_structure is the topology lock.\n"
+        "cell_level_ocr_debug is non-authoritative for text; use it only for debugging context.\n"
+        "Use prefilled_grid_from_cell_ocr as the authoritative cell text starting point.\n"
+        "full_table_text_lines and join_hints are evidence for split/merge/cutoff fixes only.\n"
+        "Do not hallucinate values not present in evidence.\n"
+        "Hard constraints:\n"
+        "- len(corrected_header_rows_full) MUST equal table_structure.header_rows.\n"
+        "- Every corrected_header_rows_full row MUST have exactly table_structure.cols cells.\n"
+        "- len(corrected_rows) MUST equal table_structure.rows - table_structure.header_rows.\n"
+        "- Every corrected_rows row MUST have exactly table_structure.cols cells.\n"
+        "- Do not add/remove columns; preserve grid size exactly.\n"
+        "- You may only merge adjacent split fragments in the same row, or fix obvious cut-offs.\n"
+        "- Do not drop numeric values.\n"
+        "- Every non-empty value in prefilled_grid_from_cell_ocr must still appear in output, unless merged with an adjacent fragment.\n"
+        "- Convert any '<empty>' sentinel to empty string ''.\n"
         "Required keys:\n"
         "- corrected_header_rows_full: list[list[str]]\n"
         "- corrected_rows: list[list[str]]\n"
@@ -459,30 +667,78 @@ def _normalize_llm_reconciliation_payload(
             "notes": "invalid_llm_output; fallback_to_prefilled",
         }
 
+    target_rows = max(0, int(expected_rows))
+    if len(headers_raw) != header_count:
+        return {
+            "valid": False,
+            "reason": "shape_violation_header_row_count",
+            "header_rows_full": fb_headers,
+            "rows": fb_rows,
+            "final_grid": [*fb_headers, *fb_rows],
+            "applied_corrections": False,
+            "notes": "shape_violation_header_row_count; fallback_to_prefilled",
+        }
+    if len(rows_raw) != target_rows:
+        return {
+            "valid": False,
+            "reason": "shape_violation_data_row_count",
+            "header_rows_full": fb_headers,
+            "rows": fb_rows,
+            "final_grid": [*fb_headers, *fb_rows],
+            "applied_corrections": False,
+            "notes": "shape_violation_data_row_count; fallback_to_prefilled",
+        }
+
     headers: list[list[str]] = []
     for row in headers_raw:
-        headers.append([str(cell).strip() for cell in row][:cols] + [""] * max(0, cols - len(row)))
+        if len(row) != cols:
+            return {
+                "valid": False,
+                "reason": "shape_violation_header_cols",
+                "header_rows_full": fb_headers,
+                "rows": fb_rows,
+                "final_grid": [*fb_headers, *fb_rows],
+                "applied_corrections": False,
+                "notes": "shape_violation_header_cols; fallback_to_prefilled",
+            }
+        headers.append([_normalize_cell_text(cell) for cell in row])
     rows: list[list[str]] = []
     for row in rows_raw:
-        rows.append([str(cell).strip() for cell in row][:cols] + [""] * max(0, cols - len(row)))
-
-    headers = headers[:header_count]
-    while len(headers) < header_count:
-        headers.append([""] * cols)
-    target_rows = max(0, int(expected_rows))
-    if target_rows > 0:
-        rows = rows[:target_rows]
-        while len(rows) < target_rows:
-            rows.append([""] * cols)
+        if len(row) != cols:
+            return {
+                "valid": False,
+                "reason": "shape_violation_data_cols",
+                "header_rows_full": fb_headers,
+                "rows": fb_rows,
+                "final_grid": [*fb_headers, *fb_rows],
+                "applied_corrections": False,
+                "notes": "shape_violation_data_cols; fallback_to_prefilled",
+            }
+        rows.append([_normalize_cell_text(cell) for cell in row])
 
     notes = str(raw_payload.get("notes", "")).strip()
     applied_corrections = bool(raw_payload.get("applied_corrections", False))
+    final_grid = [*headers, *rows]
+    missing_values = _missing_prefilled_values(fallback_grid, final_grid)
+    if missing_values:
+        return {
+            "valid": False,
+            "reason": "no_drop_violation",
+            "header_rows_full": fb_headers,
+            "rows": fb_rows,
+            "final_grid": [*fb_headers, *fb_rows],
+            "applied_corrections": False,
+            "notes": (
+                "no_drop_violation; fallback_to_prefilled; missing="
+                + ", ".join(missing_values[:8])
+            ),
+        }
     return {
         "valid": True,
         "reason": "",
         "header_rows_full": headers,
         "rows": rows,
-        "final_grid": [*headers, *rows],
+        "final_grid": final_grid,
         "applied_corrections": applied_corrections,
         "notes": notes,
     }
@@ -689,7 +945,7 @@ async def _ocr_single_cell(
             )
         except Exception as exc:  # noqa: BLE001
             return "", str(exc)
-    return str(response.content or "").strip(), ""
+    return _normalize_cell_text(response.content or ""), ""
 
 
 async def _ocr_cells_for_table(
@@ -802,7 +1058,27 @@ async def _run_llm_reconciliation(
     expected_cols: int,
     expected_header_rows: int,
 ) -> dict[str, Any]:
+    total_rows = max(0, int(expected_rows)) + max(1, int(expected_header_rows))
+    full_table_text_lines, join_hints = _extract_full_table_text_and_join_hints(
+        full_table_ocr=full_table_ocr,
+        expected_rows=total_rows,
+        expected_cols=max(1, int(expected_cols)),
+    )
+    row_kinds = _infer_row_kinds(prefilled_grid, header_rows=int(expected_header_rows))
+    cell_level_debug = {
+        "cell_level_ocr_debug_only": True,
+        "authoritative_for_text": False,
+        "cell_count": len(ocr_cells),
+        "cell_error_count": sum(1 for cell in ocr_cells if _normalize_cell_text(cell.get("error", ""))),
+    }
+
     async def _call_tool_mode(prompt_text: str, token_limit: int) -> tuple[dict[str, Any], str, str]:
+        row_schema = {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": max(1, int(expected_cols)),
+            "maxItems": max(1, int(expected_cols)),
+        }
         tool_schema = {
             "type": "function",
             "function": {
@@ -813,11 +1089,15 @@ async def _run_llm_reconciliation(
                     "properties": {
                         "corrected_header_rows_full": {
                             "type": "array",
-                            "items": {"type": "array", "items": {"type": "string"}},
+                            "items": row_schema,
+                            "minItems": max(1, int(expected_header_rows)),
+                            "maxItems": max(1, int(expected_header_rows)),
                         },
                         "corrected_rows": {
                             "type": "array",
-                            "items": {"type": "array", "items": {"type": "string"}},
+                            "items": row_schema,
+                            "minItems": max(0, int(expected_rows)),
+                            "maxItems": max(0, int(expected_rows)),
                         },
                         "applied_corrections": {"type": "boolean"},
                         "notes": {"type": "string"},
@@ -881,8 +1161,10 @@ async def _run_llm_reconciliation(
         table_id=table_id,
         structure=structure,
         prefilled_grid=prefilled_grid,
-        cell_ocr_rows=_compact_cell_rows_for_prompt(ocr_cells),
-        full_table_ocr=full_table_ocr,
+        full_table_text_lines=full_table_text_lines,
+        join_hints=join_hints,
+        row_kinds=row_kinds,
+        cell_level_debug=cell_level_debug,
     )
     raw_text = ""
     repair_text = ""
@@ -965,6 +1247,12 @@ async def _run_llm_reconciliation(
         "source": source,
         "raw_payload": raw_payload,
         "error": error,
+        "evidence": {
+            "full_table_text_lines": full_table_text_lines,
+            "join_hints": join_hints,
+            "row_kinds": row_kinds,
+            "cell_level_ocr_debug": cell_level_debug,
+        },
         "normalized": normalized,
     }
 
