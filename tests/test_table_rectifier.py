@@ -449,3 +449,84 @@ def test_rectifier_preserves_multilevel_header_rows_full(tmp_path: Path):
     assert result.applied == 1
     after = json.loads(table_json_path.read_text())
     assert len(after["header_rows_full"]) == 2
+
+
+def _write_table_structure_artifact(doc_dir: Path, table_id: str, *, rows: int, cols: int, header_rows: int = 1) -> None:
+    structure_root = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_structure"
+    structure_root.mkdir(parents=True, exist_ok=True)
+    structure_payload = {
+        "table_id": table_id,
+        "model": "tatr",
+        "rows": rows,
+        "cols": cols,
+        "header_rows": header_rows,
+        "cells": [],
+        "status": "ok",
+    }
+    structure_path = structure_root / f"{table_id}.json"
+    structure_path.write_text(json.dumps(structure_payload, indent=2, ensure_ascii=True))
+    manifest_row = {
+        "table_id": table_id,
+        "status": "ok",
+        "model": "tatr",
+        "structure_path": f"metadata/assets/structured/qa/table_structure/{table_id}.json",
+    }
+    (structure_root / "manifest.jsonl").write_text(json.dumps(manifest_row) + "\n")
+
+
+def test_rectifier_includes_table_structure_in_prompt(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    _write_table_structure_artifact(doc_dir, "p0001_t01", rows=2, cols=2, header_rows=1)
+    prompts: list[str] = []
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        prompts.append(str(kwargs.get("prompt", "")))
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all", structure_model="tatr", structure_lock=True),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.applied == 1
+    joined = "\n".join(prompts)
+    assert '"table_structure"' in joined
+    assert '"cols": 2' in joined
+
+
+def test_rectifier_enforces_structure_lock_when_tatr_structure_present(tmp_path: Path):
+    doc_dir, before = _make_doc_with_one_table(tmp_path)
+    _write_table_structure_artifact(doc_dir, "p0001_t01", rows=2, cols=2, header_rows=1)
+    payload = {
+        "rectified_header_rows_full": [["Polymer", "Value", "Extra"]],
+        "rectified_rows": [["A", "1.2 ± 0.1", "X"]],
+        "edits": [{"type": "add_col", "description": "violates locked structure"}],
+        "cell_provenance": [
+            {"row": 0, "col": 0, "source": "context", "evidence_text": "sample A", "confidence": 0.9},
+            {"row": 0, "col": 1, "source": "marker", "evidence_text": "1.2 ± 0.1", "confidence": 0.9},
+            {"row": 0, "col": 2, "source": "context", "evidence_text": "x", "confidence": 0.9},
+        ],
+        "rectifier_confidence": 0.7,
+        "needs_review": True,
+    }
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        return _FakeTextResponse(json.dumps(payload))
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all", structure_model="tatr", structure_lock=True),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.applied == 0
+    assert result.fallbacked == 1
+    assert result.evidence_violations == 1
+    table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
+    after = json.loads(table_json_path.read_text())
+    assert after["data_rows"] == before["data_rows"]

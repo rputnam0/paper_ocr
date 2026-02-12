@@ -29,6 +29,8 @@ class RectifierConfig:
     risk_threshold: float = 0.45
     max_tables_per_doc: int = 12
     target: str = "risk"
+    structure_model: str = "off"
+    structure_lock: bool = True
 
 
 @dataclass
@@ -294,6 +296,48 @@ def _resolve_fragment_index(doc_dir: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _load_table_structure_map(doc_dir: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    manifest_path = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_structure" / "manifest.jsonl"
+    for row in _load_jsonl(manifest_path):
+        table_id = str(row.get("table_id", "")).strip()
+        status = str(row.get("status", "")).strip().lower()
+        if not table_id or status != "ok":
+            continue
+        rel_path = str(row.get("structure_path", "")).strip()
+        if not rel_path:
+            continue
+        payload = _load_json(doc_dir / rel_path)
+        if not payload:
+            continue
+        try:
+            rows = int(payload.get("rows", 0) or 0)
+        except Exception:
+            rows = 0
+        try:
+            cols = int(payload.get("cols", 0) or 0)
+        except Exception:
+            cols = 0
+        try:
+            header_rows = int(payload.get("header_rows", 0) or 0)
+        except Exception:
+            header_rows = 0
+        cells = payload.get("cells", [])
+        if not isinstance(cells, list):
+            cells = []
+        out[table_id] = {
+            "table_id": table_id,
+            "model": str(payload.get("model", "") or "").strip(),
+            "rows": rows,
+            "cols": cols,
+            "header_rows": header_rows,
+            "cells": [dict(item) for item in cells if isinstance(item, dict)],
+            "crop_path": str(payload.get("crop_path", "")).strip(),
+            "html_table": str(payload.get("html_table", "") or "").strip(),
+        }
+    return out
+
+
 def _read_ocr_evidence(
     doc_dir: Path,
     table_payload: dict[str, Any],
@@ -388,6 +432,7 @@ def _collect_evidence_bundle(
     page: int,
     *,
     fragment_index: dict[str, dict[str, Any]],
+    table_structure: dict[str, Any],
 ) -> dict[str, str]:
     fragment_rows = _collect_fragment_rows(table_payload=table_payload, fragment_index=fragment_index)
     snippets: list[str] = []
@@ -439,6 +484,7 @@ def _collect_evidence_bundle(
         "marker_text": marker_text,
         "marker_fragment_text": marker_fragment_text,
         "ocr_text": ocr_text,
+        "table_structure_text": json.dumps(table_structure, ensure_ascii=True) if table_structure else "",
         "combined_text": "\n".join([marker_text, ocr_text, context_text]),
     }
 
@@ -450,6 +496,7 @@ def _build_prompt(
     risk_score: float,
     evidence: dict[str, str],
     validation_feedback: dict[str, Any],
+    table_structure: dict[str, Any],
 ) -> str:
     request = {
         "table_id": str(table_payload.get("table_id", manifest_row.get("table_id", ""))),
@@ -465,11 +512,13 @@ def _build_prompt(
             "quality_metrics": table_payload.get("quality_metrics", {}),
         },
         "validation_feedback": validation_feedback,
+        "table_structure": table_structure,
         "ocr_table_raw": evidence["ocr_text"][:24000],
         "evidence": {
             "marker_and_caption": evidence["marker_text"][:18000],
             "marker_fragment_rows": evidence.get("marker_fragment_text", "")[:22000],
             "nearby_pages_text": evidence["context_text"][:24000],
+            "table_structure_raw": evidence.get("table_structure_text", "")[:18000],
         },
     }
     return (
@@ -479,6 +528,7 @@ def _build_prompt(
         "- Evidence-bounded: do not invent values not supported by marker, OCR, or nearby context evidence.\n"
         "- Preserve units/symbols and table semantics.\n"
         "- Prioritize column alignment, multi-level header integrity, and row-to-column correctness over preserving superficial layout.\n"
+        "- Structure lock: when table_structure is provided, preserve its row/column topology and spans.\n"
         "- If values are vertically stacked across lines, merge them into their logical cell.\n"
         "- If previous validation feedback lists specific failure modes or instructions, address them explicitly.\n"
         "- Keep output rectangular.\n"
@@ -532,11 +582,13 @@ def _build_evidence_retry_prompt(
     manifest_row: dict[str, Any],
     evidence: dict[str, str],
     validation_feedback: dict[str, Any],
+    table_structure: dict[str, Any],
 ) -> str:
     request = {
         "evidence_violation": evidence_reason,
         "table_id": str(table_payload.get("table_id", manifest_row.get("table_id", ""))),
         "expected_fixes": validation_feedback,
+        "table_structure": table_structure,
         "previous_output": previous_output,
         "source_table": {
             "caption": str(table_payload.get("caption_text", manifest_row.get("caption", ""))),
@@ -548,6 +600,7 @@ def _build_evidence_retry_prompt(
             "marker_fragment_rows": evidence.get("marker_fragment_text", "")[:22000],
             "ocr_table_raw": evidence.get("ocr_text", "")[:24000],
             "nearby_pages_text": evidence.get("context_text", "")[:24000],
+            "table_structure_raw": evidence.get("table_structure_text", "")[:18000],
         },
     }
     return (
@@ -917,6 +970,8 @@ def _validate_evidence(
     table_payload: dict[str, Any],
     normalized: dict[str, Any],
     evidence: dict[str, str],
+    table_structure: dict[str, Any],
+    structure_lock: bool,
 ) -> tuple[bool, str, list[dict[str, Any]], list[str], list[list[str]]]:
     headers = [str(x) for x in normalized.get("headers", [])]
     rows = [[str(x) for x in row] for row in normalized.get("rows", []) if isinstance(row, list)]
@@ -942,6 +997,32 @@ def _validate_evidence(
         return False, "invalid_schema:no_headers", [], headers, rows
     headers = (headers + [""] * (target_cols - len(headers)))[:target_cols]
     rows = [(row + [""] * (target_cols - len(row)))[:target_cols] for row in rows]
+
+    if structure_lock and isinstance(table_structure, dict):
+        expected_cols = 0
+        expected_rows = 0
+        expected_header_rows = 0
+        try:
+            expected_cols = int(table_structure.get("cols", 0) or 0)
+        except Exception:
+            expected_cols = 0
+        try:
+            expected_rows = int(table_structure.get("rows", 0) or 0)
+        except Exception:
+            expected_rows = 0
+        try:
+            expected_header_rows = int(table_structure.get("header_rows", 0) or 0)
+        except Exception:
+            expected_header_rows = 0
+
+        candidate_header_rows_full = _coerce_header_rows_full(normalized.get("header_rows_full", []))
+        candidate_total_rows = len(candidate_header_rows_full) + len(rows)
+        if expected_cols > 0 and target_cols != expected_cols:
+            return False, "evidence_violation:structure_col_mismatch", [], headers, rows
+        if expected_rows > 0 and candidate_total_rows != expected_rows:
+            return False, "evidence_violation:structure_row_mismatch", [], headers, rows
+        if expected_header_rows > 0 and len(candidate_header_rows_full) != expected_header_rows:
+            return False, "evidence_violation:structure_header_mismatch", [], headers, rows
 
     orig_nonempty_headers = sum(1 for h in orig_headers if _normalize_cell_text(h))
     new_nonempty_headers = sum(1 for h in headers if _normalize_cell_text(h))
@@ -1280,6 +1361,7 @@ async def run_table_rectification_for_doc(
     canonical_path = tables_dir / "canonical.jsonl"
     canonical_rows = _load_jsonl(canonical_path)
     canonical_by_id = {str(row.get("table_id", "")): dict(row) for row in canonical_rows}
+    table_structure_by_id = _load_table_structure_map(doc_dir)
 
     for candidate in candidates:
         table_id = str(candidate["table_id"])
@@ -1288,11 +1370,13 @@ async def run_table_rectification_for_doc(
         manifest_row = dict(candidate.get("manifest_row", {}))
         table_payload = dict(candidate.get("table_payload", {}))
         validation_feedback = dict(validation_feedback_by_id.get(table_id, {}))
+        table_structure = dict(table_structure_by_id.get(table_id, {}))
         evidence = _collect_evidence_bundle(
             doc_dir,
             table_payload,
             page,
             fragment_index=fragment_index,
+            table_structure=table_structure,
         )
         prompt = _build_prompt(
             table_payload=table_payload,
@@ -1300,6 +1384,7 @@ async def run_table_rectification_for_doc(
             risk_score=risk_score,
             evidence=evidence,
             validation_feedback=validation_feedback,
+            table_structure=table_structure,
         )
         parsed: dict[str, Any] = {}
         parse_status = "ok"
@@ -1401,6 +1486,8 @@ async def run_table_rectification_for_doc(
             table_payload=table_payload,
             normalized=normalized,
             evidence=evidence,
+            table_structure=table_structure,
+            structure_lock=bool(config.structure_lock),
         )
         if not ok_evidence and evidence_reason.startswith("evidence_violation:"):
             retry_raw: dict[str, Any] = dict(parsed)
@@ -1411,6 +1498,7 @@ async def run_table_rectification_for_doc(
                 manifest_row=manifest_row,
                 evidence=evidence,
                 validation_feedback=validation_feedback,
+                table_structure=table_structure,
             )
             try:
                 retry_response = await call_model(
@@ -1435,6 +1523,8 @@ async def run_table_rectification_for_doc(
                             table_payload=table_payload,
                             normalized=normalized_retry,
                             evidence=evidence,
+                            table_structure=table_structure,
+                            structure_lock=bool(config.structure_lock),
                         )
                         if ok_evidence:
                             normalized = normalized_retry
@@ -1474,6 +1564,7 @@ async def run_table_rectification_for_doc(
                     "risk_score": risk_score,
                     "status": parse_status,
                     "reason": evidence_reason,
+                    "structure_used": bool(table_structure),
                 }
             )
             continue
@@ -1540,6 +1631,7 @@ async def run_table_rectification_for_doc(
                 "page": page,
                 "risk_score": risk_score,
                 "status": "applied",
+                "structure_used": bool(table_structure),
                 "rectifier_confidence": float(updated_payload.get("rectifier_confidence", 0.0) or 0.0),
                 "needs_review": bool(updated_payload.get("rectifier_needs_review", False)),
             }

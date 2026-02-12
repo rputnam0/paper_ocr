@@ -55,6 +55,7 @@ from .structured_extract import (
     run_marker_doc,
     run_marker_page,
 )
+from .table_structure import build_table_structure_artifacts
 from .table_eval import evaluate_table_pipeline
 from .table_rectifier import RectifierConfig, RectifierResult, run_table_rectification_for_doc
 from .table_validation import GeminiValidationConfig, run_gemini_table_validation, summarize_gemini_failures
@@ -81,6 +82,8 @@ TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT = 2000
 TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT = 0.45
 TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT = 12
 TABLE_LLM_RECTIFIER_TARGET_DEFAULT = "risk"
+TABLE_STRUCTURE_MODEL_DEFAULT = "tatr"
+TABLE_STRUCTURE_TIMEOUT_DEFAULT = 180
 DEFAULT_FETCH_OUTPUT_ROOT = Path("data/jobs")
 LEGACY_FETCH_OUTPUT_ROOT = Path("data/telegram_jobs")
 RESOURCE_GUARD_MIN_MEM_GB_DEFAULT = 24.0
@@ -238,6 +241,26 @@ def _parse_args() -> argparse.Namespace:
         "--table-llm-target",
         choices=["risk", "all", "nonaccept", "reject"],
         default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
+    )
+    run.add_argument(
+        "--table-structure-model",
+        choices=["off", "tatr"],
+        default=os.getenv("PAPER_OCR_TABLE_STRUCTURE_MODEL", TABLE_STRUCTURE_MODEL_DEFAULT),
+        help="Table structure recognizer used to lock row/column topology during LLM rectification.",
+    )
+    run.add_argument(
+        "--table-structure-command",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_STRUCTURE_COMMAND", ""),
+        help=(
+            "External table-structure command template. Use {image} and {output} placeholders; "
+            "command should write JSON structure payload to {output}."
+        ),
+    )
+    run.add_argument(
+        "--table-structure-timeout",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_STRUCTURE_TIMEOUT", str(TABLE_STRUCTURE_TIMEOUT_DEFAULT))),
     )
     run.add_argument(
         "--table-header-ocr-auto",
@@ -439,6 +462,26 @@ def _parse_args() -> argparse.Namespace:
         "--table-llm-target",
         choices=["risk", "all", "nonaccept", "reject"],
         default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
+    )
+    export.add_argument(
+        "--table-structure-model",
+        choices=["off", "tatr"],
+        default=os.getenv("PAPER_OCR_TABLE_STRUCTURE_MODEL", TABLE_STRUCTURE_MODEL_DEFAULT),
+        help="Table structure recognizer used to lock row/column topology during LLM rectification.",
+    )
+    export.add_argument(
+        "--table-structure-command",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_STRUCTURE_COMMAND", ""),
+        help=(
+            "External table-structure command template. Use {image} and {output} placeholders; "
+            "command should write JSON structure payload to {output}."
+        ),
+    )
+    export.add_argument(
+        "--table-structure-timeout",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_STRUCTURE_TIMEOUT", str(TABLE_STRUCTURE_TIMEOUT_DEFAULT))),
     )
     export.add_argument(
         "--table-header-ocr-auto",
@@ -1702,6 +1745,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "unresolved_figure_count": 0,
             "errors": [],
             "header_ocr": {},
+            "table_structure": {},
             "ocr_merge": {},
             "ocr_html_comparison": {},
             "table_llm_rectification": _disabled_table_rectifier_summary(
@@ -1746,6 +1790,15 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                         "ocr_merge": summary.ocr_merge,
                     }
                 )
+                table_structure_summary: dict[str, Any] = {}
+                if str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)).strip().lower() != "off":
+                    table_structure_summary = build_table_structure_artifacts(
+                        doc_dir=doc_dir,
+                        model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
+                        command=str(getattr(args, "table_structure_command", "") or ""),
+                        timeout=int(getattr(args, "table_structure_timeout", TABLE_STRUCTURE_TIMEOUT_DEFAULT)),
+                    )
+                structured_data_manifest["table_structure"] = table_structure_summary
                 if bool(getattr(args, "compare_ocr_html", False)):
                     ocr_html_dir = getattr(args, "ocr_html_dir", None)
                     compare_summary = compare_marker_tables_with_ocr_html(
@@ -1767,12 +1820,15 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                                 getattr(args, "table_llm_max_tables_per_doc", TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT)
                             ),
                             target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                            structure_model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
+                            structure_lock=True,
                         ),
                     )
                     structured_data_manifest["table_llm_rectification"] = asdict(rectifier_result)
             except Exception as exc:  # noqa: BLE001
                 structured_data_manifest["errors"] = [str(exc)]
                 structured_data_manifest["ocr_merge"] = {}
+                structured_data_manifest["table_structure"] = {}
                 if "Strict table artifact mode failed" in str(exc):
                     strict_failure = True
                 doc_errors.append(str(exc))
@@ -2074,6 +2130,14 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
                 target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
             )
+            table_structure_summary: dict[str, Any] = {}
+            if str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)).strip().lower() != "off":
+                table_structure_summary = build_table_structure_artifacts(
+                    doc_dir=doc_dir,
+                    model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
+                    command=str(getattr(args, "table_structure_command", "") or ""),
+                    timeout=int(getattr(args, "table_structure_timeout", TABLE_STRUCTURE_TIMEOUT_DEFAULT)),
+                )
             if bool(getattr(args, "table_llm_rectify", True)):
                 api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
                 if api_key:
@@ -2099,6 +2163,8 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                                     )
                                 ),
                                 target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                                structure_model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
+                                structure_lock=True,
                             ),
                         )
                     )
@@ -2120,6 +2186,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "unresolved_figure_count": summary.unresolved_figure_count,
                 "errors": summary.errors,
                 "header_ocr": header_ocr_summary,
+                "table_structure": table_structure_summary,
                 "ocr_merge": summary.ocr_merge,
                 "ocr_html_comparison": {},
                 "table_llm_rectification": table_llm_rectification,
@@ -2139,6 +2206,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "unresolved_figure_count": 0,
                 "errors": [str(exc)],
                 "header_ocr": {},
+                "table_structure": {},
                 "ocr_merge": {},
                 "ocr_html_comparison": {},
                 "table_llm_rectification": _disabled_table_rectifier_summary(
