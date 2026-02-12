@@ -33,7 +33,7 @@ class RectifierConfig:
     structure_model: str = "off"
     structure_lock: bool = True
     context_mode: str = "on_demand"
-    skip_already_rectified: bool = True
+    skip_already_rectified: bool = False
 
 
 @dataclass
@@ -50,6 +50,7 @@ class RectifierResult:
     evidence_violations: int = 0
     errors: int = 0
     report_path: str = ""
+    run_id: str = ""
     table_results: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -286,6 +287,33 @@ def _collect_validation_feedback_map(validation_path: Path) -> dict[str, dict[st
             "root_cause_hypothesis": str(review.get("root_cause_hypothesis", "") or "").strip(),
         }
         out[table_id] = feedback
+    return out
+
+
+def _baseline_payload_for_rerun(payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(payload)
+    llm_meta = payload.get("llm_rectification", {})
+    if not isinstance(llm_meta, dict):
+        return out
+    snapshot = llm_meta.get("original_snapshot", {})
+    if not isinstance(snapshot, dict):
+        return out
+    if not isinstance(snapshot.get("data_rows"), list):
+        return out
+    if not isinstance(snapshot.get("header_rows_full"), list):
+        return out
+
+    out["header_rows_full"] = snapshot.get("header_rows_full", out.get("header_rows_full", []))
+    out["data_rows"] = snapshot.get("data_rows", out.get("data_rows", []))
+    out["header_hierarchy"] = snapshot.get("header_hierarchy", out.get("header_hierarchy", []))
+    out["row_lineage"] = snapshot.get("row_lineage", out.get("row_lineage", []))
+    out["context_mappings"] = snapshot.get("context_mappings", out.get("context_mappings", []))
+    out["required_fields_missing"] = snapshot.get("required_fields_missing", out.get("required_fields_missing", []))
+    out["quality_metrics"] = snapshot.get("quality_metrics", out.get("quality_metrics", {}))
+    out.pop("cell_provenance", None)
+    out.pop("rectifier_confidence", None)
+    out.pop("rectifier_needs_review", None)
+    out.pop("llm_rectification", None)
     return out
 
 
@@ -1346,11 +1374,13 @@ async def run_table_rectification_for_doc(
     qa_root = doc_dir / "metadata" / "assets" / "structured" / "qa"
     qa_root.mkdir(parents=True, exist_ok=True)
     report_path = qa_root / "table_llm_rectification.json"
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     result = RectifierResult(
         enabled=True,
         model=config.model,
         target=config.target,
         report_path=_portable_path(report_path, doc_dir),
+        run_id=run_id,
     )
 
     tables_dir = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables"
@@ -1388,7 +1418,7 @@ async def run_table_rectification_for_doc(
                 "row_lineage": [],
                 "context_mappings": [],
             }
-        table_payloads[table_id] = payload
+        table_payloads[table_id] = _baseline_payload_for_rerun(payload)
 
     candidates: list[dict[str, Any]] = []
     for manifest_row in manifest_rows:
@@ -1817,11 +1847,47 @@ async def run_table_rectification_for_doc(
             updated_canonical_rows.append(dict(canonical_by_id.get(table_id, row)))
         _write_jsonl(canonical_path, updated_canonical_rows)
 
+    # Persist run-scoped canonical snapshots for benchmarking across reruns.
+    input_snapshot_rows: list[dict[str, Any]] = []
+    output_snapshot_rows: list[dict[str, Any]] = []
+    for row in manifest_rows:
+        table_id = str(row.get("table_id", "")).strip()
+        if not table_id:
+            continue
+        baseline_payload = dict(table_payloads.get(table_id, {}))
+        if baseline_payload:
+            input_snapshot_rows.append(
+                {
+                    "table_id": table_id,
+                    "page": int(row.get("page", 0) or 0),
+                    "caption_text": str(baseline_payload.get("caption_text", row.get("caption", ""))),
+                    "header_rows_full": baseline_payload.get("header_rows_full", []),
+                    "data_rows": baseline_payload.get("data_rows", []),
+                    "quality_metrics": baseline_payload.get("quality_metrics", {}),
+                }
+            )
+        current_payload = _load_json(tables_dir / f"{table_id}.json")
+        if current_payload:
+            output_snapshot_rows.append(
+                {
+                    "table_id": table_id,
+                    "page": int(row.get("page", 0) or 0),
+                    "caption_text": str(current_payload.get("caption_text", row.get("caption", ""))),
+                    "header_rows_full": current_payload.get("header_rows_full", []),
+                    "data_rows": current_payload.get("data_rows", []),
+                    "quality_metrics": current_payload.get("quality_metrics", {}),
+                    "llm_rectification": current_payload.get("llm_rectification", {}),
+                }
+            )
+    _write_jsonl(tables_dir / f"canonical.input.{run_id}.jsonl", input_snapshot_rows)
+    _write_jsonl(tables_dir / f"canonical.rectified.{run_id}.jsonl", output_snapshot_rows)
+
     _write_jsonl(qa_flags_path, qa_rows)
     report_payload = {
         "enabled": result.enabled,
         "model": result.model,
         "target": result.target,
+        "run_id": result.run_id,
         "considered": result.considered,
         "selected": result.selected,
         "applied": result.applied,

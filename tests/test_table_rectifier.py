@@ -131,7 +131,34 @@ def test_rectifier_accepts_valid_payload_and_writes_outputs(tmp_path: Path):
     assert any(flag["type"] == "llm_rectification_applied" for flag in flags)
 
 
-def test_rectifier_skips_already_rectified_tables_by_default(tmp_path: Path):
+def test_rectifier_skips_already_rectified_when_enabled(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
+    payload = json.loads(table_json_path.read_text())
+    payload["llm_rectification"] = {"applied": True, "model": "openai/gpt-oss-120b"}
+    table_json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+
+    calls = {"count": 0}
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        calls["count"] += 1
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all", skip_already_rectified=True),
+            call_model=_fake_call_model,
+        )
+    )
+    assert calls["count"] == 0
+    assert result.selected == 0
+    assert result.applied == 0
+    assert any(row.get("status") == "skipped_already_rectified" for row in result.table_results)
+
+
+def test_rectifier_rerectifies_already_rectified_by_default(tmp_path: Path):
     doc_dir, _ = _make_doc_with_one_table(tmp_path)
     table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
     payload = json.loads(table_json_path.read_text())
@@ -152,35 +179,77 @@ def test_rectifier_skips_already_rectified_tables_by_default(tmp_path: Path):
             call_model=_fake_call_model,
         )
     )
-    assert calls["count"] == 0
-    assert result.selected == 0
-    assert result.applied == 0
-    assert any(row.get("status") == "skipped_already_rectified" for row in result.table_results)
+    assert calls["count"] == 1
+    assert result.applied == 1
 
 
-def test_rectifier_rerectifies_when_skip_override_disabled(tmp_path: Path):
+def test_rectifier_uses_original_snapshot_as_fresh_input(tmp_path: Path):
     doc_dir, _ = _make_doc_with_one_table(tmp_path)
     table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
     payload = json.loads(table_json_path.read_text())
-    payload["llm_rectification"] = {"applied": True, "model": "openai/gpt-oss-120b"}
+    payload["data_rows"] = [["A", "9.9"]]
+    payload["llm_rectification"] = {
+        "applied": True,
+        "model": "openai/gpt-oss-120b",
+        "original_snapshot": {
+            "header_rows_full": [["Polymer", "Value"]],
+            "data_rows": [["A", "1.2 \u00b1 0.1"]],
+            "header_hierarchy": [],
+            "row_lineage": payload.get("row_lineage", []),
+            "context_mappings": [],
+            "required_fields_missing": [],
+            "quality_metrics": payload.get("quality_metrics", {}),
+        },
+    }
     table_json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
 
-    calls = {"count": 0}
+    prompts: list[str] = []
 
     async def _fake_call_model(**kwargs):  # noqa: ANN001
-        calls["count"] += 1
+        prompts.append(str(kwargs.get("prompt", "")))
         return _FakeTextResponse(_valid_payload())
 
     result = asyncio.run(
         run_table_rectification_for_doc(
             doc_dir=doc_dir,
             client=object(),  # type: ignore[arg-type]
-            config=RectifierConfig(target="all", skip_already_rectified=False),
+            config=RectifierConfig(target="all"),
             call_model=_fake_call_model,
         )
     )
-    assert calls["count"] == 1
     assert result.applied == 1
+    assert prompts
+    payload_in = _extract_prompt_input(prompts[0])
+    canonical = payload_in.get("canonical_table", {}) if isinstance(payload_in.get("canonical_table"), dict) else {}
+    rows = canonical.get("data_rows", [])
+    assert rows == [["A", "1.2 \u00b1 0.1"]]
+
+
+def test_rectifier_writes_run_scoped_canonical_snapshots(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.run_id
+    tables_dir = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables"
+    input_snapshot = tables_dir / f"canonical.input.{result.run_id}.jsonl"
+    output_snapshot = tables_dir / f"canonical.rectified.{result.run_id}.jsonl"
+    assert input_snapshot.exists()
+    assert output_snapshot.exists()
+    in_rows = [json.loads(line) for line in input_snapshot.read_text().splitlines() if line.strip()]
+    out_rows = [json.loads(line) for line in output_snapshot.read_text().splitlines() if line.strip()]
+    assert in_rows and out_rows
+    assert in_rows[0]["table_id"] == "p0001_t01"
+    assert out_rows[0]["table_id"] == "p0001_t01"
 
 
 def test_rectifier_requests_nearby_context_only_on_demand(tmp_path: Path):

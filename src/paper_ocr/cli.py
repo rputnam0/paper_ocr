@@ -246,8 +246,8 @@ def _parse_args() -> argparse.Namespace:
     run.add_argument(
         "--table-llm-rerectify",
         action=argparse.BooleanOptionalAction,
-        default=bool(int(os.getenv("PAPER_OCR_TABLE_LLM_RERECTIFY", "0"))),
-        help="Re-run LLM rectification on tables already marked as rectified (default: disabled).",
+        default=bool(int(os.getenv("PAPER_OCR_TABLE_LLM_RERECTIFY", "1"))),
+        help="Re-run LLM rectification on tables already marked as rectified (default: enabled).",
     )
     run.add_argument(
         "--table-structure-model",
@@ -473,8 +473,8 @@ def _parse_args() -> argparse.Namespace:
     export.add_argument(
         "--table-llm-rerectify",
         action=argparse.BooleanOptionalAction,
-        default=bool(int(os.getenv("PAPER_OCR_TABLE_LLM_RERECTIFY", "0"))),
-        help="Re-run LLM rectification on tables already marked as rectified (default: disabled).",
+        default=bool(int(os.getenv("PAPER_OCR_TABLE_LLM_RERECTIFY", "1"))),
+        help="Re-run LLM rectification on tables already marked as rectified (default: enabled).",
     )
     export.add_argument(
         "--table-structure-model",
