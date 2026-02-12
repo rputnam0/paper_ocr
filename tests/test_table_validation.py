@@ -151,6 +151,10 @@ def test_run_gemini_table_validation_tracks_rubric_and_failure_modes(tmp_path: P
     assert summary["needs_followup_count"] == 1
     assert summary["failure_mode_counts"]["code_legend_unresolved"] == 1
     assert summary["failure_mode_counts"]["missing_required_columns"] == 1
+    assert summary["final_reject"] == 1
+    assert summary["final_accept"] == 0
+    assert summary["review_supported_count"] == 1
+    assert summary["review_refuted_count"] == 0
     assert summary["robustness_counts"]["fragile"] == 1
     assert summary["rubric_averages"]["context_resolution"] == 0.2
     assert summary["tables_with_llm_instructions"] == 1
@@ -169,6 +173,8 @@ def test_run_gemini_table_validation_tracks_rubric_and_failure_modes(tmp_path: P
     )
     rows = [json.loads(line) for line in report_path.read_text().splitlines() if line.strip()]
     review = rows[0]["model_review"]
+    assert review["final_action"] == "reject"
+    assert review["adjudication"]["review_resolution"] == "supported"
     assert review["missing_required_information"] == ["Polymer code legend mapping"]
     assert review["formatting_issues"] == ["Unit superscript formatting dropped in two headers."]
     assert review["llm_extraction_instructions"] == [
@@ -270,6 +276,48 @@ def test_run_gemini_table_validation_continues_on_api_error(tmp_path: Path):
     rows = [json.loads(line) for line in report_path.read_text().splitlines() if line.strip()]
     assert rows[0]["model_review"]["recommended_action"] == "review"
     assert rows[0]["model_review"]["failure_modes"] == ["other"]
+    assert rows[0]["model_review"]["final_action"] == "reject"
+
+
+def test_run_gemini_table_validation_refutes_review_when_quality_is_high(tmp_path: Path):
+    _make_doc(tmp_path, status="warnings")
+    fake_client = _FakeClient(
+        json.dumps(
+            {
+                "table_present_on_page": "yes",
+                "extraction_quality": 0.9,
+                "false_positive_risk": 0.1,
+                "recommended_action": "review",
+                "issues": ["Caption punctuation differs from source."],
+                "failure_modes": ["caption_mismatch"],
+                "needs_followup": False,
+                "rubric": {
+                    "formatting_fidelity": 0.9,
+                    "structural_fidelity": 0.9,
+                    "data_completeness": 0.96,
+                    "unit_symbol_fidelity": 0.95,
+                    "context_resolution": 0.9,
+                    "overall_robustness": "robust",
+                },
+            }
+        )
+    )
+    cfg = GeminiValidationConfig(model="gemini-3-flash", api_key="x")
+
+    summary = asyncio.run(
+        run_gemini_table_validation(
+            ocr_out_dir=tmp_path / "out",
+            config=cfg,
+            client=fake_client,
+            only_problem_docs=True,
+            max_docs=0,
+            max_tables_per_doc=0,
+        )
+    )
+    assert summary["recommended_review"] == 1
+    assert summary["final_accept"] == 1
+    assert summary["review_refuted_count"] == 1
+    assert summary["review_supported_count"] == 0
 
 
 def test_summarize_gemini_failures_aggregates_reports(tmp_path: Path):
@@ -317,7 +365,12 @@ def test_summarize_gemini_failures_aggregates_reports(tmp_path: Path):
     assert payload["tables_reviewed"] == 2
     assert payload["action_counts"]["accept"] == 1
     assert payload["action_counts"]["review"] == 1
+    assert payload["adjudicated_action_counts"]["accept"] == 1
+    assert payload["adjudicated_action_counts"]["reject"] == 1
+    assert payload["review_resolution_counts"]["supported"] == 1
+    assert payload["review_resolution_counts"]["refuted"] == 0
     assert payload["failure_mode_counts"]["multi_level_header_loss"] == 1
+    assert payload["review_reason_counts"]["multi_level_header_loss"] == 1
     assert payload["robustness_counts"]["fragile"] == 1
     assert payload["rubric_averages"]["context_resolution"] == 0.7
     assert out_path.exists()

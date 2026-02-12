@@ -11,6 +11,15 @@ import fitz
 from google import genai
 from google.genai import types
 
+HARD_BLOCKING_FAILURE_MODES = {
+    "table_not_present",
+    "missing_required_columns",
+    "duplicate_or_hallucinated_rows",
+    "partial_table_extracted",
+    "row_shift_or_merge",
+    "column_shift_or_merge",
+}
+
 
 TABLE_VALIDATION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -718,6 +727,156 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _adjudicate_review(review: dict[str, Any]) -> dict[str, Any]:
+    action = str(review.get("recommended_action", "review")).strip().lower()
+    if action not in {"accept", "review", "reject"}:
+        action = "review"
+    if "table_present_on_page" in review:
+        presence = str(review.get("table_present_on_page", "uncertain")).strip().lower()
+    else:
+        # Legacy review rows may omit this field; assume present to avoid artificial rejects.
+        presence = "yes"
+    extraction_quality = _safe_float(review.get("extraction_quality", 0.0), default=0.0)
+    false_positive_risk = _safe_float(review.get("false_positive_risk", 1.0), default=1.0)
+    rubric = review.get("rubric", {})
+    if not isinstance(rubric, dict):
+        rubric = {}
+    structural_fidelity = _safe_float(rubric.get("structural_fidelity", 0.0), default=0.0)
+    data_completeness = _safe_float(rubric.get("data_completeness", 0.0), default=0.0)
+    unit_symbol_fidelity = _safe_float(rubric.get("unit_symbol_fidelity", 0.0), default=0.0)
+    context_resolution = _safe_float(rubric.get("context_resolution", 0.0), default=0.0)
+    overall_robustness = str(rubric.get("overall_robustness", "")).strip().lower()
+
+    failure_modes_raw = review.get("failure_modes", [])
+    failure_modes: list[str] = []
+    if isinstance(failure_modes_raw, list):
+        for mode in failure_modes_raw:
+            text = str(mode).strip()
+            if text:
+                failure_modes.append(text)
+    missing_required_information = review.get("missing_required_information", [])
+    missing_required = [str(item).strip() for item in missing_required_information if str(item).strip()] if isinstance(
+        missing_required_information, list
+    ) else []
+
+    blocking_reasons: list[str] = []
+    supported_failure_modes: list[str] = []
+    refuted_failure_modes: list[str] = []
+
+    if presence in {"no", "uncertain"}:
+        blocking_reasons.append(f"table_presence:{presence or 'uncertain'}")
+    if action == "reject":
+        blocking_reasons.append("model_recommended_reject")
+    if missing_required:
+        blocking_reasons.append("missing_required_information")
+    if overall_robustness in {"failed", "fragile"} and extraction_quality < 0.7:
+        blocking_reasons.append(f"overall_robustness:{overall_robustness}")
+
+    for mode in failure_modes:
+        if mode in HARD_BLOCKING_FAILURE_MODES:
+            blocking_reasons.append(f"failure_mode:{mode}")
+            supported_failure_modes.append(mode)
+            continue
+        if mode == "multi_level_header_loss":
+            if structural_fidelity < 0.8:
+                blocking_reasons.append(f"failure_mode:{mode}")
+                supported_failure_modes.append(mode)
+            else:
+                refuted_failure_modes.append(mode)
+            continue
+        if mode == "header_misalignment":
+            if structural_fidelity < 0.82:
+                blocking_reasons.append(f"failure_mode:{mode}")
+                supported_failure_modes.append(mode)
+            else:
+                refuted_failure_modes.append(mode)
+            continue
+        if mode == "symbol_or_unit_loss":
+            if unit_symbol_fidelity < 0.85:
+                blocking_reasons.append(f"failure_mode:{mode}")
+                supported_failure_modes.append(mode)
+            else:
+                refuted_failure_modes.append(mode)
+            continue
+        if mode == "code_legend_unresolved":
+            if context_resolution < 0.78:
+                blocking_reasons.append(f"failure_mode:{mode}")
+                supported_failure_modes.append(mode)
+            else:
+                refuted_failure_modes.append(mode)
+            continue
+        if mode == "split_table_continuation":
+            if data_completeness < 0.9:
+                blocking_reasons.append(f"failure_mode:{mode}")
+                supported_failure_modes.append(mode)
+            else:
+                refuted_failure_modes.append(mode)
+            continue
+        if mode == "ocr_noise":
+            if extraction_quality < 0.65:
+                blocking_reasons.append(f"failure_mode:{mode}")
+                supported_failure_modes.append(mode)
+            else:
+                refuted_failure_modes.append(mode)
+            continue
+        if mode == "caption_mismatch":
+            # Non-blocking unless table presence itself is uncertain.
+            refuted_failure_modes.append(mode)
+            continue
+        if mode == "other":
+            if extraction_quality < 0.72:
+                blocking_reasons.append(f"failure_mode:{mode}")
+                supported_failure_modes.append(mode)
+            else:
+                refuted_failure_modes.append(mode)
+            continue
+        # Unknown modes are conservatively treated as supported findings.
+        blocking_reasons.append(f"failure_mode:{mode}")
+        supported_failure_modes.append(mode)
+
+    quality_gate_passed = (
+        extraction_quality >= 0.78
+        and false_positive_risk <= 0.35
+        and structural_fidelity >= 0.78
+        and data_completeness >= 0.88
+        and unit_symbol_fidelity >= 0.82
+        and context_resolution >= 0.75
+    )
+
+    if blocking_reasons:
+        final_action = "reject"
+        basis = "blocking_findings"
+    else:
+        if action == "accept":
+            final_action = "accept"
+            basis = "model_accept_no_blockers"
+        elif action == "reject":
+            final_action = "reject"
+            basis = "model_reject"
+        elif quality_gate_passed:
+            final_action = "accept"
+            basis = "review_refuted_by_quality_gate"
+        else:
+            final_action = "reject"
+            basis = "review_supported_by_quality_shortfall"
+
+    review_resolution = "n/a"
+    if action == "review":
+        review_resolution = "refuted" if final_action == "accept" else "supported"
+
+    return {
+        "policy_version": "binary_v1",
+        "model_recommended_action": action,
+        "final_action": final_action,
+        "review_resolution": review_resolution,
+        "basis": basis,
+        "quality_gate_passed": bool(quality_gate_passed),
+        "blocking_reasons": sorted(set(blocking_reasons)),
+        "supported_failure_modes": sorted(set(supported_failure_modes)),
+        "refuted_failure_modes": sorted(set(refuted_failure_modes)),
+    }
+
+
 def _infer_metrics_report_path(ocr_out_dir: Path) -> Path:
     base_name = ocr_out_dir.name
     if base_name.lower() == "pdfs" and ocr_out_dir.parent.name:
@@ -892,7 +1051,11 @@ def summarize_gemini_failures(
 ) -> dict[str, Any]:
     docs = _discover_ocr_doc_dirs(ocr_out_dir)
     action_counts = {"accept": 0, "review": 0, "reject": 0}
+    adjudicated_action_counts = {"accept": 0, "reject": 0}
     failure_mode_counts: dict[str, int] = {}
+    review_reason_counts: dict[str, int] = {}
+    adjudication_blocking_reason_counts: dict[str, int] = {}
+    review_resolution_counts = {"supported": 0, "refuted": 0}
     robustness_counts = {"robust": 0, "mostly_robust": 0, "fragile": 0, "failed": 0}
     table_present_yes = 0
     table_present_no = 0
@@ -918,6 +1081,21 @@ def summarize_gemini_failures(
             if action not in action_counts:
                 action = "review"
             action_counts[action] += 1
+            adjudication = review.get("adjudication", {})
+            if (not isinstance(adjudication, dict)) or ("final_action" not in adjudication):
+                adjudication = _adjudicate_review(review)
+            final_action = str(adjudication.get("final_action", "reject")).strip().lower()
+            if final_action not in adjudicated_action_counts:
+                final_action = "reject"
+            adjudicated_action_counts[final_action] += 1
+            resolution = str(adjudication.get("review_resolution", "")).strip().lower()
+            if resolution in review_resolution_counts:
+                review_resolution_counts[resolution] += 1
+            for reason in adjudication.get("blocking_reasons", []):
+                key = str(reason).strip()
+                if not key:
+                    continue
+                adjudication_blocking_reason_counts[key] = int(adjudication_blocking_reason_counts.get(key, 0)) + 1
             presence = str(review.get("table_present_on_page", "uncertain")).strip().lower()
             if presence == "yes":
                 table_present_yes += 1
@@ -930,6 +1108,8 @@ def summarize_gemini_failures(
                 if not key:
                     continue
                 failure_mode_counts[key] = int(failure_mode_counts.get(key, 0)) + 1
+                if action == "review":
+                    review_reason_counts[key] = int(review_reason_counts.get(key, 0)) + 1
             rubric = review.get("rubric", {})
             if isinstance(rubric, dict):
                 robustness = str(rubric.get("overall_robustness", "")).strip().lower()
@@ -951,7 +1131,13 @@ def summarize_gemini_failures(
         "table_present_no": table_present_no,
         "table_present_uncertain": table_present_uncertain,
         "action_counts": action_counts,
+        "adjudicated_action_counts": adjudicated_action_counts,
+        "review_resolution_counts": review_resolution_counts,
         "failure_mode_counts": dict(sorted(failure_mode_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "review_reason_counts": dict(sorted(review_reason_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "adjudication_blocking_reason_counts": dict(
+            sorted(adjudication_blocking_reason_counts.items(), key=lambda item: (-item[1], item[0]))
+        ),
         "robustness_counts": robustness_counts,
         "rubric_averages": rubric_averages,
     }
@@ -1013,10 +1199,15 @@ async def run_gemini_table_validation(
         "recommended_accept": 0,
         "recommended_review": 0,
         "recommended_reject": 0,
+        "final_accept": 0,
+        "final_reject": 0,
+        "review_supported_count": 0,
+        "review_refuted_count": 0,
         "needs_followup_count": 0,
         "tables_with_llm_instructions": 0,
         "llm_instruction_count": 0,
         "failure_mode_counts": {},
+        "adjudication_blocking_reason_counts": {},
         "robustness_counts": {
             "robust": 0,
             "mostly_robust": 0,
@@ -1139,6 +1330,9 @@ async def run_gemini_table_validation(
                             raw_response="",
                         )
                         review["error"] = str(exc)
+                    adjudication = _adjudicate_review(review)
+                    review["adjudication"] = adjudication
+                    review["final_action"] = adjudication["final_action"]
                     doc_rows.append(
                         {
                             "doc_dir": str(doc_dir),
@@ -1167,6 +1361,23 @@ async def run_gemini_table_validation(
                         summary["recommended_reject"] += 1
                     else:
                         summary["recommended_review"] += 1
+                    final_action = str(adjudication.get("final_action", "reject")).strip().lower()
+                    if final_action == "accept":
+                        summary["final_accept"] += 1
+                    else:
+                        summary["final_reject"] += 1
+                    resolution = str(adjudication.get("review_resolution", "n/a")).strip().lower()
+                    if resolution == "supported":
+                        summary["review_supported_count"] += 1
+                    elif resolution == "refuted":
+                        summary["review_refuted_count"] += 1
+                    for reason in adjudication.get("blocking_reasons", []):
+                        key = str(reason).strip()
+                        if not key:
+                            continue
+                        summary["adjudication_blocking_reason_counts"][key] = int(
+                            summary["adjudication_blocking_reason_counts"].get(key, 0)
+                        ) + 1
                     if bool(review.get("needs_followup", False)):
                         summary["needs_followup_count"] += 1
                     llm_instructions = review.get("llm_extraction_instructions", [])
@@ -1205,6 +1416,14 @@ async def run_gemini_table_validation(
                 "recommended_accept": sum(1 for row in doc_rows if row["model_review"]["recommended_action"] == "accept"),
                 "recommended_review": sum(1 for row in doc_rows if row["model_review"]["recommended_action"] == "review"),
                 "recommended_reject": sum(1 for row in doc_rows if row["model_review"]["recommended_action"] == "reject"),
+                "final_accept": sum(1 for row in doc_rows if row["model_review"]["final_action"] == "accept"),
+                "final_reject": sum(1 for row in doc_rows if row["model_review"]["final_action"] == "reject"),
+                "review_supported_count": sum(
+                    1 for row in doc_rows if row["model_review"].get("adjudication", {}).get("review_resolution") == "supported"
+                ),
+                "review_refuted_count": sum(
+                    1 for row in doc_rows if row["model_review"].get("adjudication", {}).get("review_resolution") == "refuted"
+                ),
                 "needs_followup_count": sum(1 for row in doc_rows if bool(row["model_review"].get("needs_followup", False))),
                 "tables_with_llm_instructions": sum(
                     1 for row in doc_rows if row["model_review"].get("llm_extraction_instructions", [])
@@ -1221,6 +1440,7 @@ async def run_gemini_table_validation(
                     "fragile": 0,
                     "failed": 0,
                 },
+                "adjudication_blocking_reason_counts": {},
                 "report_path": str(report_path),
             }
             for row in doc_rows:
@@ -1230,6 +1450,15 @@ async def run_gemini_table_validation(
                     if not key:
                         continue
                     doc_summary["failure_mode_counts"][key] = int(doc_summary["failure_mode_counts"].get(key, 0)) + 1
+                adjudication = review.get("adjudication", {})
+                if isinstance(adjudication, dict):
+                    for reason in adjudication.get("blocking_reasons", []):
+                        key = str(reason).strip()
+                        if not key:
+                            continue
+                        doc_summary["adjudication_blocking_reason_counts"][key] = int(
+                            doc_summary["adjudication_blocking_reason_counts"].get(key, 0)
+                        ) + 1
                 rubric = review.get("rubric", {})
                 if isinstance(rubric, dict):
                     rob = str(rubric.get("overall_robustness", "")).strip()
