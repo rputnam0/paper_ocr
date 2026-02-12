@@ -244,6 +244,12 @@ def _parse_args() -> argparse.Namespace:
         default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
     )
     run.add_argument(
+        "--table-llm-rerectify",
+        action=argparse.BooleanOptionalAction,
+        default=bool(int(os.getenv("PAPER_OCR_TABLE_LLM_RERECTIFY", "0"))),
+        help="Re-run LLM rectification on tables already marked as rectified (default: disabled).",
+    )
+    run.add_argument(
         "--table-structure-model",
         choices=["off", "tatr"],
         default=os.getenv("PAPER_OCR_TABLE_STRUCTURE_MODEL", TABLE_STRUCTURE_MODEL_DEFAULT),
@@ -463,6 +469,12 @@ def _parse_args() -> argparse.Namespace:
         "--table-llm-target",
         choices=["risk", "all", "nonaccept", "reject"],
         default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
+    )
+    export.add_argument(
+        "--table-llm-rerectify",
+        action=argparse.BooleanOptionalAction,
+        default=bool(int(os.getenv("PAPER_OCR_TABLE_LLM_RERECTIFY", "0"))),
+        help="Re-run LLM rectification on tables already marked as rectified (default: disabled).",
     )
     export.add_argument(
         "--table-structure-model",
@@ -1838,6 +1850,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                             target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
                             structure_model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
                             structure_lock=True,
+                            skip_already_rectified=not bool(getattr(args, "table_llm_rerectify", False)),
                         ),
                     )
                     structured_data_manifest["table_llm_rectification"] = asdict(rectifier_result)
@@ -2181,6 +2194,7 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                                 target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
                                 structure_model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
                                 structure_lock=True,
+                                skip_already_rectified=not bool(getattr(args, "table_llm_rerectify", False)),
                             ),
                         )
                     )

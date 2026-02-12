@@ -33,6 +33,7 @@ class RectifierConfig:
     structure_model: str = "off"
     structure_lock: bool = True
     context_mode: str = "on_demand"
+    skip_already_rectified: bool = True
 
 
 @dataclass
@@ -1397,6 +1398,21 @@ async def run_table_rectification_for_doc(
         payload = table_payloads.get(table_id, {})
         risk_score = _compute_risk_score(payload, qa_rows)
         base_row = {"table_id": table_id, "page": int(manifest_row.get("page", 0) or 0), "risk_score": risk_score}
+        if bool(config.skip_already_rectified):
+            llm_meta = payload.get("llm_rectification", {})
+            already_rectified = bool(llm_meta.get("applied")) if isinstance(llm_meta, dict) else False
+            if already_rectified:
+                _append_flag(
+                    qa_rows=qa_rows,
+                    existing_flag_ids=existing_flag_ids,
+                    table_id=table_id,
+                    page=int(manifest_row.get("page", 0) or 0),
+                    flag_type="llm_rectification_skipped_already_applied",
+                    severity="info",
+                    details=f"model={str(llm_meta.get('model', '')).strip()}",
+                )
+                result.table_results.append({**base_row, "status": "skipped_already_rectified"})
+                continue
         if config.target == "all":
             candidates.append({**base_row, "manifest_row": manifest_row, "table_payload": payload})
             continue

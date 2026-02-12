@@ -131,6 +131,58 @@ def test_rectifier_accepts_valid_payload_and_writes_outputs(tmp_path: Path):
     assert any(flag["type"] == "llm_rectification_applied" for flag in flags)
 
 
+def test_rectifier_skips_already_rectified_tables_by_default(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
+    payload = json.loads(table_json_path.read_text())
+    payload["llm_rectification"] = {"applied": True, "model": "openai/gpt-oss-120b"}
+    table_json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+
+    calls = {"count": 0}
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        calls["count"] += 1
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert calls["count"] == 0
+    assert result.selected == 0
+    assert result.applied == 0
+    assert any(row.get("status") == "skipped_already_rectified" for row in result.table_results)
+
+
+def test_rectifier_rerectifies_when_skip_override_disabled(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
+    payload = json.loads(table_json_path.read_text())
+    payload["llm_rectification"] = {"applied": True, "model": "openai/gpt-oss-120b"}
+    table_json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+
+    calls = {"count": 0}
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        calls["count"] += 1
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all", skip_already_rectified=False),
+            call_model=_fake_call_model,
+        )
+    )
+    assert calls["count"] == 1
+    assert result.applied == 1
+
+
 def test_rectifier_requests_nearby_context_only_on_demand(tmp_path: Path):
     doc_dir, _ = _make_doc_with_one_table(tmp_path)
     prompts: list[str] = []

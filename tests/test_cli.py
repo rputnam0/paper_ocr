@@ -276,6 +276,7 @@ def test_parse_run_table_pipeline_defaults(monkeypatch):
     assert args.table_llm_risk_threshold == 0.45
     assert args.table_llm_max_tables_per_doc == 12
     assert args.table_llm_target == "risk"
+    assert args.table_llm_rerectify is False
     assert args.table_header_ocr_auto is True
     assert args.table_artifact_mode == "permissive"
     assert args.table_quality_gate is True
@@ -380,6 +381,7 @@ def test_parse_export_table_pipeline_options(monkeypatch):
             "4",
             "--table-llm-target",
             "nonaccept",
+            "--table-llm-rerectify",
             "--no-table-header-ocr-auto",
             "--table-artifact-mode",
             "strict",
@@ -398,6 +400,7 @@ def test_parse_export_table_pipeline_options(monkeypatch):
     assert args.table_llm_risk_threshold == 0.7
     assert args.table_llm_max_tables_per_doc == 4
     assert args.table_llm_target == "nonaccept"
+    assert args.table_llm_rerectify is True
     assert args.table_header_ocr_auto is False
     assert args.table_artifact_mode == "strict"
     assert args.compare_ocr_html is False
