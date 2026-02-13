@@ -6,6 +6,8 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -97,7 +99,10 @@ def _portable_path(path: Path, root: Path) -> str:
 
 
 def _normalize_cell_text(value: Any) -> str:
-    return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    text = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    if text.lower() in {"<empty>", "[empty]", "(empty)"}:
+        return ""
+    return text
 
 
 def _collapse_header_rows(header_rows: list[list[str]]) -> list[str]:
@@ -369,6 +374,341 @@ def _load_table_structure_map(doc_dir: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _load_page_route_map(doc_dir: Path) -> dict[int, str]:
+    manifest = _load_json(doc_dir / "metadata" / "manifest.json")
+    pages = manifest.get("pages", [])
+    out: dict[int, str] = {}
+    if not isinstance(pages, list):
+        return out
+    for idx, row in enumerate(pages, start=1):
+        if not isinstance(row, dict):
+            continue
+        page_index = row.get("page_index", idx)
+        try:
+            page = int(page_index)
+        except Exception:
+            page = idx
+        if page <= 0:
+            continue
+        route = str(row.get("route", "") or "").strip().lower()
+        if route:
+            out[page] = route
+    return out
+
+
+def _table_pages_for_payload(table_payload: dict[str, Any], fallback_page: int) -> set[int]:
+    out: set[int] = set()
+    pages = table_payload.get("pages", [])
+    if isinstance(pages, list):
+        for item in pages:
+            try:
+                page = int(item)
+            except Exception:
+                continue
+            if page > 0:
+                out.add(page)
+    if not out and fallback_page > 0:
+        out.add(int(fallback_page))
+    return out
+
+
+def _is_born_digital_table(*, table_payload: dict[str, Any], page: int, page_routes: dict[int, str]) -> bool:
+    if not page_routes:
+        return False
+    pages = _table_pages_for_payload(table_payload, page)
+    if not pages:
+        return False
+    routes = [str(page_routes.get(p, "")).strip().lower() for p in sorted(pages)]
+    known = [route for route in routes if route]
+    if not known:
+        return False
+    return all(route == "anchored" for route in known)
+
+
+def _table_structure_for_prompt(table_structure: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(table_structure, dict):
+        return {"rows": 0, "cols": 0, "header_rows": 0, "spans": []}
+    try:
+        rows = int(table_structure.get("rows", 0) or 0)
+    except Exception:
+        rows = 0
+    try:
+        cols = int(table_structure.get("cols", 0) or 0)
+    except Exception:
+        cols = 0
+    try:
+        header_rows = int(table_structure.get("header_rows", 0) or 0)
+    except Exception:
+        header_rows = 0
+    spans: list[dict[str, int]] = []
+    for raw in table_structure.get("cells", []) if isinstance(table_structure.get("cells", []), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            row_start = int(raw.get("row_start", 0))
+            row_end = int(raw.get("row_end", row_start))
+            col_start = int(raw.get("col_start", 0))
+            col_end = int(raw.get("col_end", col_start))
+        except Exception:
+            continue
+        if row_end <= row_start and col_end <= col_start:
+            continue
+        spans.append(
+            {
+                "row_start": row_start,
+                "row_end": row_end,
+                "col_start": col_start,
+                "col_end": col_end,
+            }
+        )
+    return {
+        "rows": rows,
+        "cols": cols,
+        "header_rows": header_rows,
+        "spans": spans,
+    }
+
+
+def _prefilled_grid_from_table_payload(table_payload: dict[str, Any], table_structure: dict[str, Any]) -> list[list[str]]:
+    header_rows = [
+        [_normalize_cell_text(cell) for cell in row]
+        for row in table_payload.get("header_rows_full", [])
+        if isinstance(row, list)
+    ]
+    data_rows = [
+        [_normalize_cell_text(cell) for cell in row]
+        for row in table_payload.get("data_rows", [])
+        if isinstance(row, list)
+    ]
+    try:
+        structure_rows = int(table_structure.get("rows", 0) or 0)
+    except Exception:
+        structure_rows = 0
+    try:
+        structure_cols = int(table_structure.get("cols", 0) or 0)
+    except Exception:
+        structure_cols = 0
+    target_rows = max(
+        structure_rows,
+        len(header_rows) + len(data_rows),
+    )
+    target_cols = max(
+        structure_cols,
+        max((len(row) for row in header_rows), default=0),
+        max((len(row) for row in data_rows), default=0),
+    )
+    if target_rows <= 0 or target_cols <= 0:
+        return []
+    out = [["" for _ in range(target_cols)] for _ in range(target_rows)]
+    write_row = 0
+    for row in header_rows:
+        if write_row >= target_rows:
+            break
+        normalized = (list(row) + [""] * (target_cols - len(row)))[:target_cols]
+        out[write_row] = normalized
+        write_row += 1
+    for row in data_rows:
+        if write_row >= target_rows:
+            break
+        normalized = (list(row) + [""] * (target_cols - len(row)))[:target_cols]
+        out[write_row] = normalized
+        write_row += 1
+    return out
+
+
+def _grid_to_text_lines(grid: list[list[str]]) -> list[str]:
+    out: list[str] = []
+    for row in grid:
+        normalized = [_normalize_cell_text(cell) for cell in row]
+        if any(normalized):
+            out.append(" | ".join(normalized))
+    return out
+
+
+class _HTMLTableEvidenceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_row = False
+        self.in_cell = False
+        self.cell_buf: list[str] = []
+        self.cell_colspan = 1
+        self.cell_rowspan = 1
+        self.current_row: list[dict[str, Any]] = []
+        self.rows: list[list[dict[str, Any]]] = []
+
+    @staticmethod
+    def _int_attr(attrs: list[tuple[str, str | None]], key: str, default: int = 1) -> int:
+        for name, value in attrs:
+            if str(name).lower() != key.lower():
+                continue
+            try:
+                parsed = int(str(value or default))
+            except Exception:
+                return default
+            return max(1, parsed)
+        return default
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        token = str(tag).lower()
+        if token == "tr":
+            self.in_row = True
+            self.current_row = []
+            return
+        if token in {"th", "td"} and self.in_row:
+            self.in_cell = True
+            self.cell_buf = []
+            self.cell_colspan = self._int_attr(attrs, "colspan", 1)
+            self.cell_rowspan = self._int_attr(attrs, "rowspan", 1)
+            return
+        if token == "br" and self.in_cell:
+            self.cell_buf.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        token = str(tag).lower()
+        if token in {"th", "td"} and self.in_cell:
+            text = _normalize_cell_text(unescape("".join(self.cell_buf)))
+            self.current_row.append(
+                {
+                    "text": text,
+                    "colspan": self.cell_colspan,
+                    "rowspan": self.cell_rowspan,
+                }
+            )
+            self.in_cell = False
+            self.cell_buf = []
+            self.cell_colspan = 1
+            self.cell_rowspan = 1
+            return
+        if token == "tr" and self.in_row:
+            if self.current_row:
+                self.rows.append(self.current_row)
+            self.current_row = []
+            self.in_row = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_cell:
+            self.cell_buf.append(data)
+
+
+def _extract_full_table_text_and_join_hints(
+    *,
+    full_table_text: str,
+    expected_rows: int,
+    expected_cols: int,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    raw = str(full_table_text or "").strip()
+    if not raw:
+        return [], []
+    table_blocks = re.findall(r"<table\b.*?</table>", raw, flags=re.IGNORECASE | re.DOTALL)
+    if not table_blocks:
+        lines = [_normalize_cell_text(line) for line in raw.splitlines()]
+        compact_lines = [line for line in lines if line and not re.fullmatch(r"\[[^\]]+\]", line)]
+        return compact_lines, []
+
+    parser = _HTMLTableEvidenceParser()
+    try:
+        parser.feed(table_blocks[0])
+    except Exception:
+        lines = [_normalize_cell_text(line) for line in raw.splitlines()]
+        compact_lines = [line for line in lines if line and not re.fullmatch(r"\[[^\]]+\]", line)]
+        return compact_lines, []
+
+    max_rows = max(0, int(expected_rows))
+    max_cols = max(0, int(expected_cols))
+    active_rowspans: dict[int, int] = {}
+    lines: list[str] = []
+    join_hints: list[dict[str, Any]] = []
+
+    for row_idx, row_cells in enumerate(parser.rows):
+        if max_rows and row_idx >= max_rows:
+            break
+        row_parts = [_normalize_cell_text(cell.get("text", "")) for cell in row_cells]
+        if any(row_parts):
+            lines.append(" | ".join(row_parts))
+
+        col_ptr = 0
+        for cell in row_cells:
+            while active_rowspans.get(col_ptr, 0) > 0:
+                col_ptr += 1
+            colspan = max(1, int(cell.get("colspan", 1) or 1))
+            rowspan = max(1, int(cell.get("rowspan", 1) or 1))
+            text = _normalize_cell_text(cell.get("text", ""))
+            if colspan > 1 and text:
+                end_col = min(col_ptr + colspan, max_cols) if max_cols else (col_ptr + colspan)
+                cells = [[row_idx, col] for col in range(col_ptr, end_col)]
+                if len(cells) > 1:
+                    join_hints.append({"cells": cells, "text": text})
+            if rowspan > 1:
+                for col in range(col_ptr, col_ptr + colspan):
+                    if max_cols and col >= max_cols:
+                        break
+                    active_rowspans[col] = max(active_rowspans.get(col, 0), rowspan - 1)
+            col_ptr += colspan
+        for col in list(active_rowspans.keys()):
+            remaining = int(active_rowspans[col]) - 1
+            if remaining <= 0:
+                active_rowspans.pop(col, None)
+            else:
+                active_rowspans[col] = remaining
+
+    return lines, join_hints
+
+
+def _is_note_marker(text: str) -> bool:
+    return bool(re.fullmatch(r"\(\s*\d+[A-Za-z]?\s*\)", _normalize_cell_text(text)))
+
+
+def _is_numeric_like(text: str) -> bool:
+    token = _normalize_cell_text(text).replace(",", "")
+    return bool(re.fullmatch(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", token))
+
+
+def _infer_row_kinds(grid: list[list[str]], *, header_rows: int) -> list[str]:
+    out: list[str] = []
+    for row_idx, row in enumerate(grid):
+        if row_idx < max(0, int(header_rows)):
+            out.append("header")
+            continue
+        values = [_normalize_cell_text(cell) for cell in row]
+        nonempty = [cell for cell in values if cell]
+        if not nonempty:
+            out.append("empty")
+            continue
+        first = values[0] if values else ""
+        tail = [cell for cell in values[1:] if cell]
+        if first and re.search(r"[A-Za-z]", first):
+            if not tail or all(_is_note_marker(cell) for cell in tail):
+                out.append("group")
+                continue
+            numeric_tail = sum(1 for cell in tail if _is_numeric_like(cell))
+            if numeric_tail <= max(1, len(tail) // 3):
+                out.append("group")
+                continue
+        out.append("data")
+    return out
+
+
+def _collect_full_table_text_evidence(
+    *,
+    born_digital: bool,
+    prefilled_grid: list[list[str]],
+    ocr_text: str,
+    table_structure_prompt: dict[str, Any],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    if born_digital:
+        return _grid_to_text_lines(prefilled_grid), []
+    expected_rows = int(table_structure_prompt.get("rows", 0) or 0)
+    expected_cols = int(table_structure_prompt.get("cols", 0) or 0)
+    lines, join_hints = _extract_full_table_text_and_join_hints(
+        full_table_text=ocr_text,
+        expected_rows=expected_rows,
+        expected_cols=expected_cols,
+    )
+    if not lines:
+        lines = _grid_to_text_lines(prefilled_grid)
+    return lines, join_hints
+
+
 def _read_ocr_evidence(
     doc_dir: Path,
     table_payload: dict[str, Any],
@@ -520,8 +860,9 @@ def _collect_evidence_bundle(
     *,
     fragment_index: dict[str, dict[str, Any]],
     table_structure: dict[str, Any],
+    born_digital: bool,
     context_window: str = "none",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     fragment_rows = _collect_fragment_rows(table_payload=table_payload, fragment_index=fragment_index)
     context_text = _collect_page_context_text(
         doc_dir=doc_dir,
@@ -529,6 +870,8 @@ def _collect_evidence_bundle(
         page=page,
         context_window=context_window,
     )
+    table_structure_prompt = _table_structure_for_prompt(table_structure)
+    prefilled_grid = _prefilled_grid_from_table_payload(table_payload, table_structure_prompt)
     headers = [str(x) for row in table_payload.get("header_rows_full", []) if isinstance(row, list) for x in row]
     rows = [str(x) for row in table_payload.get("data_rows", []) if isinstance(row, list) for x in row]
     fragment_text_parts: list[str] = []
@@ -545,14 +888,33 @@ def _collect_evidence_bundle(
         )
     marker_fragment_text = "\n".join(fragment_text_parts)
     marker_text = "\n".join(headers + rows + [str(table_payload.get("caption_text", "")), marker_fragment_text])
-    ocr_text = _read_ocr_evidence(doc_dir, table_payload, page, fragment_rows)
+    ocr_text = "" if born_digital else _read_ocr_evidence(doc_dir, table_payload, page, fragment_rows)
+    full_table_text_lines, join_hints = _collect_full_table_text_evidence(
+        born_digital=born_digital,
+        prefilled_grid=prefilled_grid,
+        ocr_text=ocr_text,
+        table_structure_prompt=table_structure_prompt,
+    )
+    try:
+        header_rows = int(table_structure_prompt.get("header_rows", 0) or 0)
+    except Exception:
+        header_rows = 0
+    if header_rows <= 0:
+        header_rows = max(1, len(table_payload.get("header_rows_full", [])) or 1)
+    row_kinds = _infer_row_kinds(prefilled_grid, header_rows=header_rows)
     return {
+        "born_digital": bool(born_digital),
         "context_text": context_text,
         "marker_text": marker_text,
         "marker_fragment_text": marker_fragment_text,
         "ocr_text": ocr_text,
-        "table_structure_text": json.dumps(table_structure, ensure_ascii=True) if table_structure else "",
-        "combined_text": "\n".join([marker_text, ocr_text, context_text]),
+        "table_structure_prompt": table_structure_prompt,
+        "table_structure_text": json.dumps(table_structure_prompt, ensure_ascii=True) if table_structure_prompt else "",
+        "prefilled_grid": prefilled_grid,
+        "full_table_text_lines": full_table_text_lines,
+        "join_hints": join_hints,
+        "row_kinds": row_kinds,
+        "combined_text": "\n".join([marker_text, "\n".join(full_table_text_lines), ocr_text, context_text]),
     }
 
 
@@ -561,19 +923,46 @@ def _build_prompt(
     table_payload: dict[str, Any],
     manifest_row: dict[str, Any],
     risk_score: float,
-    evidence: dict[str, str],
+    evidence: dict[str, Any],
     validation_feedback: dict[str, Any],
     table_structure: dict[str, Any],
     context_window: str = "none",
     context_mode: str = "on_demand",
 ) -> str:
     active_context = evidence.get("context_text", "")
+    prompt_structure = evidence.get("table_structure_prompt", {})
+    if not isinstance(prompt_structure, dict):
+        prompt_structure = _table_structure_for_prompt(table_structure)
+    full_table_text_lines = [
+        _normalize_cell_text(line)
+        for line in (evidence.get("full_table_text_lines", []) if isinstance(evidence.get("full_table_text_lines", []), list) else [])
+        if _normalize_cell_text(line)
+    ]
+    join_hints = [
+        dict(item)
+        for item in (evidence.get("join_hints", []) if isinstance(evidence.get("join_hints", []), list) else [])
+        if isinstance(item, dict)
+    ]
+    row_kinds = [
+        _normalize_cell_text(kind)
+        for kind in (evidence.get("row_kinds", []) if isinstance(evidence.get("row_kinds", []), list) else [])
+        if _normalize_cell_text(kind)
+    ]
+    prefilled_grid = [
+        [_normalize_cell_text(cell) for cell in row]
+        for row in (evidence.get("prefilled_grid", []) if isinstance(evidence.get("prefilled_grid", []), list) else [])
+        if isinstance(row, list)
+    ]
     request = {
         "table_id": str(table_payload.get("table_id", manifest_row.get("table_id", ""))),
         "page": int(manifest_row.get("page", 0) or 0),
         "risk_score": risk_score,
         "context_mode": str(context_mode),
         "context_window_active": str(context_window),
+        "table_source_profile": {
+            "born_digital": bool(evidence.get("born_digital", False)),
+            "ocr_usage_policy": "minimal_for_born_digital",
+        },
         "canonical_table": {
             "caption": str(table_payload.get("caption_text", manifest_row.get("caption", ""))),
             "header_rows_full": table_payload.get("header_rows_full", []),
@@ -584,8 +973,12 @@ def _build_prompt(
             "quality_metrics": table_payload.get("quality_metrics", {}),
         },
         "validation_feedback": validation_feedback,
-        "table_structure": table_structure,
-        "ocr_table_raw": evidence["ocr_text"][:24000],
+        "table_structure": prompt_structure,
+        "prefilled_grid_from_cell_ocr": prefilled_grid,
+        "full_table_text_lines": full_table_text_lines[:400],
+        "join_hints": join_hints[:200],
+        "row_kinds": row_kinds[: int(prompt_structure.get("rows", 0) or 0)] if prompt_structure else row_kinds[:200],
+        "ocr_table_raw_text_only": "\n".join(full_table_text_lines[:400])[:24000],
         "context_tool": {
             "available": True,
             "allowed_windows": list(CONTEXT_WINDOW_OPTIONS),
@@ -601,6 +994,7 @@ def _build_prompt(
             "marker_fragment_rows": evidence.get("marker_fragment_text", "")[:22000],
             "nearby_pages_text": active_context[:24000],
             "table_structure_raw": evidence.get("table_structure_text", "")[:18000],
+            "evidence_role": "repair_text_not_structure",
         },
     }
     return (
@@ -611,10 +1005,15 @@ def _build_prompt(
         "- Preserve units/symbols and table semantics.\n"
         "- Prioritize column alignment, multi-level header integrity, and row-to-column correctness over preserving superficial layout.\n"
         "- Structure lock: when table_structure is provided, preserve its row/column topology and spans.\n"
+        "- Evidence role: full_table_text_lines, join_hints, and nearby_pages_text may repair text only; they may NOT change row/column alignment.\n"
+        "- If evidence appears to contain more or fewer fields than table_structure.cols, treat it as incomplete/non-structural; do not re-grid.\n"
         "- If values are vertically stacked across lines, merge them into their logical cell.\n"
         "- If previous validation feedback lists specific failure modes or instructions, address them explicitly.\n"
         "- Context discipline: default to table-local evidence (marker+caption+OCR). Request page context only when strictly needed.\n"
         "- Keep output rectangular.\n"
+        "- Do not add/remove columns.\n"
+        "- Preserve every non-empty cell value from prefilled_grid_from_cell_ocr unless merged with adjacent split fragments.\n"
+        "- Convert '<empty>' to ''.\n"
         "- Every non-empty changed cell must include provenance.\n"
         "Output schema keys (all required):\n"
         "rectified_header_rows_full, rectified_rows, edits, cell_provenance, rectifier_confidence, needs_review.\n\n"
@@ -665,33 +1064,57 @@ def _build_evidence_retry_prompt(
     previous_output: dict[str, Any],
     table_payload: dict[str, Any],
     manifest_row: dict[str, Any],
-    evidence: dict[str, str],
+    evidence: dict[str, Any],
     validation_feedback: dict[str, Any],
     table_structure: dict[str, Any],
 ) -> str:
+    prompt_structure = evidence.get("table_structure_prompt", {})
+    if not isinstance(prompt_structure, dict):
+        prompt_structure = _table_structure_for_prompt(table_structure)
+    full_table_text_lines = evidence.get("full_table_text_lines", [])
+    if not isinstance(full_table_text_lines, list):
+        full_table_text_lines = []
+    join_hints = evidence.get("join_hints", [])
+    if not isinstance(join_hints, list):
+        join_hints = []
+    row_kinds = evidence.get("row_kinds", [])
+    if not isinstance(row_kinds, list):
+        row_kinds = []
+    prefilled_grid = evidence.get("prefilled_grid", [])
+    if not isinstance(prefilled_grid, list):
+        prefilled_grid = []
     request = {
         "evidence_violation": evidence_reason,
         "table_id": str(table_payload.get("table_id", manifest_row.get("table_id", ""))),
         "expected_fixes": validation_feedback,
-        "table_structure": table_structure,
+        "table_structure": prompt_structure,
+        "table_source_profile": {
+            "born_digital": bool(evidence.get("born_digital", False)),
+            "ocr_usage_policy": "minimal_for_born_digital",
+        },
         "previous_output": previous_output,
         "source_table": {
             "caption": str(table_payload.get("caption_text", manifest_row.get("caption", ""))),
             "header_rows_full": table_payload.get("header_rows_full", []),
             "data_rows": table_payload.get("data_rows", []),
         },
+        "prefilled_grid_from_cell_ocr": prefilled_grid,
+        "full_table_text_lines": [_normalize_cell_text(line) for line in full_table_text_lines if _normalize_cell_text(line)][:400],
+        "join_hints": [dict(item) for item in join_hints if isinstance(item, dict)][:200],
+        "row_kinds": [_normalize_cell_text(kind) for kind in row_kinds if _normalize_cell_text(kind)][:200],
         "evidence": {
             "marker_and_caption": evidence.get("marker_text", "")[:18000],
             "marker_fragment_rows": evidence.get("marker_fragment_text", "")[:22000],
-            "ocr_table_raw": evidence.get("ocr_text", "")[:24000],
             "nearby_pages_text": evidence.get("context_text", "")[:24000],
             "table_structure_raw": evidence.get("table_structure_text", "")[:18000],
+            "evidence_role": "repair_text_not_structure",
         },
     }
     return (
         "Your previous rectification failed evidence validation.\n"
         "Return corrected JSON only.\n"
         "Focus on: preserving headers/units/symbols, fixing row/column alignment, and grounding every changed cell in evidence.\n"
+        "Do not use evidence to alter table topology.\n"
         "Do not hallucinate values.\n\n"
         f"Input:\n{json.dumps(request, ensure_ascii=True)}"
     )
@@ -862,7 +1285,7 @@ def _infer_provenance_for_changed_cells(
     provenance_by_cell: dict[tuple[int, int], dict[str, Any]],
     rows: list[list[str]],
     orig_rows: list[list[str]],
-    evidence: dict[str, str],
+    evidence: dict[str, Any],
 ) -> dict[tuple[int, int], dict[str, Any]]:
     out = dict(provenance_by_cell)
     marker_text = str(evidence.get("marker_text", ""))
@@ -970,7 +1393,7 @@ def _auto_repair_candidate_for_validation(
     orig_headers: list[str],
     orig_rows: list[list[str]],
     provenance_by_cell: dict[tuple[int, int], dict[str, Any]],
-    evidence: dict[str, str],
+    evidence: dict[str, Any],
 ) -> tuple[list[str], list[list[str]], dict[tuple[int, int], dict[str, Any]]]:
     repaired_headers = [str(x) for x in headers]
     repaired_rows = [[str(cell) for cell in row] for row in rows]
@@ -1068,7 +1491,7 @@ def _validate_evidence(
     *,
     table_payload: dict[str, Any],
     normalized: dict[str, Any],
-    evidence: dict[str, str],
+    evidence: dict[str, Any],
     table_structure: dict[str, Any],
     structure_lock: bool,
 ) -> tuple[bool, str, list[dict[str, Any]], list[str], list[list[str]]]:
@@ -1488,6 +1911,7 @@ async def run_table_rectification_for_doc(
     canonical_rows = _load_jsonl(canonical_path)
     canonical_by_id = {str(row.get("table_id", "")): dict(row) for row in canonical_rows}
     table_structure_by_id = _load_table_structure_map(doc_dir)
+    page_routes = _load_page_route_map(doc_dir)
 
     for candidate in candidates:
         table_id = str(candidate["table_id"])
@@ -1497,6 +1921,11 @@ async def run_table_rectification_for_doc(
         table_payload = dict(candidate.get("table_payload", {}))
         validation_feedback = dict(validation_feedback_by_id.get(table_id, {}))
         table_structure = dict(table_structure_by_id.get(table_id, {}))
+        born_digital = _is_born_digital_table(
+            table_payload=table_payload,
+            page=page,
+            page_routes=page_routes,
+        )
         context_window_used = "none"
         context_requested = False
         context_request_reason = ""
@@ -1506,6 +1935,7 @@ async def run_table_rectification_for_doc(
             page,
             fragment_index=fragment_index,
             table_structure=table_structure,
+            born_digital=born_digital,
             context_window=context_window_used,
         )
         prompt = _build_prompt(
@@ -1573,6 +2003,7 @@ async def run_table_rectification_for_doc(
                     page,
                     fragment_index=fragment_index,
                     table_structure=table_structure,
+                    born_digital=born_digital,
                     context_window=context_window_used,
                 )
                 _append_flag(
@@ -1668,6 +2099,7 @@ async def run_table_rectification_for_doc(
                     "reason": schema_reason,
                     "context_requested": context_requested,
                     "context_window": context_window_used,
+                    "born_digital": born_digital,
                 }
             )
             continue
@@ -1758,6 +2190,7 @@ async def run_table_rectification_for_doc(
                     "context_requested": context_requested,
                     "context_window": context_window_used,
                     "context_request_reason": context_request_reason,
+                    "born_digital": born_digital,
                 }
             )
             continue
@@ -1828,6 +2261,7 @@ async def run_table_rectification_for_doc(
                 "context_requested": context_requested,
                 "context_window": context_window_used,
                 "context_request_reason": context_request_reason,
+                "born_digital": born_digital,
                 "rectifier_confidence": float(updated_payload.get("rectifier_confidence", 0.0) or 0.0),
                 "needs_review": bool(updated_payload.get("rectifier_needs_review", False)),
             }

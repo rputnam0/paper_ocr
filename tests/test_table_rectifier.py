@@ -104,6 +104,35 @@ def _extract_prompt_input(prompt: str) -> dict[str, object]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _write_doc_manifest_with_routes(doc_dir: Path, routes_by_page: dict[int, str]) -> None:
+    page_count = max(routes_by_page.keys(), default=0)
+    pages: list[dict[str, object]] = []
+    for page_idx in range(1, page_count + 1):
+        route = str(routes_by_page.get(page_idx, "anchored"))
+        pages.append(
+            {
+                "page_index": page_idx,
+                "route": route,
+                "status": "structured_ok",
+                "heuristics": {
+                    "char_count": 800,
+                    "printable_ratio": 0.99,
+                    "cid_ratio": 0.0,
+                    "replacement_char_ratio": 0.0,
+                    "avg_token_length": 5.0,
+                },
+            }
+        )
+    payload = {
+        "doc_id": "abc",
+        "page_count": page_count,
+        "pages": pages,
+    }
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+
+
 def test_rectifier_accepts_valid_payload_and_writes_outputs(tmp_path: Path):
     doc_dir, _ = _make_doc_with_one_table(tmp_path)
 
@@ -711,3 +740,70 @@ def test_rectifier_enforces_structure_lock_when_tatr_structure_present(tmp_path:
     table_json_path = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "p0001_t01.json"
     after = json.loads(table_json_path.read_text())
     assert after["data_rows"] == before["data_rows"]
+
+
+def test_rectifier_prompt_uses_table_text_lines_for_born_digital_and_avoids_ocr_html(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    _write_doc_manifest_with_routes(doc_dir, {1: "anchored"})
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "table_01_page_0001.md").write_text("<table><tr><td>SHOULD_NOT_APPEAR</td></tr></table>")
+
+    prompts: list[str] = []
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        prompts.append(str(kwargs.get("prompt", "")))
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.applied == 1
+    assert prompts
+    payload_in = _extract_prompt_input(prompts[0])
+    assert payload_in.get("table_source_profile", {}).get("born_digital") is True
+    assert "Polymer | Value" in str(payload_in.get("ocr_table_raw_text_only", ""))
+    lines = payload_in.get("full_table_text_lines", [])
+    assert isinstance(lines, list)
+    assert any("Polymer | Value" in str(line) for line in lines)
+    assert "SHOULD_NOT_APPEAR" not in prompts[0]
+
+
+def test_rectifier_prompt_uses_ocr_text_lines_and_join_hints_for_non_digital(tmp_path: Path):
+    doc_dir, _ = _make_doc_with_one_table(tmp_path)
+    _write_doc_manifest_with_routes(doc_dir, {1: "unanchored"})
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "table_01_page_0001.md").write_text(
+        "<table><tr><th>Polymer</th><th colspan='2'>Value range</th></tr><tr><td>A</td><td>1.2</td><td>1.3</td></tr></table>"
+    )
+
+    prompts: list[str] = []
+
+    async def _fake_call_model(**kwargs):  # noqa: ANN001
+        prompts.append(str(kwargs.get("prompt", "")))
+        return _FakeTextResponse(_valid_payload())
+
+    result = asyncio.run(
+        run_table_rectification_for_doc(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            config=RectifierConfig(target="all"),
+            call_model=_fake_call_model,
+        )
+    )
+    assert result.applied == 1
+    payload_in = _extract_prompt_input(prompts[0])
+    assert payload_in.get("table_source_profile", {}).get("born_digital") is False
+    lines = payload_in.get("full_table_text_lines", [])
+    assert isinstance(lines, list)
+    assert any("Polymer | Value range" in str(line) for line in lines)
+    join_hints = payload_in.get("join_hints", [])
+    assert isinstance(join_hints, list)
+    assert any("Value range" in str(item.get("text", "")) for item in join_hints if isinstance(item, dict))
+    assert "<table>" not in str(payload_in.get("ocr_table_raw_text_only", ""))
