@@ -1709,41 +1709,53 @@ def test_process_page_structured_failure_uses_fallback(monkeypatch, tmp_path: Pa
     assert result["structured"]["fallback_reason"] == "marker unavailable"
 
 
-def test_extract_discovery_can_return_sections_without_grobid(monkeypatch):
-    class _Resp:
-        def __init__(self, content: str):
-            self.content = content
-            self.reasoning_content = ""
-
-    calls: list[str] = []
-
-    async def _fake_text_model(**kwargs):  # noqa: ANN001
-        prompt = str(kwargs.get("prompt", ""))
-        calls.append(prompt)
-        if "extract the paper abstract" in prompt.lower():
-            return _Resp('{"abstract":"A study of rheology.","key_topics":["rheology"]}')
-        if "one chunk of a paper markdown transcript" in prompt:
-            return _Resp(
-                '{"chunk_summary":"chunk","key_topics":["rheology"],"sections":[{"title":"Methods","start_page":2,"end_page":4,"summary":"m"}]}'
-            )
-        if "combining chunk-level paper discovery data" in prompt:
-            return _Resp(
-                '{"paper_summary":"A study of rheology.","key_topics":["rheology"],"sections":[{"title":"Methods","start_page":2,"end_page":4,"summary":"m"}]}'
-            )
-        return _Resp("{}")
-
-    monkeypatch.setattr(cli, "call_text_model", _fake_text_model)
-
+def test_extract_discovery_can_return_sections_without_grobid():
     out = asyncio.run(
         cli._extract_discovery(
             client=object(),  # type: ignore[arg-type]
             metadata_model="m",
             bibliography={"title": "T", "citation": "C"},
             page_count=10,
-            consolidated_markdown="# Page 1\nAbstract\n\n# Page 2\nMethods\n",
+            consolidated_markdown=(
+                "# Page 1\n"
+                "Sample Paper Title\n\n"
+                "## Abstract\n"
+                "This paper studies rheology in polymer solutions and summarizes deterministic extraction.\n\n"
+                "## Introduction\n"
+                "We motivate deterministic metadata extraction from OCR markdown.\n\n"
+                "# Page 2\n"
+                "## Methods\n"
+                "We parse headings and abstract text directly.\n\n"
+                "## Results\n"
+                "The parser produces stable JSON artifacts.\n\n"
+                "# Page 3\n"
+                "## Conclusion\n"
+                "Deterministic metadata replaced the LLM step.\n"
+            ),
         )
     )
 
-    assert out["paper_summary"]
+    assert "rheology" in out["paper_summary"].lower()
+    assert out["key_topics"]
     assert out["sections"]
-    assert any("one chunk of a paper markdown transcript" in p for p in calls)
+    assert any(sec.get("title") == "Methods" for sec in out["sections"])
+
+
+def test_extract_bibliography_is_deterministic():
+    out = asyncio.run(
+        cli._extract_bibliography(
+            client=object(),  # type: ignore[arg-type]
+            metadata_model="m",
+            first_page_markdown=(
+                "A Deterministic OCR Metadata Pipeline for Born-Digital Papers\n\n"
+                "Jane Doe, John Smith\n\n"
+                "Journal of OCR Systems 12(3): 45-59 (2021)\n"
+                "doi:10.1000/xyz-123\n"
+            ),
+        )
+    )
+
+    assert out["title"] == "A Deterministic OCR Metadata Pipeline for Born-Digital Papers"
+    assert out["authors"] == ["Jane Doe", "John Smith"]
+    assert out["year"] == "2021"
+    assert out["doi"] == "10.1000/xyz-123"

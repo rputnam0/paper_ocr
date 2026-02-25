@@ -20,22 +20,15 @@ from openai import AsyncOpenAI
 
 from .anchoring import build_anchored_prompt, build_unanchored_prompt, extract_anchors
 from .bibliography import (
-    bibliography_prompt,
     citation_from_bibliography,
-    extract_json_object,
+    extract_bibliography_deterministic,
     normalize_bibliography,
 )
-from .client import call_olmocr, call_text_model
+from .client import call_olmocr
 from .data_audit import format_audit_report, run_data_audit
 from .discoverability import (
-    abstract_extraction_prompt,
-    discoverability_aggregate_prompt,
-    discoverability_chunk_prompt,
-    first_pages_excerpt,
-    is_useful_discovery,
-    normalize_discovery,
+    extract_discovery_deterministic,
     render_group_readme,
-    split_markdown_for_discovery,
 )
 from .doi_resolution import DoiResolutionConfig, resolve_dois
 from .facts import export_facts_for_doc
@@ -922,6 +915,8 @@ async def _extract_bibliography(
     metadata_model: str,
     first_page_markdown: str,
 ) -> dict[str, Any]:
+    _ = client
+    _ = metadata_model
     if not first_page_markdown.strip():
         return {
             "title": "",
@@ -931,19 +926,7 @@ async def _extract_bibliography(
             "doi": "",
             "citation": "",
         }
-
-    try:
-        prompt = bibliography_prompt(first_page_markdown)
-        response = await call_text_model(
-            client=client,
-            model=metadata_model,
-            prompt=prompt,
-            max_tokens=800,
-        )
-        raw = extract_json_object(response.content)
-        parsed = normalize_bibliography(raw)
-    except Exception:
-        parsed = normalize_bibliography({})
+    parsed = extract_bibliography_deterministic(first_page_markdown)
 
     return {
         "title": parsed.title,
@@ -968,118 +951,13 @@ async def _extract_discovery(
     page_count: int,
     consolidated_markdown: str,
 ) -> dict[str, Any]:
-    if not consolidated_markdown.strip():
-        return {"paper_summary": "", "key_topics": [], "sections": []}
-
-    async def _json_call(
-        prompt: str,
-        max_tokens: int,
-        schema: str,
-        attempts: int = 4,
-    ) -> dict[str, Any]:
-        for _ in range(attempts):
-            try:
-                response = await call_text_model(
-                    client=client,
-                    model=metadata_model,
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                )
-                candidates = [response.content or "", response.reasoning_content or ""]
-                for c in candidates:
-                    raw = extract_json_object(c)
-                    if isinstance(raw, dict) and raw:
-                        return raw
-                reasoning = (response.reasoning_content or "").strip()
-                if reasoning:
-                    repair_prompt = (
-                        "Convert these draft notes into one strict JSON object.\n"
-                        "Output JSON only, no prose.\n"
-                        f"Schema:\n{schema}\n\n"
-                        f"Notes:\n{reasoning[:7000]}"
-                    )
-                    repaired = await call_text_model(
-                        client=client,
-                        model=metadata_model,
-                        prompt=repair_prompt,
-                        max_tokens=max_tokens,
-                    )
-                    for c in [repaired.content or "", repaired.reasoning_content or ""]:
-                        raw = extract_json_object(c)
-                        if isinstance(raw, dict) and raw:
-                            return raw
-            except Exception:
-                continue
-        return {}
-
-    abstract_schema = '{' '"abstract":"...",' '"key_topics":["..."],' '}'
-    excerpt = first_pages_excerpt(consolidated_markdown, max_pages=5)
-    abstract_prompt = abstract_extraction_prompt(
-        title=str(bibliography.get("title", "")),
-        citation=str(bibliography.get("citation", "")),
+    _ = client
+    _ = metadata_model
+    _ = bibliography
+    return extract_discovery_deterministic(
+        consolidated_markdown=consolidated_markdown,
         page_count=page_count,
-        first_pages_markdown=excerpt,
     )
-    abstract_raw = await _json_call(abstract_prompt, max_tokens=700, schema=abstract_schema)
-    base_discovery = {"paper_summary": "", "key_topics": [], "sections": []}
-    if abstract_raw:
-        base_discovery = normalize_discovery(
-            {
-                "paper_summary": str(abstract_raw.get("abstract", "")).strip(),
-                "key_topics": abstract_raw.get("key_topics", []),
-                "sections": [],
-            },
-            page_count=page_count,
-        )
-    chunks = split_markdown_for_discovery(consolidated_markdown, max_chars=32000)
-    chunk_payloads: list[dict[str, Any]] = []
-    if chunks:
-        chunk_schema = (
-            '{'
-            '"chunk_summary":"...",'
-            '"key_topics":["..."],'
-            '"sections":[{"title":"...","start_page":1,"end_page":1,"summary":"..."}]'
-            '}'
-        )
-        for idx, chunk in enumerate(chunks, start=1):
-            prompt = discoverability_chunk_prompt(
-                title=str(bibliography.get("title", "")),
-                citation=str(bibliography.get("citation", "")),
-                page_count=page_count,
-                chunk_index=idx,
-                chunk_count=len(chunks),
-                markdown_chunk=chunk,
-            )
-            raw = await _json_call(prompt, max_tokens=1000, schema=chunk_schema)
-            if isinstance(raw, dict) and raw:
-                chunk_payloads.append(raw)
-
-    if chunk_payloads:
-        agg_schema = (
-            '{'
-            '"paper_summary":"...",'
-            '"key_topics":["..."],'
-            '"sections":[{"title":"...","start_page":1,"end_page":1,"summary":"..."}]'
-            '}'
-        )
-        agg_prompt = discoverability_aggregate_prompt(
-            title=str(bibliography.get("title", "")),
-            citation=str(bibliography.get("citation", "")),
-            page_count=page_count,
-            chunk_outputs=chunk_payloads,
-        )
-        agg_raw = await _json_call(agg_prompt, max_tokens=1200, schema=agg_schema)
-        agg_discovery = normalize_discovery(agg_raw, page_count=page_count) if agg_raw else {"paper_summary": "", "key_topics": [], "sections": []}
-        if agg_discovery.get("sections"):
-            if not agg_discovery.get("paper_summary"):
-                agg_discovery["paper_summary"] = str(base_discovery.get("paper_summary", ""))
-            if not agg_discovery.get("key_topics"):
-                agg_discovery["key_topics"] = list(base_discovery.get("key_topics", []))
-            return agg_discovery
-
-    if is_useful_discovery(base_discovery):
-        return base_discovery
-    return {"paper_summary": "", "key_topics": [], "sections": []}
 
 
 def _move_first_page_artifacts(
