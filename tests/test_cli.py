@@ -1576,6 +1576,65 @@ def test_process_page_uses_ocr_for_low_quality_text_layer(monkeypatch, tmp_path:
     assert ocr_calls["count"] == 1
 
 
+def test_process_page_honors_unanchored_mode_even_when_text_layer_is_reliable(monkeypatch, tmp_path: Path):
+    dirs = cli.ensure_dirs(tmp_path / "doc")
+    page = _FakePage(page_dict={"blocks": []}, text="Deterministic born-digital page text.\n")
+    doc = _FakeDocForPageProcessing(page)
+    ocr_calls = {"count": 0}
+
+    class _Render:
+        format = "png"
+        image_bytes = b"img"
+        mime_type = "image/png"
+
+    class _Response:
+        content = "ignored"
+        usage = {"total_tokens": 12}
+        raw = {"ok": True}
+
+    class _Parsed:
+        markdown = "OCR output"
+        metadata = {"is_rotation_valid": True}
+
+    async def _fake_ocr(**kwargs):  # noqa: ANN001
+        _ = kwargs
+        ocr_calls["count"] += 1
+        return _Response()
+
+    monkeypatch.setattr(cli, "render_page", lambda *args, **kwargs: _Render())
+    monkeypatch.setattr(cli, "build_unanchored_prompt", lambda *args, **kwargs: ("prompt", "builder"))
+    monkeypatch.setattr(cli, "parse_yaml_front_matter", lambda *args, **kwargs: _Parsed())
+    monkeypatch.setattr(cli, "call_olmocr", _fake_ocr)
+
+    result = asyncio.run(
+        cli._process_page(
+            semaphore=asyncio.Semaphore(1),
+            client=object(),  # type: ignore[arg-type]
+            doc=doc,  # type: ignore[arg-type]
+            page_index=0,
+            mode="unanchored",
+            max_tokens=64,
+            model="m",
+            scan_preprocess=False,
+            debug=False,
+            dirs=dirs,
+            force=False,
+            text_only_enabled=True,
+            heuristics_override=TextHeuristics(
+                char_count=180,
+                printable_ratio=0.995,
+                cid_ratio=0.0,
+                replacement_char_ratio=0.0,
+                avg_token_length=5.2,
+            ),
+        )
+    )
+
+    assert result["route"] == "unanchored"
+    assert result["status"] == "ok"
+    assert ocr_calls["count"] == 1
+
+
 def test_ensure_header_ocr_artifacts_generates_only_missing(monkeypatch, tmp_path: Path):
     doc_dir = tmp_path / "doc"
     marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"

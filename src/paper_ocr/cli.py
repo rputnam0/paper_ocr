@@ -1163,7 +1163,7 @@ async def _process_page(
     page_width = float(page.rect.width)
     page_height = float(page.rect.height)
 
-    text_only = text_only_enabled and (
+    text_only = text_only_enabled and route == "anchored" and (
         is_text_only_candidate(heuristics) or is_reliable_text_layer_candidate(heuristics)
     )
 
