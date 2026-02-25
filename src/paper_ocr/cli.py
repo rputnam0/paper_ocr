@@ -33,7 +33,7 @@ from .discoverability import (
 from .doi_resolution import DoiResolutionConfig, resolve_dois
 from .facts import export_facts_for_doc
 from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_group_name
-from .inspect import compute_text_heuristics, decide_route, is_text_only_candidate
+from .inspect import compute_text_heuristics, decide_route, is_reliable_text_layer_candidate, is_text_only_candidate
 from .postprocess import parse_yaml_front_matter
 from .render import render_page
 from .schemas import new_manifest
@@ -1163,7 +1163,9 @@ async def _process_page(
     page_width = float(page.rect.width)
     page_height = float(page.rect.height)
 
-    text_only = text_only_enabled and route == "anchored" and is_text_only_candidate(heuristics)
+    text_only = text_only_enabled and route == "anchored" and (
+        is_text_only_candidate(heuristics) or is_reliable_text_layer_candidate(heuristics)
+    )
 
     if text_only:
         text = page.get_text("text")

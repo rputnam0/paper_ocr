@@ -65,6 +65,9 @@ def decide_route(heuristics: TextHeuristics, mode: str = "auto") -> str:
     if mode in {"anchored", "unanchored"}:
         return mode
 
+    if is_reliable_text_layer_candidate(heuristics):
+        return "anchored"
+
     if (
         heuristics.char_count >= 200
         and heuristics.printable_ratio >= 0.85
@@ -80,6 +83,18 @@ def is_text_only_candidate(heuristics: TextHeuristics) -> bool:
         and heuristics.printable_ratio >= 0.9
         and heuristics.cid_ratio <= 0.01
         and heuristics.replacement_char_ratio <= 0.001
+    )
+
+
+def is_reliable_text_layer_candidate(heuristics: TextHeuristics) -> bool:
+    # Lower text-density gate than `is_text_only_candidate`, but stronger
+    # encoding-quality checks to avoid scan/OCR-noise false positives.
+    return (
+        heuristics.char_count >= 160
+        and heuristics.printable_ratio >= 0.97
+        and heuristics.cid_ratio <= 0.005
+        and heuristics.replacement_char_ratio <= 0.0005
+        and 2.0 <= heuristics.avg_token_length <= 12.0
     )
 
 
