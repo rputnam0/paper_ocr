@@ -843,7 +843,7 @@ def _fails_quality(metrics: dict[str, Any]) -> bool:
     )
 
 
-def _catastrophic_quality(headers: list[str], rows: list[list[str]], metrics: dict[str, Any]) -> tuple[bool, str]:
+def _catastrophic_quality(headers: list[str], rows: list[list[str]]) -> tuple[bool, str]:
     # Catastrophic outputs are excluded from exported dataset to avoid high-confidence bad tables.
     if not rows:
         return True, "no_data_rows"
@@ -2031,7 +2031,7 @@ def build_structured_exports(
                         details="merged_with_next_page_fragment",
                     )
                 )
-            catastrophic, catastrophic_reason = _catastrophic_quality(headers, rows, metrics)
+            catastrophic, catastrophic_reason = _catastrophic_quality(headers, rows)
             if catastrophic:
                 page_ocr_tables = ocr_tables_by_page.get(int(page), [])
                 ocr_fallback = _select_ocr_fallback_for_marker_table(headers, rows, page_ocr_tables)
@@ -2043,7 +2043,7 @@ def build_structured_exports(
                         if isinstance(r, list)
                     ]
                     ocr_metrics = _quality_metrics(ocr_headers, ocr_rows)
-                    ocr_catastrophic, ocr_reason = _catastrophic_quality(ocr_headers, ocr_rows, ocr_metrics)
+                    ocr_catastrophic, ocr_reason = _catastrophic_quality(ocr_headers, ocr_rows)
                     if not ocr_catastrophic:
                         headers = ocr_headers
                         rows = ocr_rows
@@ -2070,7 +2070,7 @@ def build_structured_exports(
                         fb_rows = [list(r) for r in fallback.get("rows", []) if isinstance(r, list)]
                         fb_caption = str(fallback.get("caption", "")).strip()
                         fb_metrics = _quality_metrics(fb_headers, fb_rows)
-                        fb_catastrophic, fb_reason = _catastrophic_quality(fb_headers, fb_rows, fb_metrics)
+                        fb_catastrophic, fb_reason = _catastrophic_quality(fb_headers, fb_rows)
                         if not fb_catastrophic:
                             headers = fb_headers
                             rows = fb_rows

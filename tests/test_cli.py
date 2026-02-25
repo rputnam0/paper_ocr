@@ -38,7 +38,9 @@ class _FakeOpen:
         self._doc._closed = True
 
 
-async def _fake_extract_discovery(*args, **kwargs):
+def _fake_extract_discovery(page_count: int, consolidated_markdown: str):
+    _ = page_count
+    _ = consolidated_markdown
     return {"paper_summary": "", "key_topics": [], "sections": []}
 
 
@@ -84,7 +86,6 @@ def test_process_pdf_uses_cached_page_count_after_close(monkeypatch, tmp_path: P
         debug=False,
         scan_preprocess=False,
         text_only=False,
-        metadata_model="meta",
     )
 
     monkeypatch.setenv("DEEPINFRA_API_KEY", "test-key")
@@ -1118,52 +1119,6 @@ def test_fetch_telegram_normalizes_job_slug(monkeypatch, tmp_path: Path):
     assert config.in_dir == tmp_path / "jobs" / "my_papers" / "pdfs"
 
 
-def test_fetch_telegram_migrates_legacy_default_job_dir(monkeypatch, tmp_path: Path):
-    monkeypatch.chdir(tmp_path)
-    args = argparse.Namespace(
-        doi_csv=tmp_path / "papers.csv",
-        output_root=Path("data/jobs"),
-        doi_column="DOI",
-        target_bot="@example_bot",
-        session_name="nexus_session",
-        min_delay=10.0,
-        max_delay=20.0,
-        response_timeout=60,
-        search_timeout=40,
-        report_file=None,
-        failed_file=None,
-        debug=False,
-        resolve_dois=False,
-        url_column=None,
-        title_column=None,
-        author_column=None,
-        year_column=None,
-        container_column=None,
-        crossref_mailto="",
-        resolve_rows=5,
-        resolve_timeout=20,
-        resolve_max_retries=3,
-        resolve_cache=True,
-        resolve_refresh_cache=False,
-        scihub_fallback=True,
-        scihub_timeout=45,
-        scihub_base_urls="",
-    )
-    args.doi_csv.write_text("DOI\n10.1000/abc\n")
-    legacy_job = tmp_path / "data" / "telegram_jobs" / "papers"
-    (legacy_job / "reports").mkdir(parents=True, exist_ok=True)
-    (legacy_job / "reports" / "download_index.json").write_text("{}")
-
-    monkeypatch.setenv("TG_API_ID", "123")
-    monkeypatch.setenv("TG_API_HASH", "abc")
-    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
-
-    asyncio.run(cli._run_fetch_telegram(args))
-
-    assert not legacy_job.exists()
-    assert (tmp_path / "data" / "jobs" / "papers" / "reports" / "download_index.json").exists()
-
-
 def test_fetch_telegram_keeps_input_csv_outside_job_folder(monkeypatch, tmp_path: Path):
     output_root = tmp_path / "jobs"
     doi_csv = tmp_path / "papers.csv"
@@ -1393,34 +1348,6 @@ def test_render_dims_for_route_matches_truncation_behavior():
     assert h == 3300
 
 
-def test_final_doc_dir_avoids_collision_on_different_sha(monkeypatch, tmp_path: Path):
-    args = argparse.Namespace(out_dir=tmp_path / "out")
-    pdf_parent = tmp_path / "in"
-    pdf_parent.mkdir()
-    pdf_path = pdf_parent / "paper.pdf"
-    pdf_path.write_bytes(b"pdf")
-    monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
-    out = cli._final_doc_dir(args, pdf_path, {"authors": ["Doe, Jane"], "year": "2024", "title": "T"})
-    assert out.name == "doc_abc123def456"
-
-
-def test_final_doc_dir_avoids_non_manifest_existing_folder(monkeypatch, tmp_path: Path):
-    args = argparse.Namespace(out_dir=tmp_path / "out")
-    pdf_parent = tmp_path / "in"
-    pdf_parent.mkdir()
-    pdf_path = pdf_parent / "paper.pdf"
-    pdf_path.write_bytes(b"pdf")
-    group_dir = args.out_dir / "in"
-    candidate = group_dir / "doc_abc123def456"
-    candidate.mkdir(parents=True)
-    (candidate / "orphan.txt").write_text("orphan")
-
-    monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
-
-    out = cli._final_doc_dir(args, pdf_path, {"authors": ["Doe, Jane"], "year": "2024", "title": "T"})
-    assert out.name == "doc_abc123def456"
-
-
 def test_process_pdf_skips_when_manifest_sha_matches(monkeypatch, tmp_path: Path):
     in_dir = tmp_path / "in"
     in_dir.mkdir()
@@ -1438,7 +1365,6 @@ def test_process_pdf_skips_when_manifest_sha_matches(monkeypatch, tmp_path: Path
         debug=False,
         scan_preprocess=False,
         text_only=False,
-        metadata_model="meta",
     )
     monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
     doc_dir = out_dir / "in" / "doc_abc123def456"
@@ -1710,29 +1636,24 @@ def test_process_page_structured_failure_uses_fallback(monkeypatch, tmp_path: Pa
 
 
 def test_extract_discovery_can_return_sections_without_grobid():
-    out = asyncio.run(
-        cli._extract_discovery(
-            client=object(),  # type: ignore[arg-type]
-            metadata_model="m",
-            bibliography={"title": "T", "citation": "C"},
-            page_count=10,
-            consolidated_markdown=(
-                "# Page 1\n"
-                "Sample Paper Title\n\n"
-                "## Abstract\n"
-                "This paper studies rheology in polymer solutions and summarizes deterministic extraction.\n\n"
-                "## Introduction\n"
-                "We motivate deterministic metadata extraction from OCR markdown.\n\n"
-                "# Page 2\n"
-                "## Methods\n"
-                "We parse headings and abstract text directly.\n\n"
-                "## Results\n"
-                "The parser produces stable JSON artifacts.\n\n"
-                "# Page 3\n"
-                "## Conclusion\n"
-                "Deterministic metadata replaced the LLM step.\n"
-            ),
-        )
+    out = cli._extract_discovery(
+        page_count=10,
+        consolidated_markdown=(
+            "# Page 1\n"
+            "Sample Paper Title\n\n"
+            "## Abstract\n"
+            "This paper studies rheology in polymer solutions and summarizes deterministic extraction.\n\n"
+            "## Introduction\n"
+            "We motivate deterministic metadata extraction from OCR markdown.\n\n"
+            "# Page 2\n"
+            "## Methods\n"
+            "We parse headings and abstract text directly.\n\n"
+            "## Results\n"
+            "The parser produces stable JSON artifacts.\n\n"
+            "# Page 3\n"
+            "## Conclusion\n"
+            "Deterministic metadata replaced the LLM step.\n"
+        ),
     )
 
     assert "rheology" in out["paper_summary"].lower()
@@ -1742,17 +1663,13 @@ def test_extract_discovery_can_return_sections_without_grobid():
 
 
 def test_extract_bibliography_is_deterministic():
-    out = asyncio.run(
-        cli._extract_bibliography(
-            client=object(),  # type: ignore[arg-type]
-            metadata_model="m",
-            first_page_markdown=(
-                "A Deterministic OCR Metadata Pipeline for Born-Digital Papers\n\n"
-                "Jane Doe, John Smith\n\n"
-                "Journal of OCR Systems 12(3): 45-59 (2021)\n"
-                "doi:10.1000/xyz-123\n"
-            ),
-        )
+    out = cli._extract_bibliography(
+        first_page_markdown=(
+            "A Deterministic OCR Metadata Pipeline for Born-Digital Papers\n\n"
+            "Jane Doe, John Smith\n\n"
+            "Journal of OCR Systems 12(3): 45-59 (2021)\n"
+            "doi:10.1000/xyz-123\n"
+        ),
     )
 
     assert out["title"] == "A Deterministic OCR Metadata Pipeline for Born-Digital Papers"

@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover - exercised only when dependency missing
 try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover - exercised only when dependency missing
-    def tqdm(iterable, **kwargs):  # type: ignore[no-redef]
+    def tqdm(iterable, **_kwargs):  # type: ignore[no-redef]
         return iterable
 
 

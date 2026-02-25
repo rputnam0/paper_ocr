@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
@@ -52,67 +51,6 @@ def _is_placeholder_value(value: str) -> bool:
     return False
 
 
-def discoverability_prompt(
-    title: str,
-    citation: str,
-    page_count: int,
-    markdown_excerpt: str,
-) -> str:
-    return (
-        "You are extracting structured paper-discovery metadata from OCR markdown.\n"
-        "Respond with a SINGLE JSON object in assistant content only.\n"
-        "Do not include analysis, markdown, code fences, or extra text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{"
-        '"paper_summary": "<summary text>", '
-        '"key_topics": ["<topic>"], '
-        '"sections": ['
-        '{"title":"<section title>","start_page":1,"end_page":1,"summary":"<section summary>"}'
-        "]"
-        "}\n"
-        "Rules:\n"
-        "- Do NOT use placeholder words like 'string' or '<topic>' in output values.\n"
-        "- Keep paper_summary to 1-3 sentences.\n"
-        "- key_topics should be concise (3-8 entries).\n"
-        "- sections should cover major content regions in reading order.\n"
-        "- start_page/end_page are 1-based and between 1 and page_count.\n"
-        "- If uncertain, still return best-effort fields; never include extra keys.\n\n"
-        f"Title: {title or '(unknown)'}\n"
-        f"Citation: {citation or '(unknown)'}\n"
-        f"Page count: {page_count}\n\n"
-        "OCR markdown excerpt:\n"
-        f"{markdown_excerpt}"
-    )
-
-
-def abstract_extraction_prompt(
-    title: str,
-    citation: str,
-    page_count: int,
-    first_pages_markdown: str,
-) -> str:
-    return (
-        "You extract the paper abstract from OCR markdown.\n"
-        "Respond with a SINGLE JSON object in assistant content only.\n"
-        "Do not include analysis, markdown, code fences, or extra text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{"
-        '"abstract":"<abstract text>",'
-        '"key_topics":["<topic>"]'
-        "}\n"
-        "Rules:\n"
-        "- Prefer the explicit abstract section when present.\n"
-        "- If no explicit abstract exists, provide a brief high-level summary from the opening pages.\n"
-        "- key_topics should be concise (3-8 entries).\n"
-        "- Do NOT use placeholder values like 'string' or '...'.\n\n"
-        f"Title: {title or '(unknown)'}\n"
-        f"Citation: {citation or '(unknown)'}\n"
-        f"Page count: {page_count}\n\n"
-        "First pages markdown:\n"
-        f"{first_pages_markdown}"
-    )
-
-
 def first_pages_excerpt(markdown_text: str, max_pages: int = 5) -> str:
     if max_pages < 1:
         max_pages = 1
@@ -126,94 +64,6 @@ def first_pages_excerpt(markdown_text: str, max_pages: int = 5) -> str:
         return text
     cutoff = starts[max_pages].start()
     return text[:cutoff]
-
-
-def discoverability_chunk_prompt(
-    title: str,
-    citation: str,
-    page_count: int,
-    chunk_index: int,
-    chunk_count: int,
-    markdown_chunk: str,
-) -> str:
-    return (
-        "You are extracting discovery metadata from one chunk of a paper markdown transcript.\n"
-        "Respond with a SINGLE JSON object in assistant content only.\n"
-        "Do not include analysis, markdown, code fences, or extra text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{"
-        '"chunk_summary": "<summary text>", '
-        '"key_topics": ["<topic>"], '
-        '"sections": ['
-        '{"title":"<section title>","start_page":1,"end_page":1,"summary":"<section summary>"}'
-        "]"
-        "}\n"
-        "Rules:\n"
-        "- Do NOT use placeholder words like 'string' or '<topic>' in output values.\n"
-        "- Infer absolute page numbers from `# Page N` markers in the chunk.\n"
-        "- Keep chunk_summary to 1-2 sentences.\n"
-        "- If uncertain, return best effort with empty fields as needed.\n\n"
-        f"Title: {title or '(unknown)'}\n"
-        f"Citation: {citation or '(unknown)'}\n"
-        f"Page count: {page_count}\n"
-        f"Chunk: {chunk_index}/{chunk_count}\n\n"
-        "Markdown chunk:\n"
-        f"{markdown_chunk}"
-    )
-
-
-def discoverability_aggregate_prompt(
-    title: str,
-    citation: str,
-    page_count: int,
-    chunk_outputs: list[dict[str, Any]],
-) -> str:
-    return (
-        "You are combining chunk-level paper discovery data into one final structured output.\n"
-        "Respond with a SINGLE JSON object in assistant content only.\n"
-        "Do not include analysis, markdown, code fences, or extra text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{"
-        '"paper_summary": "<summary text>", '
-        '"key_topics": ["<topic>"], '
-        '"sections": ['
-        '{"title":"<section title>","start_page":1,"end_page":1,"summary":"<section summary>"}'
-        "]"
-        "}\n"
-        "Rules:\n"
-        "- Do NOT use placeholder words like 'string' or '<topic>' in output values.\n"
-        "- paper_summary: 2-5 sentences high-level summary of the full paper.\n"
-        "- key_topics: 3-10 concise topics.\n"
-        "- sections: 4-12 major sections in reading order.\n"
-        "- start_page/end_page are absolute 1-based pages.\n\n"
-        f"Title: {title or '(unknown)'}\n"
-        f"Citation: {citation or '(unknown)'}\n"
-        f"Page count: {page_count}\n\n"
-        "Chunk discovery JSON list:\n"
-        f"{json.dumps(chunk_outputs, ensure_ascii=True)}"
-    )
-
-
-def split_markdown_for_discovery(markdown_text: str, max_chars: int = 32000) -> list[str]:
-    if max_chars < 1000:
-        max_chars = 1000
-    text = markdown_text or ""
-    if len(text) <= max_chars:
-        return [text]
-    chunks: list[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        j = min(i + max_chars, n)
-        if j < n:
-            split = text.rfind("\n\n# Page ", i, j)
-            if split > i:
-                j = split
-        if j <= i:
-            j = min(i + max_chars, n)
-        chunks.append(text[i:j])
-        i = j
-    return chunks
 
 
 def normalize_discovery(raw: dict[str, Any], page_count: int) -> dict[str, Any]:

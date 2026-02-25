@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from openai import AsyncOpenAI
 

@@ -54,7 +54,6 @@ from .table_rectifier import RectifierConfig, RectifierResult, run_table_rectifi
 from .table_validation import GeminiValidationConfig, run_gemini_table_validation, summarize_gemini_failures
 from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
-METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
 MIN_DELAY_DEFAULT = "4"
 MAX_DELAY_DEFAULT = "8"
 RESPONSE_TIMEOUT_DEFAULT = 4
@@ -79,7 +78,6 @@ TABLE_LLM_RECTIFIER_TARGET_DEFAULT = "risk"
 TABLE_STRUCTURE_MODEL_DEFAULT = "tatr"
 TABLE_STRUCTURE_TIMEOUT_DEFAULT = 180
 DEFAULT_FETCH_OUTPUT_ROOT = Path("data/jobs")
-LEGACY_FETCH_OUTPUT_ROOT = Path("data/telegram_jobs")
 RESOURCE_GUARD_MIN_MEM_GB_DEFAULT = 24.0
 RESOURCE_GUARD_MIN_CPUS_DEFAULT = 8
 GEMINI_TABLE_VALIDATION_MODEL_DEFAULT = "gemini-2.5-flash"
@@ -106,7 +104,6 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="Enable text-only extraction for high-quality text layers (default: enabled)",
     )
-    run.add_argument("--metadata-model", type=str, default=METADATA_MODEL_DEFAULT)
     run.add_argument(
         "--digital-structured",
         choices=["off", "auto", "on"],
@@ -910,13 +907,9 @@ async def _ensure_header_ocr_artifacts(
     }
 
 
-async def _extract_bibliography(
-    client: AsyncOpenAI,
-    metadata_model: str,
+def _extract_bibliography(
     first_page_markdown: str,
 ) -> dict[str, Any]:
-    _ = client
-    _ = metadata_model
     if not first_page_markdown.strip():
         return {
             "title": "",
@@ -938,22 +931,10 @@ async def _extract_bibliography(
     }
 
 
-def _final_doc_dir(args: argparse.Namespace, pdf_path: Path, bibliography: dict[str, Any]) -> Path:
-    group_dir = args.out_dir / output_group_name(pdf_path)
-    doc_id = doc_id_from_sha(file_sha256(pdf_path))
-    return group_dir / f"doc_{doc_id}"
-
-
-async def _extract_discovery(
-    client: AsyncOpenAI,
-    metadata_model: str,
-    bibliography: dict[str, Any],
+def _extract_discovery(
     page_count: int,
     consolidated_markdown: str,
 ) -> dict[str, Any]:
-    _ = client
-    _ = metadata_model
-    _ = bibliography
     return extract_discovery_deterministic(
         consolidated_markdown=consolidated_markdown,
         page_count=page_count,
@@ -1059,13 +1040,6 @@ def _infer_fetch_job_slug(doi_csv: Path, output_root: Path) -> str:
     return fallback
 
 
-def _is_same_path(a: Path, b: Path) -> bool:
-    try:
-        return a.resolve() == b.resolve()
-    except Exception:  # noqa: BLE001
-        return str(a) == str(b)
-
-
 def _is_path_within(path: Path, parent: Path) -> bool:
     try:
         path.resolve().relative_to(parent.resolve())
@@ -1075,17 +1049,7 @@ def _is_path_within(path: Path, parent: Path) -> bool:
 
 
 def _resolve_fetch_job_dir(output_root: Path, csv_slug: str) -> Path:
-    job_dir = output_root / csv_slug
-    if _is_same_path(output_root, DEFAULT_FETCH_OUTPUT_ROOT):
-        legacy_job_dir = LEGACY_FETCH_OUTPUT_ROOT / csv_slug
-        if legacy_job_dir.exists() and not job_dir.exists():
-            job_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(legacy_job_dir), str(job_dir))
-            print(
-                "[fetch-telegram] migrated legacy job folder "
-                f"{legacy_job_dir} -> {job_dir}"
-            )
-    return job_dir
+    return output_root / csv_slug
 
 
 async def _process_page_structured(
@@ -1464,7 +1428,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             first_page = await _process_one_page(0, dirs)
             first_page_md = Path(first_page["output_files"].get("markdown", ""))
             first_page_text = first_page_md.read_text() if first_page_md.exists() else ""
-            bibliography = await _extract_bibliography(client, args.metadata_model, first_page_text)
+            bibliography = _extract_bibliography(first_page_text)
             if structured_enabled and structured_backend == "hybrid" and grobid_url.strip():
                 grobid_result = await asyncio.to_thread(
                     run_grobid_doc,
@@ -1619,13 +1583,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         consolidated_text = "".join(md_out).strip() + "\n"
         write_text(doc_dir / consolidated_name, consolidated_text)
         write_text(final_dirs["metadata"] / "document.jsonl", "\n".join(jsonl_out) + "\n")
-        discovery = await _extract_discovery(
-            client=client,
-            metadata_model=args.metadata_model,
-            bibliography=bibliography,
-            page_count=page_count,
-            consolidated_markdown=consolidated_text,
-        )
+        discovery = _extract_discovery(page_count=page_count, consolidated_markdown=consolidated_text)
         if grobid_sections:
             discovered_sections = discovery.get("sections", []) or []
             grobid_high_conf = (

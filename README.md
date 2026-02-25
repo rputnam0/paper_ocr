@@ -134,7 +134,6 @@ Core options:
 - `--debug`
 - `--scan-preprocess`
 - `--text-only` / `--no-text-only` (default: `--text-only`)
-- `--metadata-model` default `nvidia/Nemotron-3-Nano-30B-A3B`
 - `--digital-structured off|auto|on` default `auto`
 - `--structured-backend marker|hybrid` default `hybrid`
 - `--marker-command` default `marker_single`
@@ -196,9 +195,6 @@ Fetch options:
 - `--debug`
 - `--report-file` override report path
 - `--failed-file` override failed-report path
-
-Compatibility note:
-- Legacy jobs under `data/telegram_jobs/<job_slug>/` are auto-migrated to `data/jobs/<job_slug>/` when using the default `output_root`.
 
 ### 3) Resolve and canonicalize DOIs (standalone preflight)
 

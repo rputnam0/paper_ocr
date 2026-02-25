@@ -83,27 +83,6 @@ def normalize_bibliography(raw: dict[str, Any]) -> BibliographyInfo:
     )
 
 
-def bibliography_prompt(first_page_markdown: str) -> str:
-    return (
-        "You are extracting citation metadata from the first page of an academic paper.\n"
-        "Return ONLY valid JSON with this exact schema:\n"
-        '{'
-        '"title": "string", '
-        '"authors": ["string"], '
-        '"year": "YYYY", '
-        '"journal_ref": "string", '
-        '"doi": "string"'
-        "}\n"
-        "Rules:\n"
-        "- Use authors in display order.\n"
-        "- Keep `journal_ref` concise, e.g. journal, volume(issue), pages.\n"
-        "- `doi` should be bare DOI without URL prefix when available.\n"
-        "- If a field is unknown, return an empty string (or empty list for authors).\n\n"
-        "First page markdown:\n"
-        f"{first_page_markdown}"
-    )
-
-
 def _snake(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_")
 

@@ -24,7 +24,7 @@ Key behaviors:
 - Routes pages to **anchored** or **unanchored** OCR prompts based on text-layer heuristics.
 - Renders pages to images with the **longest dimension capped at 1288 px**.
 - Parses YAML front matter from model output and writes markdown + metadata per page.
-- Extracts bibliographic metadata from first-page markdown using `nvidia/Nemotron-3-Nano-30B-A3B` by default.
+- Extracts bibliographic metadata from first-page markdown using deterministic parsing.
 - Names each output document folder as `doc_<doc_id>` (deterministic from source hash).
 - Uses a stable consolidated markdown filename: `document.md`.
 - Extracts discovery metadata (`paper_summary`, `key_topics`) from the first few pages (abstract-first).
@@ -45,7 +45,6 @@ Options:
 - `--debug` write request/response payloads per page
 - `--scan-preprocess` enable mild scan preprocessing
 - `--text-only` enable high-quality text-layer extraction (skips VLM)
-- `--metadata-model <str>` default `nvidia/Nemotron-3-Nano-30B-A3B`
 
 Example:
 - `uv run paper-ocr run data/LISA out`
