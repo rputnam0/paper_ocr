@@ -771,6 +771,7 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
         )
 
     monkeypatch.setattr(cli, "run_table_rectification_for_doc", _fake_rectify)
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "test-key")
 
     args = argparse.Namespace(
         ocr_out_dir=root,
