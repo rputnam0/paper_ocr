@@ -1,10 +1,8 @@
 from paper_ocr.discoverability import (
-    abstract_extraction_prompt,
     first_pages_excerpt,
     is_useful_discovery,
     normalize_discovery,
     render_group_readme,
-    split_markdown_for_discovery,
 )
 
 
@@ -56,13 +54,6 @@ def test_render_group_readme_includes_locations_and_sections():
     assert "Method (pp. 12-45)" in text
 
 
-def test_split_markdown_for_discovery_covers_all_text():
-    text = "A" * 35000 + "B" * 35000 + "C" * 1000
-    chunks = split_markdown_for_discovery(text, max_chars=32000)
-    assert len(chunks) >= 3
-    assert "".join(chunks) == text
-
-
 def test_is_useful_discovery_rejects_placeholder_values():
     bad = {"paper_summary": "string", "key_topics": ["string"], "sections": [{"title": "string"}]}
     good = {"paper_summary": "This paper analyzes instability in liquid sheets.", "key_topics": ["instability"], "sections": []}
@@ -78,8 +69,3 @@ def test_first_pages_excerpt_limits_by_page_marker():
     assert "# Page 1" in out
     assert "# Page 3" in out
     assert "# Page 4" not in out
-
-
-def test_abstract_prompt_mentions_abstract_task():
-    prompt = abstract_extraction_prompt("Title", "Citation", 10, "# Page 1\nAbstract text")
-    assert "extract the paper abstract" in prompt.lower()

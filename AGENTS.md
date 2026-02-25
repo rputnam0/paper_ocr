@@ -4,7 +4,14 @@
 - Use `uv` for Python workflows instead of `pip`.
   - Install deps: `uv sync`
   - Run CLI: `uv run paper-ocr run <in_dir> <out_dir>`
-  - Run tests: `uv run pytest`
+  - Run tests (fast lane, default): `uv run pytest`
+  - Run full suite (pre-merge/CI parity): `uv run pytest --run-integration --run-slow --run-network --run-service --run-gpu`
+- Run normal/lightweight tasks locally on this machine by default.
+- Use WSL only for heavy structured workloads that need GPU-backed services:
+  - Marker service workloads
+  - GROBID document parsing workloads
+- Access WSL services through SSH alias `wsl` with local port forwarding.
+- Do not run local Marker CLI extraction unless explicitly requested by the user.
 - Make **frequent git commits** after meaningful additions to the codebase.
 - Use **test-driven development** for new features.
   - Write tests first, then implement.
@@ -17,9 +24,9 @@ Key behaviors:
 - Routes pages to **anchored** or **unanchored** OCR prompts based on text-layer heuristics.
 - Renders pages to images with the **longest dimension capped at 1288 px**.
 - Parses YAML front matter from model output and writes markdown + metadata per page.
-- Extracts bibliographic metadata from first-page markdown using `nvidia/Nemotron-3-Nano-30B-A3B` by default.
-- Names each output document folder from extracted author/year metadata.
-- Names each consolidated markdown file from extracted paper title.
+- Extracts bibliographic metadata from first-page markdown using deterministic parsing.
+- Names each output document folder as `doc_<doc_id>` (deterministic from source hash).
+- Uses a stable consolidated markdown filename: `document.md`.
 - Extracts discovery metadata (`paper_summary`, `key_topics`) from the first few pages (abstract-first).
 - Writes group-level paper index README files for fast folder-level discoverability.
 - Produces a full output bundle per PDF, including manifest, debug artifacts, and assembled document files.
@@ -38,7 +45,6 @@ Options:
 - `--debug` write request/response payloads per page
 - `--scan-preprocess` enable mild scan preprocessing
 - `--text-only` enable high-quality text-layer extraction (skips VLM)
-- `--metadata-model <str>` default `nvidia/Nemotron-3-Nano-30B-A3B`
 
 Example:
 - `uv run paper-ocr run data/LISA out`
@@ -52,8 +58,8 @@ For each PDF:
 ```
 out/<input_parent>/
   README.md
-out/<input_parent>/<author_year>/
-  <paper_title>.md
+out/<input_parent>/doc_<doc_id>/
+  document.md
   pages/
     0001.md
     0002.md
@@ -82,9 +88,16 @@ out/<input_parent>/<author_year>/
 - `src/paper_ocr/schemas.py` manifest construction
 
 ## Testing
-- Run tests with: `uv run pytest`
+- Fast lane (default local): `uv run pytest`
+  - Skips tests marked `integration`, `slow`, `network`, `service`, `gpu`.
+- Full lane (required before merge): `uv run pytest --run-integration --run-slow --run-network --run-service --run-gpu`
+- Optional full-lane env toggle: `PAPER_OCR_TEST_FULL=1 uv run pytest`
 - Add tests in `tests/` for each new feature or bugfix.
 - Tests are required for new additions and must pass.
+- Useful local iteration commands:
+  - Last failed only: `uv run pytest --lf`
+  - Failed-first ordering: `uv run pytest --ff`
+  - Subset filter: `uv run pytest -k "<expr>"`
 
 ## Best Practices
 - Preserve stable output (idempotent writes unless `--force`).
@@ -112,7 +125,12 @@ Validation command:
 - Do not write final `paper-ocr run` outputs under `data/jobs`; use `out/<...>`.
 
 ## Remote Service Guidance (Marker/GROBID)
-- Prefer service URLs for heavy structured extraction when running from low-resource clients.
+- This machine is a low-resource MacBook Air; keep non-heavy processing local.
+- Use WSL-hosted services only for heavy GPU-oriented structured extraction and GROBID document parsing.
+- Treat local CLI extraction as fallback only when the user explicitly requests it.
+- `paper-ocr run` enforces a resource guard for structured extraction:
+  - If `--digital-structured auto|on` and `--marker-url` is missing on a low-resource host, run fails fast and instructs WSL service usage.
+  - Override only when explicitly requested: `--allow-local-heavy` or `PAPER_OCR_ALLOW_LOCAL_HEAVY=1`.
 - `paper-ocr run` supports both:
   - Marker CLI mode: `--marker-command ...`
   - Marker service mode: `--marker-url <base_url>`
@@ -123,7 +141,17 @@ Validation command:
 - Service health checks before long runs:
   - Marker: `GET <marker_url>/openapi.json`
   - GROBID: `GET <grobid_url>/api/isalive`
-- If services are remote, agents may use SSH local forwarding to bind remote service ports to localhost, then pass localhost URLs to CLI options/env vars.
+- Agents should call WSL as a service endpoint via SSH local forwarding and pass localhost URLs to CLI options/env vars.
+  - Example tunnel:
+    - `ssh -N -L 8008:127.0.0.1:8008 -L 8070:127.0.0.1:8070 wsl`
+  - Example env:
+    - `export PAPER_OCR_MARKER_URL=http://127.0.0.1:8008`
+    - `export PAPER_OCR_GROBID_URL=http://127.0.0.1:8070`
+  - Example preflight checks:
+    - `curl -fsS http://127.0.0.1:8008/openapi.json >/dev/null`
+    - `curl -fsS http://127.0.0.1:8070/api/isalive`
+  - Example run:
+    - `uv run paper-ocr run <in_dir> <out_dir> --marker-url http://127.0.0.1:8008 --grobid-url http://127.0.0.1:8070`
 - Marker OCR must remain disabled by default; do not remove no-OCR safeguards in structured extraction path.
 
 ## Table Pipeline Guardrails

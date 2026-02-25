@@ -21,6 +21,8 @@ import fitz
 
 from .inspect import TextHeuristics, decide_route, is_structured_page_candidate
 
+TRUE_VALUES = {"1", "true", "yes", "on"}
+
 
 @dataclass
 class StructuredPageResult:
@@ -49,6 +51,57 @@ class MarkerDocResult:
     artifacts: dict[str, str] = field(default_factory=dict)
     localization_page_status: dict[int, dict[str, Any]] = field(default_factory=dict)
     error: str = ""
+
+
+def _truthy_env(value: str | None) -> bool:
+    return str(value or "").strip().lower() in TRUE_VALUES
+
+
+def _resolve_marker_url(marker_url: str, env: dict[str, str] | None = None) -> str:
+    env_map = env or dict(os.environ)
+    explicit = str(marker_url or "").strip()
+    if explicit:
+        return explicit
+    return str(env_map.get("PAPER_OCR_MARKER_URL", "") or "").strip()
+
+
+def _marker_service_llm_form_fields(env: dict[str, str] | None = None) -> dict[str, str]:
+    env_map = env or dict(os.environ)
+    if not _truthy_env(env_map.get("PAPER_OCR_MARKER_SERVICE_USE_LLM")):
+        return {}
+
+    fields: dict[str, str] = {"use_llm": "true"}
+    llm_service = str(env_map.get("PAPER_OCR_MARKER_SERVICE_LLM_SERVICE", "") or "").strip()
+    if llm_service:
+        fields["llm_service"] = llm_service
+
+    openai_base_url = str(env_map.get("PAPER_OCR_MARKER_SERVICE_OPENAI_BASE_URL", "") or "").strip()
+    openai_model = str(env_map.get("PAPER_OCR_MARKER_SERVICE_OPENAI_MODEL", "") or "").strip()
+    if openai_base_url:
+        fields["openai_base_url"] = openai_base_url
+    if openai_model:
+        fields["openai_model"] = openai_model
+
+    openai_api_key = str(env_map.get("PAPER_OCR_MARKER_SERVICE_OPENAI_API_KEY", "") or "").strip()
+    if not openai_api_key:
+        openai_api_key = str(env_map.get("DEEPINFRA_API_KEY", "") or "").strip()
+    if openai_api_key:
+        fields["openai_api_key"] = openai_api_key
+    return fields
+
+
+def _local_marker_cli_block_reason(*, marker_url: str, env: dict[str, str] | None = None) -> str:
+    env_map = env or dict(os.environ)
+    if _truthy_env(env_map.get("PAPER_OCR_ALLOW_LOCAL_HEAVY")):
+        return ""
+    if _resolve_marker_url(marker_url, env_map):
+        return ""
+    if _truthy_env(env_map.get("PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED")):
+        return (
+            "Blocked local Marker CLI execution by policy: PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED=1 "
+            "requires --marker-url (or PAPER_OCR_MARKER_URL)."
+        )
+    return ""
 
 
 def is_structured_candidate_doc(
@@ -254,16 +307,18 @@ def _run_marker_page_via_service(
     page_index: int,
 ) -> StructuredPageResult:
     endpoint = marker_url.rstrip("/") + "/marker/upload"
+    form_fields = {
+        "output_format": "markdown",
+        "force_ocr": "false",
+        "paginate_output": "false",
+        **_marker_service_llm_form_fields(),
+    }
     req = _multipart_upload_request(
         url=endpoint,
         file_field="file",
         file_path=single_pdf,
         content_type="application/pdf",
-        form_fields={
-            "output_format": "markdown",
-            "force_ocr": "false",
-            "paginate_output": "false",
-        },
+        form_fields=form_fields,
     )
     try:
         with request.urlopen(req, timeout=timeout) as resp:
@@ -359,6 +414,10 @@ def run_marker_page(
     asset_level: str = "standard",
     marker_url: str = "",
 ) -> StructuredPageResult:
+    guard_error = _local_marker_cli_block_reason(marker_url=marker_url)
+    if guard_error:
+        return StructuredPageResult(success=False, error=guard_error)
+    resolved_marker_url = _resolve_marker_url(marker_url)
     env = os.environ.copy()
     env["OCR_ENGINE"] = "None"
     last_error = ""
@@ -368,9 +427,9 @@ def run_marker_page(
         single_pdf = tmp_dir / f"page_{page_index + 1:04d}.pdf"
         _single_page_pdf(pdf_path, page_index, single_pdf)
 
-        if str(marker_url).strip():
+        if resolved_marker_url:
             return _run_marker_page_via_service(
-                marker_url=marker_url,
+                marker_url=resolved_marker_url,
                 single_pdf=single_pdf,
                 timeout=timeout,
                 assets_root=assets_root,
@@ -879,6 +938,10 @@ def run_marker_doc(
     profile: str = "full_json",
     marker_url: str = "",
 ) -> MarkerDocResult:
+    guard_error = _local_marker_cli_block_reason(marker_url=marker_url)
+    if guard_error:
+        return MarkerDocResult(success=False, error=guard_error)
+    resolved_marker_url = _resolve_marker_url(marker_url)
     marker_root = assets_root / "structured" / "marker"
     marker_root.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -892,18 +955,20 @@ def run_marker_doc(
         tmp_dir = Path(tmp)
         out_dir = tmp_dir / "out"
 
-        if str(marker_url).strip():
-            endpoint = marker_url.rstrip("/") + "/marker/upload"
+        if resolved_marker_url:
+            endpoint = resolved_marker_url.rstrip("/") + "/marker/upload"
+            form_fields = {
+                "output_format": "json" if profile == "full_json" else "markdown",
+                "force_ocr": "false",
+                "paginate_output": "true",
+                **_marker_service_llm_form_fields(),
+            }
             req = _multipart_upload_request(
                 url=endpoint,
                 file_field="file",
                 file_path=pdf_path,
                 content_type="application/pdf",
-                form_fields={
-                    "output_format": "json" if profile == "full_json" else "markdown",
-                    "force_ocr": "false",
-                    "paginate_output": "true",
-                },
+                form_fields=form_fields,
             )
             try:
                 with request.urlopen(req, timeout=timeout) as resp:

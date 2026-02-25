@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "baseline_report": "data/jobs/polymer_viscosity_lit/reports/table_validation_failure_summary_gemini_20260211_rubric.json",
+  "global_targets": {
+    "recommended_reject_max": 1,
+    "recommended_accept_delta_min": 10,
+    "table_present_no_max": 0
+  },
+  "failure_mode_reduction_targets": {
+    "multi_level_header_loss": 0.5,
+    "missing_required_columns": 0.5,
+    "row_shift_or_merge": 0.4,
+    "column_shift_or_merge": 0.4,
+    "partial_table_extracted": 0.4,
+    "symbol_or_unit_loss": 0.5,
+    "split_table_continuation": 1.0
+  },
+  "rubric_targets": {
+    "data_completeness_delta_min": 0.05,
+    "unit_symbol_fidelity_min": 0.9,
+    "context_resolution_delta_min": 0.08
+  }
+}

@@ -1,8 +1,42 @@
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
+
+PAGE_MARKER_RE = re.compile(r"(?m)^# Page (\d+)\s*$")
+MD_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
+PLAIN_SECTION_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)*\s+)?(abstract|introduction|background|methods?|materials and methods|results?|discussion|conclusion|references)\s*$",
+    flags=re.IGNORECASE,
+)
+ABSTRACT_HEADING_RE = re.compile(r"^\s{0,3}(?:#{1,6}\s*)?abstract\s*:?\s*$", flags=re.IGNORECASE)
+KEYWORDS_LINE_RE = re.compile(r"^\s{0,3}(?:#{1,6}\s*)?keywords?\s*:\s*(.+)$", flags=re.IGNORECASE)
+TOPIC_STOPWORDS = {
+    "about",
+    "across",
+    "after",
+    "analysis",
+    "approach",
+    "based",
+    "between",
+    "conclusion",
+    "conclusions",
+    "data",
+    "discussion",
+    "from",
+    "into",
+    "introduction",
+    "method",
+    "methods",
+    "paper",
+    "result",
+    "results",
+    "study",
+    "table",
+    "tables",
+    "using",
+    "with",
+}
 
 
 def _is_placeholder_value(value: str) -> bool:
@@ -15,67 +49,6 @@ def _is_placeholder_value(value: str) -> bool:
     if all(ch in ".-_ " for ch in norm):
         return True
     return False
-
-
-def discoverability_prompt(
-    title: str,
-    citation: str,
-    page_count: int,
-    markdown_excerpt: str,
-) -> str:
-    return (
-        "You are extracting structured paper-discovery metadata from OCR markdown.\n"
-        "Respond with a SINGLE JSON object in assistant content only.\n"
-        "Do not include analysis, markdown, code fences, or extra text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{"
-        '"paper_summary": "<summary text>", '
-        '"key_topics": ["<topic>"], '
-        '"sections": ['
-        '{"title":"<section title>","start_page":1,"end_page":1,"summary":"<section summary>"}'
-        "]"
-        "}\n"
-        "Rules:\n"
-        "- Do NOT use placeholder words like 'string' or '<topic>' in output values.\n"
-        "- Keep paper_summary to 1-3 sentences.\n"
-        "- key_topics should be concise (3-8 entries).\n"
-        "- sections should cover major content regions in reading order.\n"
-        "- start_page/end_page are 1-based and between 1 and page_count.\n"
-        "- If uncertain, still return best-effort fields; never include extra keys.\n\n"
-        f"Title: {title or '(unknown)'}\n"
-        f"Citation: {citation or '(unknown)'}\n"
-        f"Page count: {page_count}\n\n"
-        "OCR markdown excerpt:\n"
-        f"{markdown_excerpt}"
-    )
-
-
-def abstract_extraction_prompt(
-    title: str,
-    citation: str,
-    page_count: int,
-    first_pages_markdown: str,
-) -> str:
-    return (
-        "You extract the paper abstract from OCR markdown.\n"
-        "Respond with a SINGLE JSON object in assistant content only.\n"
-        "Do not include analysis, markdown, code fences, or extra text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{"
-        '"abstract":"<abstract text>",'
-        '"key_topics":["<topic>"]'
-        "}\n"
-        "Rules:\n"
-        "- Prefer the explicit abstract section when present.\n"
-        "- If no explicit abstract exists, provide a brief high-level summary from the opening pages.\n"
-        "- key_topics should be concise (3-8 entries).\n"
-        "- Do NOT use placeholder values like 'string' or '...'.\n\n"
-        f"Title: {title or '(unknown)'}\n"
-        f"Citation: {citation or '(unknown)'}\n"
-        f"Page count: {page_count}\n\n"
-        "First pages markdown:\n"
-        f"{first_pages_markdown}"
-    )
 
 
 def first_pages_excerpt(markdown_text: str, max_pages: int = 5) -> str:
@@ -91,94 +64,6 @@ def first_pages_excerpt(markdown_text: str, max_pages: int = 5) -> str:
         return text
     cutoff = starts[max_pages].start()
     return text[:cutoff]
-
-
-def discoverability_chunk_prompt(
-    title: str,
-    citation: str,
-    page_count: int,
-    chunk_index: int,
-    chunk_count: int,
-    markdown_chunk: str,
-) -> str:
-    return (
-        "You are extracting discovery metadata from one chunk of a paper markdown transcript.\n"
-        "Respond with a SINGLE JSON object in assistant content only.\n"
-        "Do not include analysis, markdown, code fences, or extra text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{"
-        '"chunk_summary": "<summary text>", '
-        '"key_topics": ["<topic>"], '
-        '"sections": ['
-        '{"title":"<section title>","start_page":1,"end_page":1,"summary":"<section summary>"}'
-        "]"
-        "}\n"
-        "Rules:\n"
-        "- Do NOT use placeholder words like 'string' or '<topic>' in output values.\n"
-        "- Infer absolute page numbers from `# Page N` markers in the chunk.\n"
-        "- Keep chunk_summary to 1-2 sentences.\n"
-        "- If uncertain, return best effort with empty fields as needed.\n\n"
-        f"Title: {title or '(unknown)'}\n"
-        f"Citation: {citation or '(unknown)'}\n"
-        f"Page count: {page_count}\n"
-        f"Chunk: {chunk_index}/{chunk_count}\n\n"
-        "Markdown chunk:\n"
-        f"{markdown_chunk}"
-    )
-
-
-def discoverability_aggregate_prompt(
-    title: str,
-    citation: str,
-    page_count: int,
-    chunk_outputs: list[dict[str, Any]],
-) -> str:
-    return (
-        "You are combining chunk-level paper discovery data into one final structured output.\n"
-        "Respond with a SINGLE JSON object in assistant content only.\n"
-        "Do not include analysis, markdown, code fences, or extra text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{"
-        '"paper_summary": "<summary text>", '
-        '"key_topics": ["<topic>"], '
-        '"sections": ['
-        '{"title":"<section title>","start_page":1,"end_page":1,"summary":"<section summary>"}'
-        "]"
-        "}\n"
-        "Rules:\n"
-        "- Do NOT use placeholder words like 'string' or '<topic>' in output values.\n"
-        "- paper_summary: 2-5 sentences high-level summary of the full paper.\n"
-        "- key_topics: 3-10 concise topics.\n"
-        "- sections: 4-12 major sections in reading order.\n"
-        "- start_page/end_page are absolute 1-based pages.\n\n"
-        f"Title: {title or '(unknown)'}\n"
-        f"Citation: {citation or '(unknown)'}\n"
-        f"Page count: {page_count}\n\n"
-        "Chunk discovery JSON list:\n"
-        f"{json.dumps(chunk_outputs, ensure_ascii=True)}"
-    )
-
-
-def split_markdown_for_discovery(markdown_text: str, max_chars: int = 32000) -> list[str]:
-    if max_chars < 1000:
-        max_chars = 1000
-    text = markdown_text or ""
-    if len(text) <= max_chars:
-        return [text]
-    chunks: list[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        j = min(i + max_chars, n)
-        if j < n:
-            split = text.rfind("\n\n# Page ", i, j)
-            if split > i:
-                j = split
-        if j <= i:
-            j = min(i + max_chars, n)
-        chunks.append(text[i:j])
-        i = j
-    return chunks
 
 
 def normalize_discovery(raw: dict[str, Any], page_count: int) -> dict[str, Any]:
@@ -245,6 +130,232 @@ def is_useful_discovery(discovery: dict[str, Any]) -> bool:
         if isinstance(s, dict)
     )
     return summary_ok or (topics_ok and sections_ok)
+
+
+def _clean_markdown_line(raw: str) -> str:
+    line = str(raw or "").strip()
+    if not line:
+        return ""
+    line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+    line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+    line = re.sub(r"[`*_~]+", "", line)
+    line = re.sub(r"\s+", " ", line).strip()
+    return line
+
+
+def _split_markdown_pages(markdown_text: str) -> list[tuple[int, str]]:
+    text = str(markdown_text or "")
+    if not text.strip():
+        return []
+    markers = list(PAGE_MARKER_RE.finditer(text))
+    if not markers:
+        return [(1, text)]
+    pages: list[tuple[int, str]] = []
+    for idx, marker in enumerate(markers):
+        page_num = int(marker.group(1))
+        start = marker.end()
+        end = markers[idx + 1].start() if idx + 1 < len(markers) else len(text)
+        pages.append((page_num, text[start:end]))
+    return pages
+
+
+def _clean_heading_text(raw: str) -> str:
+    text = _clean_markdown_line(raw)
+    text = re.sub(r"^\d+(?:\.\d+)*\s+", "", text).strip()
+    text = text.strip(":.- ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _is_heading_candidate(title: str) -> bool:
+    text = str(title or "").strip()
+    if not text:
+        return False
+    low = text.lower()
+    if low.startswith("page "):
+        return False
+    if len(text) < 2 or len(text) > 120:
+        return False
+    if all(ch in "-_=*." for ch in text):
+        return False
+    return True
+
+
+def _extract_sections_from_markdown(consolidated_markdown: str, page_count: int) -> list[dict[str, Any]]:
+    pages = _split_markdown_pages(consolidated_markdown)
+    if not pages:
+        return []
+    headings: list[dict[str, Any]] = []
+    for page_num, page_text in pages:
+        lines = page_text.splitlines()
+        for idx, raw in enumerate(lines):
+            line = str(raw or "").strip()
+            if not line:
+                continue
+            title = ""
+            heading_match = MD_HEADING_RE.match(line)
+            if heading_match:
+                title = _clean_heading_text(heading_match.group(2))
+            elif PLAIN_SECTION_RE.match(line):
+                title = _clean_heading_text(line)
+            if not _is_heading_candidate(title):
+                continue
+            snippet = ""
+            for follower in lines[idx + 1 :]:
+                cleaned = _clean_markdown_line(follower)
+                if not cleaned:
+                    continue
+                if MD_HEADING_RE.match(follower) or PLAIN_SECTION_RE.match(follower):
+                    break
+                if cleaned.lower().startswith("keywords"):
+                    break
+                snippet = cleaned
+                break
+            headings.append({"title": title, "page": page_num, "summary": snippet})
+    # Deduplicate near-adjacent repeated headings.
+    compact: list[dict[str, Any]] = []
+    for heading in headings:
+        title = str(heading.get("title", "")).strip()
+        if compact and compact[-1]["title"].lower() == title.lower() and int(compact[-1]["page"]) == int(heading.get("page", 1)):
+            continue
+        compact.append(heading)
+
+    max_page = max(1, int(page_count or 1))
+    sections: list[dict[str, Any]] = []
+    for idx, heading in enumerate(compact[:24]):
+        start_page = max(1, min(int(heading.get("page", 1) or 1), max_page))
+        if idx + 1 < len(compact):
+            next_page = max(1, min(int(compact[idx + 1].get("page", start_page) or start_page), max_page))
+            end_page = start_page if next_page <= start_page else max(start_page, next_page - 1)
+        else:
+            end_page = max(start_page, max_page)
+        summary = str(heading.get("summary", "")).strip()
+        if summary and len(summary) > 220:
+            summary = summary[:217].rstrip() + "..."
+        sections.append(
+            {
+                "title": str(heading.get("title", "")).strip(),
+                "start_page": start_page,
+                "end_page": end_page,
+                "summary": summary,
+            }
+        )
+    return sections
+
+
+def _clip_sentences(text: str, max_sentences: int = 2, max_chars: int = 480) -> str:
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not raw:
+        return ""
+    pieces = re.split(r"(?<=[.!?])\s+", raw)
+    chosen = " ".join(pieces[:max_sentences]).strip() or raw
+    if len(chosen) <= max_chars:
+        return chosen
+    return chosen[: max_chars - 3].rstrip() + "..."
+
+
+def _extract_abstract(consolidated_markdown: str) -> str:
+    excerpt = first_pages_excerpt(consolidated_markdown, max_pages=5)
+    lines = excerpt.splitlines()
+    collecting = False
+    collected: list[str] = []
+    for raw in lines:
+        line = str(raw or "").strip()
+        if not line:
+            if collecting and collected:
+                break
+            continue
+        if ABSTRACT_HEADING_RE.match(line):
+            collecting = True
+            continue
+        if collecting:
+            if PAGE_MARKER_RE.match(line) or MD_HEADING_RE.match(line) or PLAIN_SECTION_RE.match(line):
+                break
+            if line.lower().startswith("keywords"):
+                break
+            cleaned = _clean_markdown_line(line)
+            if cleaned:
+                collected.append(cleaned)
+    return _clip_sentences(" ".join(collected))
+
+
+def _fallback_summary(consolidated_markdown: str) -> str:
+    excerpt = first_pages_excerpt(consolidated_markdown, max_pages=2)
+    chunks: list[str] = []
+    for raw in excerpt.splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            if chunks:
+                break
+            continue
+        if PAGE_MARKER_RE.match(line) or MD_HEADING_RE.match(line):
+            continue
+        cleaned = _clean_markdown_line(line)
+        if cleaned and not cleaned.lower().startswith(("keywords", "doi:")):
+            chunks.append(cleaned)
+    return _clip_sentences(" ".join(chunks))
+
+
+def _extract_keyword_topics(consolidated_markdown: str) -> list[str]:
+    topics: list[str] = []
+    for raw in consolidated_markdown.splitlines():
+        match = KEYWORDS_LINE_RE.match(str(raw or ""))
+        if not match:
+            continue
+        for part in re.split(r"[;,]", match.group(1)):
+            candidate = str(part).strip(" .")
+            if candidate and candidate.lower() not in {t.lower() for t in topics}:
+                topics.append(candidate)
+        if topics:
+            break
+    return topics[:8]
+
+
+def _token_topics(text: str, limit: int = 8) -> list[str]:
+    counts: dict[str, int] = {}
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9-]{3,}", str(text or "").lower()):
+        if token in TOPIC_STOPWORDS:
+            continue
+        counts[token] = counts.get(token, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [token for token, _ in ranked[:limit]]
+
+
+def _derive_topics(consolidated_markdown: str, sections: list[dict[str, Any]], summary: str) -> list[str]:
+    topics = _extract_keyword_topics(consolidated_markdown)
+    if len(topics) < 3:
+        section_blob = " ".join(str(sec.get("title", "")) for sec in sections)
+        for topic in _token_topics(section_blob, limit=8):
+            if topic.lower() not in {t.lower() for t in topics}:
+                topics.append(topic)
+            if len(topics) >= 8:
+                break
+    if len(topics) < 3:
+        for topic in _token_topics(summary, limit=8):
+            if topic.lower() not in {t.lower() for t in topics}:
+                topics.append(topic)
+            if len(topics) >= 8:
+                break
+    return topics[:8]
+
+
+def extract_discovery_deterministic(
+    consolidated_markdown: str,
+    page_count: int,
+) -> dict[str, Any]:
+    if not str(consolidated_markdown or "").strip():
+        return {"paper_summary": "", "key_topics": [], "sections": []}
+    sections = _extract_sections_from_markdown(consolidated_markdown, page_count=page_count)
+    summary = _extract_abstract(consolidated_markdown) or _fallback_summary(consolidated_markdown)
+    topics = _derive_topics(consolidated_markdown, sections=sections, summary=summary)
+    return normalize_discovery(
+        {
+            "paper_summary": summary,
+            "key_topics": topics,
+            "sections": sections,
+        },
+        page_count=page_count,
+    )
 
 
 def render_group_readme(group_name: str, papers: list[dict[str, Any]]) -> str:

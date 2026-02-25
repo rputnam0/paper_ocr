@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 
 import fitz
+import pytest
 
 from paper_ocr.inspect import TextHeuristics
 from paper_ocr.structured_extract import (
+    _marker_service_llm_form_fields,
     build_render_contract,
     grobid_coords_to_px,
     is_structured_candidate_doc,
@@ -16,6 +18,13 @@ from paper_ocr.structured_extract import (
     run_marker_doc,
     run_marker_page,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_marker_guard_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED", raising=False)
+    monkeypatch.delenv("PAPER_OCR_ALLOW_LOCAL_HEAVY", raising=False)
+    monkeypatch.delenv("PAPER_OCR_MARKER_URL", raising=False)
 
 
 def _h(char_count: int, printable: float = 0.99, cid: float = 0.0, repl: float = 0.0) -> TextHeuristics:
@@ -232,6 +241,138 @@ def test_run_marker_page_via_service_failure(monkeypatch, tmp_path: Path):
     )
     assert not result.success
     assert "service failed" in result.error
+
+
+def test_run_marker_page_blocks_local_cli_when_wsl_policy_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    monkeypatch.setenv("PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED", "1")
+    called = {"subprocess": 0}
+
+    def _fake_run(*args, **kwargs):  # noqa: ANN001
+        called["subprocess"] += 1
+        return 0
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    result = run_marker_page(
+        pdf_path=pdf_path,
+        page_index=0,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=tmp_path / "assets",
+        asset_level="standard",
+    )
+    assert not result.success
+    assert "Blocked local Marker CLI execution by policy" in result.error
+    assert called["subprocess"] == 0
+
+
+def test_run_marker_doc_blocks_local_cli_when_wsl_policy_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    monkeypatch.setenv("PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED", "1")
+    called = {"subprocess": 0}
+
+    def _fake_run(*args, **kwargs):  # noqa: ANN001
+        called["subprocess"] += 1
+        return 0
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    result = run_marker_doc(
+        pdf_path=pdf_path,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=tmp_path / "assets",
+        profile="full_json",
+    )
+    assert not result.success
+    assert "Blocked local Marker CLI execution by policy" in result.error
+    assert called["subprocess"] == 0
+
+
+def test_run_marker_page_uses_marker_url_from_env_when_arg_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    monkeypatch.setenv("PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED", "1")
+    monkeypatch.setenv("PAPER_OCR_MARKER_URL", "http://127.0.0.1:8008")
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def read(self) -> bytes:
+            return b'{"success": true, "output": "# OK"}'
+
+    called = {"subprocess": 0}
+
+    def _fake_run(*args, **kwargs):  # noqa: ANN001
+        called["subprocess"] += 1
+        return 0
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: _Resp())
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    result = run_marker_page(
+        pdf_path=pdf_path,
+        page_index=0,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=tmp_path / "assets",
+        asset_level="standard",
+    )
+    assert result.success
+    assert called["subprocess"] == 0
+
+
+def test_run_marker_page_allows_local_when_override_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(pdf_path)
+    monkeypatch.setenv("PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED", "1")
+    monkeypatch.setenv("PAPER_OCR_ALLOW_LOCAL_HEAVY", "1")
+    called = {"subprocess": 0}
+
+    def _fake_run(cmd, check, env, stdout, stderr, timeout):  # noqa: ANN001
+        called["subprocess"] += 1
+        out_dir = Path(cmd[cmd.index("--output_dir") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "doc.md").write_text("# Local override\n")
+        return 0
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    result = run_marker_page(
+        pdf_path=pdf_path,
+        page_index=0,
+        marker_command="marker_single",
+        timeout=10,
+        assets_root=tmp_path / "assets",
+        asset_level="standard",
+    )
+    assert result.success
+    assert called["subprocess"] > 0
+
+
+def test_marker_service_llm_form_fields_disabled_by_default():
+    fields = _marker_service_llm_form_fields(env={})
+    assert fields == {}
+
+
+def test_marker_service_llm_form_fields_include_openai_defaults_from_env():
+    fields = _marker_service_llm_form_fields(
+        env={
+            "PAPER_OCR_MARKER_SERVICE_USE_LLM": "1",
+            "PAPER_OCR_MARKER_SERVICE_LLM_SERVICE": "marker.services.openai.OpenAIService",
+            "PAPER_OCR_MARKER_SERVICE_OPENAI_BASE_URL": "https://api.deepinfra.com/v1/openai",
+            "PAPER_OCR_MARKER_SERVICE_OPENAI_MODEL": "openai/gpt-oss-120b",
+            "DEEPINFRA_API_KEY": "test-key",
+        }
+    )
+    assert fields["use_llm"] == "true"
+    assert fields["llm_service"] == "marker.services.openai.OpenAIService"
+    assert fields["openai_base_url"] == "https://api.deepinfra.com/v1/openai"
+    assert fields["openai_model"] == "openai/gpt-oss-120b"
+    assert fields["openai_api_key"] == "test-key"
 
 
 def test_run_grobid_doc_success(monkeypatch, tmp_path: Path):

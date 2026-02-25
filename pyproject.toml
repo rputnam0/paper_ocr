@@ -15,6 +15,7 @@ dependencies = [
   "telethon>=1.36.0",
   "tqdm>=4.66.0",
   "pytest>=8.0.0",
+  "google-genai>=1.62.0",
 ]
 
 [project.scripts]
@@ -31,4 +32,12 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q -ra"
+testpaths = ["tests"]
+markers = [
+  "slow: long-running tests (opt-in locally)",
+  "integration: cross-module integration tests (opt-in locally)",
+  "network: tests requiring outbound network access (opt-in locally)",
+  "service: tests requiring running external services (opt-in locally)",
+  "gpu: tests requiring GPU resources (opt-in locally)",
+]

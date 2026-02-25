@@ -1,15 +1,18 @@
 import argparse
 import asyncio
 import json
+from io import BytesIO
 from pathlib import Path
 
 import fitz
 import pytest
+from PIL import Image
 
 from paper_ocr import cli
 from paper_ocr.inspect import TextHeuristics
 from paper_ocr.structured_data import StructuredExportSummary
 from paper_ocr.structured_extract import StructuredPageResult
+from paper_ocr.table_rectifier import RectifierResult
 
 
 class _FakeDoc:
@@ -35,13 +38,33 @@ class _FakeOpen:
         self._doc._closed = True
 
 
-async def _fake_extract_discovery(*args, **kwargs):
+def _fake_extract_discovery(page_count: int, consolidated_markdown: str):
+    _ = page_count
+    _ = consolidated_markdown
     return {"paper_summary": "", "key_topics": [], "sections": []}
 
 
 async def _fake_fetch_from_telegram(config):
     _fake_fetch_from_telegram.last_config = config
     return []
+
+
+def _fake_resolve_dois(config):
+    _fake_resolve_dois.last_config = config
+    out_dir = config.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fetch_ready = out_dir / "fetch_ready_dois.csv"
+    fetch_ready.write_text("DOI\n10.1000/abc\n")
+    summary_json = out_dir / "summary.json"
+    summary_json.write_text('{"status_counts":{"needs_review":1}}')
+    return {
+        "resolved_csv": str(out_dir / "resolved.csv"),
+        "fetch_ready_csv": str(fetch_ready),
+        "candidates_jsonl": str(out_dir / "candidates.jsonl"),
+        "crossref_raw_jsonl": str(out_dir / "crossref_raw.jsonl"),
+        "summary_json": str(summary_json),
+        "cache_json": str(out_dir / "cache.json"),
+    }
 
 
 def test_process_pdf_uses_cached_page_count_after_close(monkeypatch, tmp_path: Path):
@@ -63,7 +86,6 @@ def test_process_pdf_uses_cached_page_count_after_close(monkeypatch, tmp_path: P
         debug=False,
         scan_preprocess=False,
         text_only=False,
-        metadata_model="meta",
     )
 
     monkeypatch.setenv("DEEPINFRA_API_KEY", "test-key")
@@ -116,6 +138,86 @@ def test_parse_fetch_telegram_defaults(monkeypatch):
     assert args.max_delay == 8.0
     assert args.response_timeout == 15
     assert args.search_timeout == 40
+    assert args.resolve_dois is True
+    assert args.resolve_rows == 5
+    assert args.resolve_timeout == 20
+    assert args.resolve_max_retries == 3
+    assert args.resolve_cache is True
+    assert args.resolve_refresh_cache is False
+    assert args.scihub_fallback is True
+    assert args.scihub_timeout == 6
+    assert args.scihub_base_urls == ""
+
+
+def test_parse_fetch_telegram_scihub_flags(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "fetch-telegram",
+            "papers.csv",
+            "--no-scihub-fallback",
+            "--scihub-timeout",
+            "90",
+            "--scihub-base-urls",
+            "https://sci-hub.se,https://sci-hub.ru",
+        ],
+    )
+
+    args = cli._parse_args()
+
+    assert args.scihub_fallback is False
+    assert args.scihub_timeout == 90
+    assert args.scihub_base_urls == "https://sci-hub.se,https://sci-hub.ru"
+
+
+def test_parse_fetch_telegram_scihub_base_urls_from_project_env(monkeypatch):
+    monkeypatch.setenv("PAPER_OCR_SCIHUB_BASE_URLS", "https://sci-hub.st,https://sci-hub.se")
+    monkeypatch.delenv("SCIHUB_BASE_URLS", raising=False)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "fetch-telegram",
+            "papers.csv",
+        ],
+    )
+
+    args = cli._parse_args()
+
+    assert args.scihub_base_urls == "https://sci-hub.st,https://sci-hub.se"
+
+
+def test_parse_resolve_dois_args(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "resolve-dois",
+            "input/papers.csv",
+            "data/jobs",
+            "--rows",
+            "7",
+            "--timeout",
+            "33",
+            "--max-retries",
+            "4",
+            "--no-cache",
+            "--refresh-cache",
+            "--crossref-mailto",
+            "bot@example.com",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "resolve-dois"
+    assert args.input_csv == Path("input/papers.csv")
+    assert args.output_root == Path("data/jobs")
+    assert args.rows == 7
+    assert args.timeout == 33
+    assert args.max_retries == 4
+    assert args.cache is False
+    assert args.refresh_cache is True
+    assert args.crossref_mailto == "bot@example.com"
 
 
 def test_parse_export_structured_data_args(monkeypatch):
@@ -169,6 +271,13 @@ def test_parse_run_table_pipeline_defaults(monkeypatch):
     assert args.table_source == "marker-first"
     assert args.table_ocr_merge is True
     assert args.table_ocr_merge_scope == "header"
+    assert args.table_llm_rectify is True
+    assert args.table_llm_model == "openai/gpt-oss-120b"
+    assert args.table_llm_max_tokens == 2000
+    assert args.table_llm_risk_threshold == 0.45
+    assert args.table_llm_max_tables_per_doc == 12
+    assert args.table_llm_target == "risk"
+    assert args.table_llm_rerectify is True
     assert args.table_header_ocr_auto is True
     assert args.table_artifact_mode == "permissive"
     assert args.table_quality_gate is True
@@ -177,6 +286,71 @@ def test_parse_run_table_pipeline_defaults(monkeypatch):
     assert args.table_qa_mode == "warn"
     assert args.compare_ocr_html is False
     assert args.ocr_html_dir is None
+    assert args.allow_local_heavy is False
+
+
+def test_parse_run_allow_local_heavy_flag(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "run",
+            "data/in",
+            "out",
+            "--allow-local-heavy",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.allow_local_heavy is True
+
+
+def test_resource_guard_blocks_local_structured_on_low_resource():
+    args = argparse.Namespace(
+        digital_structured="auto",
+        marker_url="",
+        allow_local_heavy=False,
+    )
+    msg = cli._resource_guard_violation(
+        args,
+        cpu_count=4,
+        mem_gib=8.0,
+        env={},
+    )
+    assert "Resource guard blocked local structured run" in msg
+    assert "--marker-url http://127.0.0.1:8008" in msg
+
+
+def test_resource_guard_blocks_when_wsl_policy_enabled_even_on_high_resource():
+    args = argparse.Namespace(
+        digital_structured="auto",
+        marker_url="",
+        allow_local_heavy=False,
+    )
+    msg = cli._resource_guard_violation(
+        args,
+        cpu_count=32,
+        mem_gib=128.0,
+        env={"PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED": "1"},
+    )
+    assert "Resource guard blocked local structured run" in msg
+
+
+def test_resource_guard_allows_when_marker_service_url_is_set():
+    args = argparse.Namespace(
+        digital_structured="auto",
+        marker_url="http://127.0.0.1:8008",
+        allow_local_heavy=False,
+    )
+    assert cli._resource_guard_violation(args, cpu_count=4, mem_gib=8.0, env={}) == ""
+
+
+def test_resource_guard_allows_with_explicit_override():
+    args = argparse.Namespace(
+        digital_structured="auto",
+        marker_url="",
+        allow_local_heavy=True,
+    )
+    assert cli._resource_guard_violation(args, cpu_count=4, mem_gib=8.0, env={}) == ""
 
 
 def test_parse_export_table_pipeline_options(monkeypatch):
@@ -197,6 +371,18 @@ def test_parse_export_table_pipeline_options(monkeypatch):
             "--no-table-ocr-merge",
             "--table-ocr-merge-scope",
             "full",
+            "--no-table-llm-rectify",
+            "--table-llm-model",
+            "openai/gpt-oss-20b",
+            "--table-llm-max-tokens",
+            "1500",
+            "--table-llm-risk-threshold",
+            "0.7",
+            "--table-llm-max-tables-per-doc",
+            "4",
+            "--table-llm-target",
+            "nonaccept",
+            "--table-llm-rerectify",
             "--no-table-header-ocr-auto",
             "--table-artifact-mode",
             "strict",
@@ -209,6 +395,13 @@ def test_parse_export_table_pipeline_options(monkeypatch):
     assert args.table_escalation_max == 3
     assert args.table_ocr_merge is False
     assert args.table_ocr_merge_scope == "full"
+    assert args.table_llm_rectify is False
+    assert args.table_llm_model == "openai/gpt-oss-20b"
+    assert args.table_llm_max_tokens == 1500
+    assert args.table_llm_risk_threshold == 0.7
+    assert args.table_llm_max_tables_per_doc == 4
+    assert args.table_llm_target == "nonaccept"
+    assert args.table_llm_rerectify is True
     assert args.table_header_ocr_auto is False
     assert args.table_artifact_mode == "strict"
     assert args.compare_ocr_html is False
@@ -284,6 +477,102 @@ def test_parse_eval_table_pipeline_regression_options(monkeypatch):
     assert args.min_numeric_parse == 0.9
 
 
+def test_parse_validate_tables_gemini_defaults(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "validate-tables-gemini",
+            "out",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "validate-tables-gemini"
+    assert args.ocr_out_dir == Path("out")
+    assert args.model == "gemini-2.5-flash"
+    assert args.api_key_env == "GEMINI_API_KEY"
+    assert args.api_key == ""
+    assert args.max_output_tokens == 2000
+    assert args.render_dpi == 220
+    assert args.only_problem_docs is True
+    assert args.max_docs == 0
+    assert args.max_tables_per_doc == 0
+
+
+def test_parse_validate_tables_gemini_overrides(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "validate-tables-gemini",
+            "out",
+            "--model",
+            "gemini-3-flash",
+            "--api-key-env",
+            "ALT_GEMINI_KEY",
+            "--api-key",
+            "manual-key",
+            "--max-output-tokens",
+            "512",
+            "--render-dpi",
+            "180",
+            "--no-only-problem-docs",
+            "--max-docs",
+            "4",
+            "--max-tables-per-doc",
+            "2",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.model == "gemini-3-flash"
+    assert args.api_key_env == "ALT_GEMINI_KEY"
+    assert args.api_key == "manual-key"
+    assert args.max_output_tokens == 512
+    assert args.render_dpi == 180
+    assert args.only_problem_docs is False
+    assert args.max_docs == 4
+    assert args.max_tables_per_doc == 2
+
+
+def test_parse_summarize_gemini_failures_defaults(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "summarize-gemini-failures",
+            "out",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.command == "summarize-gemini-failures"
+    assert args.ocr_out_dir == Path("out")
+    assert args.report_out is None
+    assert args.baseline is None
+    assert args.gates == Path("docs/table_fix_backlog_gates.json")
+
+
+def test_parse_summarize_gemini_failures_overrides(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "paper-ocr",
+            "summarize-gemini-failures",
+            "out",
+            "--report-out",
+            "reports/metrics.json",
+            "--baseline",
+            "reports/baseline.json",
+            "--gates",
+            "docs/gates.json",
+        ],
+    )
+    args = cli._parse_args()
+    assert args.ocr_out_dir == Path("out")
+    assert args.report_out == Path("reports/metrics.json")
+    assert args.baseline == Path("reports/baseline.json")
+    assert args.gates == Path("docs/gates.json")
+
+
 def test_parse_data_audit_args(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -300,6 +589,34 @@ def test_parse_data_audit_args(monkeypatch):
     assert args.data_dir == Path("data")
     assert args.strict is True
     assert args.json is True
+
+
+def test_run_summarize_gemini_failures_passes_through(monkeypatch, tmp_path: Path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    args = argparse.Namespace(
+        ocr_out_dir=out_dir,
+        report_out=tmp_path / "report.json",
+        baseline=tmp_path / "baseline.json",
+        gates=tmp_path / "gates.json",
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_summarize(*, ocr_out_dir, report_out, baseline_path, gates_path):  # noqa: ANN001
+        captured["ocr_out_dir"] = ocr_out_dir
+        captured["report_out"] = report_out
+        captured["baseline_path"] = baseline_path
+        captured["gates_path"] = gates_path
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "summarize_gemini_failures", _fake_summarize)
+    payload = cli._run_summarize_gemini_failures(args)
+    assert payload == {"ok": True}
+    assert captured["ocr_out_dir"] == out_dir
+    assert captured["report_out"] == tmp_path / "report.json"
+    assert captured["baseline_path"] == tmp_path / "baseline.json"
+    assert captured["gates_path"] == tmp_path / "gates.json"
 
 
 def test_run_eval_table_pipeline_strict_regression_raises(tmp_path: Path):
@@ -410,6 +727,27 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
             "report_path": "metadata/assets/structured/qa/table_ocr_html_compare.json",
         },
     )
+    rectifier_calls: list[dict[str, object]] = []
+
+    async def _fake_rectify(**kwargs):  # noqa: ANN001
+        rectifier_calls.append(kwargs)
+        return RectifierResult(
+            enabled=True,
+            model="openai/gpt-oss-120b",
+            target="risk",
+            considered=2,
+            selected=1,
+            applied=1,
+            skipped_low_risk=1,
+            fallbacked=0,
+            invalid_schema=0,
+            evidence_violations=0,
+            errors=0,
+            report_path="metadata/assets/structured/qa/table_llm_rectification.json",
+            table_results=[],
+        )
+
+    monkeypatch.setattr(cli, "run_table_rectification_for_doc", _fake_rectify)
 
     args = argparse.Namespace(
         ocr_out_dir=root,
@@ -418,6 +756,12 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
         table_source="marker-first",
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=True,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,
@@ -440,6 +784,8 @@ def test_run_export_structured_data_updates_manifest(monkeypatch, tmp_path: Path
     assert seen_kwargs["table_artifact_mode"] == "permissive"
     assert seen_kwargs["ocr_html_dir"] is None
     assert seen_kwargs["grobid_status"] == "unknown"
+    assert payload["structured_data_extraction"]["table_llm_rectification"]["applied"] == 1
+    assert rectifier_calls
     assert payload["processing_status"]["status"] == "ok"
     assert payload["processing_status"]["strict_failure"] is False
 
@@ -470,6 +816,12 @@ def test_run_export_structured_data_non_strict_errors_do_not_mark_failed(monkeyp
         table_source="marker-first",
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=False,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,
@@ -509,6 +861,12 @@ def test_run_export_structured_data_passes_grobid_ok_when_manifest_records_usage
         table_source="marker-first",
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=False,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,
@@ -530,6 +888,12 @@ def test_run_export_structured_data_requires_docs(tmp_path: Path):
         deplot_timeout=90,
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=False,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,
@@ -646,6 +1010,21 @@ def test_fetch_telegram_requires_env(monkeypatch, tmp_path: Path):
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=True,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -670,6 +1049,21 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -681,6 +1075,7 @@ def test_fetch_telegram_dispatches(monkeypatch, tmp_path: Path):
     config = _fake_fetch_from_telegram.last_config
     assert config.in_dir == tmp_path / "jobs" / "papers" / "pdfs"
     assert config.report_file == tmp_path / "jobs" / "papers" / "reports" / "telegram_download_report.csv"
+    assert config.scihub_fallback is True
 
 
 def test_fetch_telegram_normalizes_job_slug(monkeypatch, tmp_path: Path):
@@ -697,6 +1092,21 @@ def test_fetch_telegram_normalizes_job_slug(monkeypatch, tmp_path: Path):
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
 
@@ -707,37 +1117,6 @@ def test_fetch_telegram_normalizes_job_slug(monkeypatch, tmp_path: Path):
     asyncio.run(cli._run_fetch_telegram(args))
     config = _fake_fetch_from_telegram.last_config
     assert config.in_dir == tmp_path / "jobs" / "my_papers" / "pdfs"
-
-
-def test_fetch_telegram_migrates_legacy_default_job_dir(monkeypatch, tmp_path: Path):
-    monkeypatch.chdir(tmp_path)
-    args = argparse.Namespace(
-        doi_csv=tmp_path / "papers.csv",
-        output_root=Path("data/jobs"),
-        doi_column="DOI",
-        target_bot="@example_bot",
-        session_name="nexus_session",
-        min_delay=10.0,
-        max_delay=20.0,
-        response_timeout=60,
-        search_timeout=40,
-        report_file=None,
-        failed_file=None,
-        debug=False,
-    )
-    args.doi_csv.write_text("DOI\n10.1000/abc\n")
-    legacy_job = tmp_path / "data" / "telegram_jobs" / "papers"
-    (legacy_job / "reports").mkdir(parents=True, exist_ok=True)
-    (legacy_job / "reports" / "download_index.json").write_text("{}")
-
-    monkeypatch.setenv("TG_API_ID", "123")
-    monkeypatch.setenv("TG_API_HASH", "abc")
-    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
-
-    asyncio.run(cli._run_fetch_telegram(args))
-
-    assert not legacy_job.exists()
-    assert (tmp_path / "data" / "jobs" / "papers" / "reports" / "download_index.json").exists()
 
 
 def test_fetch_telegram_keeps_input_csv_outside_job_folder(monkeypatch, tmp_path: Path):
@@ -757,6 +1136,21 @@ def test_fetch_telegram_keeps_input_csv_outside_job_folder(monkeypatch, tmp_path
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     monkeypatch.setenv("TG_API_ID", "123")
     monkeypatch.setenv("TG_API_HASH", "abc")
@@ -781,6 +1175,21 @@ def test_fetch_telegram_does_not_create_ocr_out_subdir(monkeypatch, tmp_path: Pa
         report_file=None,
         failed_file=None,
         debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
     )
     args.doi_csv.write_text("DOI\n10.1000/abc\n")
     monkeypatch.setenv("TG_API_ID", "123")
@@ -790,6 +1199,138 @@ def test_fetch_telegram_does_not_create_ocr_out_subdir(monkeypatch, tmp_path: Pa
     asyncio.run(cli._run_fetch_telegram(args))
     assert not (tmp_path / "jobs" / "papers" / "ocr_out").exists()
     assert not (tmp_path / "jobs" / "papers" / "input").exists()
+
+
+def test_fetch_telegram_auto_resolve_rewrites_input_csv(monkeypatch, tmp_path: Path):
+    args = argparse.Namespace(
+        doi_csv=tmp_path / "papers.csv",
+        output_root=tmp_path / "jobs",
+        doi_column="DOI",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+        resolve_dois=True,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="bot@example.com",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
+    )
+    args.doi_csv.write_text("doi,url_landing\n,https://doi.org/10.1000/abc\n")
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "resolve_dois", _fake_resolve_dois)
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+
+    assert _fake_fetch_from_telegram.last_config.doi_csv.name == "fetch_ready_dois.csv"
+    assert _fake_resolve_dois.last_config.input_csv == args.doi_csv
+
+
+def test_fetch_telegram_reuses_job_when_input_csv_is_in_reports(monkeypatch, tmp_path: Path):
+    output_root = tmp_path / "jobs"
+    doi_csv = output_root / "fetch_ready_dois" / "reports" / "telegram_failed_papers.csv"
+    doi_csv.parent.mkdir(parents=True, exist_ok=True)
+    doi_csv.write_text("doi_normalized\n10.1000/abc\n")
+
+    args = argparse.Namespace(
+        doi_csv=doi_csv,
+        output_root=output_root,
+        doi_column="doi_normalized",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
+    )
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+    config = _fake_fetch_from_telegram.last_config
+    assert config.in_dir == output_root / "fetch_ready_dois" / "pdfs"
+    assert config.report_file == output_root / "fetch_ready_dois" / "reports" / "telegram_download_report.csv"
+
+
+def test_fetch_telegram_reuses_job_for_nested_doi_resolution_csv(monkeypatch, tmp_path: Path):
+    output_root = tmp_path / "jobs"
+    doi_csv = output_root / "canonical_polymer_solution_rheology_sources" / "reports" / "doi_resolution" / "fetch_ready_dois.csv"
+    doi_csv.parent.mkdir(parents=True, exist_ok=True)
+    doi_csv.write_text("DOI\n10.1000/abc\n")
+
+    args = argparse.Namespace(
+        doi_csv=doi_csv,
+        output_root=output_root,
+        doi_column="DOI",
+        target_bot="@example_bot",
+        session_name="nexus_session",
+        min_delay=10.0,
+        max_delay=20.0,
+        response_timeout=60,
+        search_timeout=40,
+        report_file=None,
+        failed_file=None,
+        debug=False,
+        resolve_dois=False,
+        url_column=None,
+        title_column=None,
+        author_column=None,
+        year_column=None,
+        container_column=None,
+        crossref_mailto="",
+        resolve_rows=5,
+        resolve_timeout=20,
+        resolve_max_retries=3,
+        resolve_cache=True,
+        resolve_refresh_cache=False,
+        scihub_fallback=True,
+        scihub_timeout=45,
+        scihub_base_urls="",
+    )
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "abc")
+    monkeypatch.setattr(cli, "fetch_from_telegram", _fake_fetch_from_telegram)
+
+    asyncio.run(cli._run_fetch_telegram(args))
+    config = _fake_fetch_from_telegram.last_config
+    assert config.in_dir == output_root / "canonical_polymer_solution_rheology_sources" / "pdfs"
+    assert config.report_file == output_root / "canonical_polymer_solution_rheology_sources" / "reports" / "telegram_download_report.csv"
 
 
 def test_run_rejects_output_under_jobs_folder(tmp_path: Path):
@@ -805,34 +1346,6 @@ def test_render_dims_for_route_matches_truncation_behavior():
     w, h = cli._render_dims_for_route(610.0, 792.0, "unanchored", max_dim=10000)
     assert w == 2541
     assert h == 3300
-
-
-def test_final_doc_dir_avoids_collision_on_different_sha(monkeypatch, tmp_path: Path):
-    args = argparse.Namespace(out_dir=tmp_path / "out")
-    pdf_parent = tmp_path / "in"
-    pdf_parent.mkdir()
-    pdf_path = pdf_parent / "paper.pdf"
-    pdf_path.write_bytes(b"pdf")
-    monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
-    out = cli._final_doc_dir(args, pdf_path, {"authors": ["Doe, Jane"], "year": "2024", "title": "T"})
-    assert out.name == "doc_abc123def456"
-
-
-def test_final_doc_dir_avoids_non_manifest_existing_folder(monkeypatch, tmp_path: Path):
-    args = argparse.Namespace(out_dir=tmp_path / "out")
-    pdf_parent = tmp_path / "in"
-    pdf_parent.mkdir()
-    pdf_path = pdf_parent / "paper.pdf"
-    pdf_path.write_bytes(b"pdf")
-    group_dir = args.out_dir / "in"
-    candidate = group_dir / "doc_abc123def456"
-    candidate.mkdir(parents=True)
-    (candidate / "orphan.txt").write_text("orphan")
-
-    monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
-
-    out = cli._final_doc_dir(args, pdf_path, {"authors": ["Doe, Jane"], "year": "2024", "title": "T"})
-    assert out.name == "doc_abc123def456"
 
 
 def test_process_pdf_skips_when_manifest_sha_matches(monkeypatch, tmp_path: Path):
@@ -852,7 +1365,6 @@ def test_process_pdf_skips_when_manifest_sha_matches(monkeypatch, tmp_path: Path
         debug=False,
         scan_preprocess=False,
         text_only=False,
-        metadata_model="meta",
     )
     monkeypatch.setattr(cli, "file_sha256", lambda p: "abc123def456zzz")
     doc_dir = out_dir / "in" / "doc_abc123def456"
@@ -918,6 +1430,12 @@ def test_run_export_structured_data_raises_when_strict_doc_fails(monkeypatch, tm
         table_source="marker-first",
         table_ocr_merge=True,
         table_ocr_merge_scope="header",
+        table_llm_rectify=False,
+        table_llm_model="openai/gpt-oss-120b",
+        table_llm_max_tokens=2000,
+        table_llm_risk_threshold=0.45,
+        table_llm_max_tables_per_doc=12,
+        table_llm_target="risk",
         table_header_ocr_auto=False,
         table_header_ocr_model="m",
         table_header_ocr_max_tokens=500,
@@ -951,12 +1469,16 @@ def test_ensure_header_ocr_artifacts_generates_only_missing(monkeypatch, tmp_pat
     manifest_path.write_text(json.dumps({"source_path": str(src_pdf)}))
     qa_out = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
     qa_out.mkdir(parents=True, exist_ok=True)
-    (qa_out / "table_01_page_0001.md").write_text("<table></table>")
+    (qa_out / "table_01_page_0001.md").write_text(
+        f"<!-- ocr_mode:{cli.TABLE_OCR_ARTIFACT_VERSION} -->\n<table></table>"
+    )
+    call_count = {"count": 0}
 
     class _Resp:
         content = "<table><tr><th>A</th></tr></table>"
 
     async def _fake_ocr(**kwargs):  # noqa: ANN001
+        call_count["count"] += 1
         return _Resp()
 
     monkeypatch.setattr(cli, "call_olmocr", _fake_ocr)
@@ -972,6 +1494,54 @@ def test_ensure_header_ocr_artifacts_generates_only_missing(monkeypatch, tmp_pat
     assert summary["generated"] == 1
     assert summary["skipped_existing"] == 1
     assert summary["failed"] == 0
+    assert call_count["count"] == 1
+
+
+def test_ensure_header_ocr_artifacts_regenerates_legacy_and_uses_full_crop(monkeypatch, tmp_path: Path):
+    doc_dir = tmp_path / "doc"
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps({"page": 1, "bbox": [10, 10, 100, 100]}) + "\n")
+    manifest_path = doc_dir / "metadata" / "manifest.json"
+    src_pdf = tmp_path / "source.pdf"
+    with fitz.open() as out:
+        out.new_page(width=300, height=300)
+        out.save(src_pdf)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps({"source_path": str(src_pdf)}))
+    qa_out = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    qa_out.mkdir(parents=True, exist_ok=True)
+    legacy_path = qa_out / "table_01_page_0001.md"
+    legacy_path.write_text("<table><tr><th>legacy</th></tr></table>")
+
+    image_dims: list[tuple[int, int]] = []
+
+    class _Resp:
+        content = "<table><tr><th>H</th></tr><tr><td>1</td></tr></table>"
+
+    async def _fake_ocr(**kwargs):  # noqa: ANN001
+        image_bytes = kwargs.get("image_bytes", b"")
+        with Image.open(BytesIO(image_bytes)) as img:
+            image_dims.append((img.width, img.height))
+        return _Resp()
+
+    monkeypatch.setattr(cli, "call_olmocr", _fake_ocr)
+    summary = asyncio.run(
+        cli._ensure_header_ocr_artifacts(
+            doc_dir=doc_dir,
+            client=object(),  # type: ignore[arg-type]
+            model="m",
+            max_tokens=100,
+        )
+    )
+    assert summary["expected"] == 1
+    assert summary["generated"] == 1
+    assert summary["skipped_existing"] == 0
+    assert summary["failed"] == 0
+    assert image_dims and image_dims[0][0] > 300
+    assert image_dims[0][1] > 300
+    written = legacy_path.read_text()
+    assert f"ocr_mode:{cli.TABLE_OCR_ARTIFACT_VERSION}" in written
 
 
 def test_process_page_structured_success_skips_fallback(monkeypatch, tmp_path: Path):
@@ -1065,41 +1635,44 @@ def test_process_page_structured_failure_uses_fallback(monkeypatch, tmp_path: Pa
     assert result["structured"]["fallback_reason"] == "marker unavailable"
 
 
-def test_extract_discovery_can_return_sections_without_grobid(monkeypatch):
-    class _Resp:
-        def __init__(self, content: str):
-            self.content = content
-            self.reasoning_content = ""
-
-    calls: list[str] = []
-
-    async def _fake_text_model(**kwargs):  # noqa: ANN001
-        prompt = str(kwargs.get("prompt", ""))
-        calls.append(prompt)
-        if "extract the paper abstract" in prompt.lower():
-            return _Resp('{"abstract":"A study of rheology.","key_topics":["rheology"]}')
-        if "one chunk of a paper markdown transcript" in prompt:
-            return _Resp(
-                '{"chunk_summary":"chunk","key_topics":["rheology"],"sections":[{"title":"Methods","start_page":2,"end_page":4,"summary":"m"}]}'
-            )
-        if "combining chunk-level paper discovery data" in prompt:
-            return _Resp(
-                '{"paper_summary":"A study of rheology.","key_topics":["rheology"],"sections":[{"title":"Methods","start_page":2,"end_page":4,"summary":"m"}]}'
-            )
-        return _Resp("{}")
-
-    monkeypatch.setattr(cli, "call_text_model", _fake_text_model)
-
-    out = asyncio.run(
-        cli._extract_discovery(
-            client=object(),  # type: ignore[arg-type]
-            metadata_model="m",
-            bibliography={"title": "T", "citation": "C"},
-            page_count=10,
-            consolidated_markdown="# Page 1\nAbstract\n\n# Page 2\nMethods\n",
-        )
+def test_extract_discovery_can_return_sections_without_grobid():
+    out = cli._extract_discovery(
+        page_count=10,
+        consolidated_markdown=(
+            "# Page 1\n"
+            "Sample Paper Title\n\n"
+            "## Abstract\n"
+            "This paper studies rheology in polymer solutions and summarizes deterministic extraction.\n\n"
+            "## Introduction\n"
+            "We motivate deterministic metadata extraction from OCR markdown.\n\n"
+            "# Page 2\n"
+            "## Methods\n"
+            "We parse headings and abstract text directly.\n\n"
+            "## Results\n"
+            "The parser produces stable JSON artifacts.\n\n"
+            "# Page 3\n"
+            "## Conclusion\n"
+            "Deterministic metadata replaced the LLM step.\n"
+        ),
     )
 
-    assert out["paper_summary"]
+    assert "rheology" in out["paper_summary"].lower()
+    assert out["key_topics"]
     assert out["sections"]
-    assert any("one chunk of a paper markdown transcript" in p for p in calls)
+    assert any(sec.get("title") == "Methods" for sec in out["sections"])
+
+
+def test_extract_bibliography_is_deterministic():
+    out = cli._extract_bibliography(
+        first_page_markdown=(
+            "A Deterministic OCR Metadata Pipeline for Born-Digital Papers\n\n"
+            "Jane Doe, John Smith\n\n"
+            "Journal of OCR Systems 12(3): 45-59 (2021)\n"
+            "doi:10.1000/xyz-123\n"
+        ),
+    )
+
+    assert out["title"] == "A Deterministic OCR Metadata Pipeline for Born-Digital Papers"
+    assert out["authors"] == ["Jane Doe", "John Smith"]
+    assert out["year"] == "2021"
+    assert out["doi"] == "10.1000/xyz-123"

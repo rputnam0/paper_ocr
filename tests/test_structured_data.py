@@ -41,6 +41,19 @@ def test_extract_markdown_tables_keeps_empty_edge_cells():
     assert tables[0]["rows"] == [["", "1", "2", ""]]
 
 
+def test_extract_markdown_tables_accepts_two_dash_separator_cells():
+    md = """
+Table 2: Data
+| A | B | C |
+| --- | --- | -- |
+| 1 | 2 | 3 |
+"""
+    tables = extract_markdown_tables(md)
+    assert len(tables) == 1
+    assert tables[0]["headers"] == ["A", "B", "C"]
+    assert tables[0]["rows"] == [["1", "2", "3"]]
+
+
 def test_extract_markdown_tables_normalizes_line_break_cells_in_csv(tmp_path: Path):
     doc_dir = tmp_path / "Doe_2024"
     pages_dir = doc_dir / "pages"
@@ -696,3 +709,507 @@ def test_build_structured_exports_writes_caption_low_confidence_flag(tmp_path: P
     qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
     flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
     assert any(flag["type"] == "caption_low_confidence" for flag in flags)
+
+
+def test_build_structured_exports_no_tables_missing_marker_raw_is_ok(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text("This page has no markdown tables.\n")
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=True,
+    )
+
+    assert summary.table_count == 0
+    status_path = doc_dir / "metadata" / "assets" / "structured" / "qa" / "pipeline_status.json"
+    payload = json.loads(status_path.read_text())
+    assert payload["status"] == "ok"
+    assert payload["errors"] == []
+
+
+def test_build_structured_exports_markdown_fallback_tables_keep_warning(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text(
+        "\n".join(
+            [
+                "Table 1: Data",
+                "| Name | Value |",
+                "| --- | --- |",
+                "| A | 1 |",
+            ]
+        )
+    )
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=True,
+    )
+
+    assert summary.table_count == 1
+    status_path = doc_dir / "metadata" / "assets" / "structured" / "qa" / "pipeline_status.json"
+    payload = json.loads(status_path.read_text())
+    assert payload["status"] == "warnings"
+    assert "marker_tables_raw_missing" in payload["errors"]
+
+
+def test_build_structured_exports_skips_grobid_table_mismatch_when_no_grobid_tables(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text("No markdown tables\n")
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["Polymer", "Value"]],
+        "data_rows": [["A", "10"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    grobid_root = doc_dir / "metadata" / "assets" / "structured" / "grobid"
+    grobid_root.mkdir(parents=True, exist_ok=True)
+    # GROBID produced only figure signals; table QA mismatch should be gated.
+    grobid_rec = {"doc_id": "doc", "type": "figure", "label": "Figure 1", "page": 1, "coords": []}
+    (grobid_root / "figures_tables.jsonl").write_text(json.dumps(grobid_rec) + "\n")
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_qa_mode="warn",
+    )
+    assert summary.table_count == 1
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert not any(flag["type"] in {"count_mismatch", "page_mismatch"} for flag in flags)
+    assert any(flag["type"] == "qa_skipped" for flag in flags)
+
+
+def test_build_structured_exports_excludes_catastrophic_marker_table(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["X" * 220, "Value"]],
+        "data_rows": [["A", "1"], ["B", "2"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 0
+    assert any("excluded_low_quality" in err for err in summary.errors)
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "excluded_low_quality" for flag in flags)
+
+    status_path = doc_dir / "metadata" / "assets" / "structured" / "qa" / "pipeline_status.json"
+    status = json.loads(status_path.read_text())
+    assert any("excluded_low_quality_tables" in err for err in status["errors"])
+
+
+def test_build_structured_exports_uses_markdown_fallback_for_catastrophic_marker_table(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text(
+        "\n".join(
+            [
+                "Table 1: Clean fallback",
+                "| Name | Value |",
+                "| --- | --- |",
+                "| A | 1 |",
+                "| B | 2 |",
+            ]
+        )
+    )
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["X" * 220, "Value"]],
+        "data_rows": [["A", "1"], ["B", "2"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    assert first["headers"] == ["Name", "Value"]
+    assert first["rows"] == [["A", "1"], ["B", "2"]]
+
+    table_json = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / f"{first['table_id']}.json"
+    payload = json.loads(table_json.read_text())
+    assert payload["source_format"] == "markdown_fallback"
+    assert payload["header_rows"] == [["Name", "Value"]]
+    assert payload["data_rows"] == [["A", "1"], ["B", "2"]]
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "fallback_markdown_applied" for flag in flags)
+
+
+def test_build_structured_exports_uses_ocr_fallback_for_catastrophic_marker_table(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["same", "same", "same", "same"]],
+        "data_rows": [["Table 1", "Table 1", "Table 1", "Table 1"], ["1", "0", "0.43 ±", "0.68 ±"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    ocr_dir = doc_dir / "metadata" / "assets" / "structured" / "qa" / "bbox_ocr_outputs"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / "table_01_page_0001.md").write_text(
+        (
+            "<table>"
+            "<tr><th>MC Concentration (% wt)</th><th>Salt Concentration (% wt)</th><th>m (Pa·s<sup>n</sup>)</th><th>n</th></tr>"
+            "<tr><th>1</th><th>0</th><th>0.43 ± 0.07</th><th>0.68 ± 0.02</th></tr>"
+            "</table>"
+        )
+    )
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    assert first["headers"] == [
+        "MC Concentration (% wt)",
+        "Salt Concentration (% wt)",
+        "m (Pa·sn)",
+        "n",
+    ]
+    assert first["rows"] == [["1", "0", "0.43 ± 0.07", "0.68 ± 0.02"]]
+
+    table_json = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / f"{first['table_id']}.json"
+    payload = json.loads(table_json.read_text())
+    assert payload["source_format"] == "ocr_fallback"
+    assert payload["header_rows"] == [first["headers"]]
+    assert payload["data_rows"] == first["rows"]
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "fallback_ocr_applied" for flag in flags)
+
+
+def test_build_structured_exports_merges_cross_page_table_continuation(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text("Table on page 1\n")
+    (pages_dir / "0002.md").write_text("Continuation on page 2\n")
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_rows = [
+        {
+            "table_group_id": "page_0001_table_01",
+            "table_block_ids": ["b1"],
+            "caption_block_id": "c1",
+            "page": 1,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["Temperature\n800 °C", "900 °C", "1000 °C"]],
+            "data_rows": [],
+            "caption_text": "Table 2. Calculated K partition ratio (%)",
+        },
+        {
+            "table_group_id": "page_0002_table_01",
+            "table_block_ids": ["b2"],
+            "caption_block_id": "",
+            "page": 2,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["K2Si4O9", "85.4", "76.8", "65.8"], ["KCl", "14.6", "23.2", "34.2"]],
+            "data_rows": [],
+            "caption_text": "",
+        },
+    ]
+    (marker_root / "tables_raw.jsonl").write_text("\n".join(json.dumps(r) for r in marker_rows) + "\n")
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=False,
+    )
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    assert first["page"] == 1
+    assert first["headers"] == ["Temperature", "800 °C", "900 °C", "1000 °C"]
+    assert first["rows"] == [
+        ["K2Si4O9", "85.4", "76.8", "65.8"],
+        ["KCl", "14.6", "23.2", "34.2"],
+    ]
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "cross_page_continuation_merged" for flag in flags)
+    assert not any(flag["type"] == "excluded_low_quality" for flag in flags)
+
+
+def test_build_structured_exports_merges_cross_page_continuation_keeps_secondary_header_rows(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text("Table on page 1\n")
+    (pages_dir / "0002.md").write_text("Continuation on page 2\n")
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_rows = [
+        {
+            "table_group_id": "page_0001_table_01",
+            "table_block_ids": ["b1"],
+            "caption_block_id": "c1",
+            "page": 1,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["Case\n1\n2\n3\n4"]],
+            "data_rows": [],
+            "caption_text": "Table 1. Materials and their amounts used in the experiments",
+        },
+        {
+            "table_group_id": "page_0002_table_01",
+            "table_block_ids": ["b2"],
+            "caption_block_id": "",
+            "page": 2,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["", "", "", "", ""], ["Materials", "K2CO3", "K2CO3-SiO2", "KCl", "KCl-SiO2"]],
+            "data_rows": [["K/Si (mg/mg)", "-", "1:2", "-", "1:2"]],
+            "caption_text": "",
+        },
+    ]
+    (marker_root / "tables_raw.jsonl").write_text("\n".join(json.dumps(r) for r in marker_rows) + "\n")
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=False,
+    )
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    assert first["headers"] == [
+        "Case (Materials)",
+        "1 (K2CO3)",
+        "2 (K2CO3-SiO2)",
+        "3 (KCl)",
+        "4 (KCl-SiO2)",
+    ]
+    assert first["rows"] == [["K/Si (mg/mg)", "-", "1:2", "-", "1:2"]]
+
+    table_json = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / f"{first['table_id']}.json"
+    payload = json.loads(table_json.read_text())
+    assert payload["header_rows_full"] == [
+        ["Case", "1", "2", "3", "4"],
+        ["Materials", "K2CO3", "K2CO3-SiO2", "KCl", "KCl-SiO2"],
+    ]
+
+
+def test_build_structured_exports_does_not_merge_distinct_adjacent_tables(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text("Table on page 1\n")
+    (pages_dir / "0002.md").write_text("Different table on page 2\n")
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_rows = [
+        {
+            "table_group_id": "page_0001_table_01",
+            "table_block_ids": ["b1"],
+            "caption_block_id": "c1",
+            "page": 1,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["A", "B"]],
+            "data_rows": [["1", "2"]],
+            "caption_text": "Table 1. First",
+        },
+        {
+            "table_group_id": "page_0002_table_01",
+            "table_block_ids": ["b2"],
+            "caption_block_id": "c2",
+            "page": 2,
+            "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+            "header_rows": [["X", "Y"]],
+            "data_rows": [["7", "8"]],
+            "caption_text": "Table 2. Second",
+        },
+    ]
+    (marker_root / "tables_raw.jsonl").write_text("\n".join(json.dumps(r) for r in marker_rows) + "\n")
+
+    summary = build_structured_exports(
+        doc_dir=doc_dir,
+        table_source="marker-first",
+        table_ocr_merge=False,
+    )
+    assert summary.table_count == 2
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert not any(flag["type"] == "cross_page_continuation_merged" for flag in flags)
+
+
+def test_build_structured_exports_excludes_duplicate_headers_marker_table(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["same", "same", "same", "same"]],
+        "data_rows": [["1", "2", "3", "4"], ["5", "6", "7", "8"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 0
+    assert any("excluded_low_quality" in err for err in summary.errors)
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "excluded_low_quality" and "duplicate_headers" in flag["details"] for flag in flags)
+
+
+def test_build_structured_exports_excludes_sparse_headers_marker_table(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["context sentence leaked", "", "", ""]],
+        "data_rows": [["A", "1", "", ""], ["B", "2", "", ""]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 0
+    assert any("excluded_low_quality" in err for err in summary.errors)
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "excluded_low_quality" and "sparse_headers" in flag["details"] for flag in flags)
+
+
+def test_build_structured_exports_emits_lineage_context_and_required_fields(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    pages_dir = doc_dir / "pages"
+    pages_dir.mkdir(parents=True)
+    (pages_dir / "0001.md").write_text(
+        "\n".join(
+            [
+                "Legend",
+                "A1 = poly(styrene)",
+            ]
+        )
+    )
+
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["Sample", "Value"]],
+        "data_rows": [["A1", "1.2"], ["B2", "1.9"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    table_json = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / f"{first['table_id']}.json"
+    payload = json.loads(table_json.read_text())
+
+    assert len(payload["row_lineage"]) == 2
+    assert payload["row_lineage"][0]["fragment_id"]
+    assert payload["context_mappings"][0]["code"] == "A1"
+    assert payload["context_mappings"][0]["resolved_text"] == "poly(styrene)"
+    assert any(item.startswith("unresolved_code_mappings:") for item in payload["required_fields_missing"])
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "legend_code_resolved" for flag in flags)
+
+
+def test_build_structured_exports_corrects_simple_column_shift_and_flags_it(tmp_path: Path):
+    doc_dir = tmp_path / "Doe_2024"
+    (doc_dir / "pages").mkdir(parents=True)
+    marker_root = doc_dir / "metadata" / "assets" / "structured" / "marker"
+    marker_root.mkdir(parents=True, exist_ok=True)
+    marker_table = {
+        "table_group_id": "tblgrp-1",
+        "table_block_ids": ["b1"],
+        "caption_block_id": "c1",
+        "page": 1,
+        "polygons": [[[10, 10], [100, 10], [100, 200], [10, 200]]],
+        "header_rows": [["Sample", "A", "B"]],
+        "data_rows": [["", "S1", "1", "2"], ["", "S2", "3", "4"]],
+        "caption_text": "Table 1",
+    }
+    (marker_root / "tables_raw.jsonl").write_text(json.dumps(marker_table) + "\n")
+
+    summary = build_structured_exports(doc_dir=doc_dir, table_source="marker-first")
+    assert summary.table_count == 1
+
+    table_manifest = doc_dir / "metadata" / "assets" / "structured" / "extracted" / "tables" / "manifest.jsonl"
+    first = json.loads(table_manifest.read_text().splitlines()[0])
+    assert first["rows"] == [["S1", "1", "2"], ["S2", "3", "4"]]
+
+    qa_flags = doc_dir / "metadata" / "assets" / "structured" / "qa" / "table_flags.jsonl"
+    flags = [json.loads(line) for line in qa_flags.read_text().splitlines() if line.strip()]
+    assert any(flag["type"] == "row_column_topology_corrected" for flag in flags)

@@ -12,8 +12,9 @@ class _FakeFloodWaitError(Exception):
 
 
 class _FakeButton:
-    def __init__(self, text: str):
+    def __init__(self, text: str, url: str | None = None):
         self.text = text
+        self.url = url
 
 
 class _FakeMessage:
@@ -83,6 +84,12 @@ def _factory(conv):
 def test_normalize_doi():
     assert telegram_fetch.normalize_doi(" https://doi.org/10.1000/ABC ") == "10.1000/abc"
     assert telegram_fetch.normalize_doi("DOI:10.5555/xyz") == "10.5555/xyz"
+    assert (
+        telegram_fetch.normalize_doi(
+            "https://example.org/redirect?target=https%3A%2F%2Fdoi.org%2F10.1016%2Fj.carbpol.2020.117012"
+        )
+        == "10.1016/j.carbpol.2020.117012"
+    )
 
 
 def test_doi_filename_sanitizes():
@@ -211,6 +218,88 @@ def test_process_doi_hard_failure(tmp_path: Path):
     assert result.status == "Failed"
 
 
+def test_process_doi_hard_failure_then_scihub_fallback_success(tmp_path: Path, monkeypatch):
+    conv = _FakeConversation([_FakeMessage(text="Not found")])
+
+    def _fake_download(**kwargs):  # noqa: ANN001
+        out = kwargs["output_path"]
+        out.write_bytes(b"pdf")
+        return out
+
+    monkeypatch.setattr(telegram_fetch, "download_pdf_via_scihub", _fake_download)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            scihub_fallback=True,
+            scihub_timeout=5,
+            scihub_base_urls=[],
+        )
+    )
+
+    assert result.status == "Success"
+    assert result.file_path.endswith("10.1000_abc.pdf")
+    assert "fallback=scihub" in result.bot_message_excerpt
+
+
+def test_process_doi_hard_failure_then_scihub_fallback_failure_keeps_status(tmp_path: Path, monkeypatch):
+    conv = _FakeConversation([_FakeMessage(text="Not found")])
+
+    def _fake_download(**kwargs):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(telegram_fetch, "download_pdf_via_scihub", _fake_download)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            scihub_fallback=True,
+            scihub_timeout=5,
+            scihub_base_urls=[],
+        )
+    )
+
+    assert result.status == "Failed"
+    assert "scihub fallback did not find a pdf" in result.error.lower()
+
+
+def test_process_doi_hard_failure_scihub_fallback_tries_original_then_normalized(tmp_path: Path, monkeypatch):
+    conv = _FakeConversation([_FakeMessage(text="Not found")])
+    seen_identifiers = []
+
+    def _fake_download(**kwargs):  # noqa: ANN001
+        identifier = kwargs["identifier"]
+        seen_identifiers.append(identifier)
+        if identifier == "10.1000/abc":
+            out = kwargs["output_path"]
+            out.write_bytes(b"pdf")
+            return out
+        return None
+
+    monkeypatch.setattr(telegram_fetch, "download_pdf_via_scihub", _fake_download)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="https://doi.org/10.1000/ABC",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            scihub_fallback=True,
+            scihub_timeout=5,
+            scihub_base_urls=[],
+        )
+    )
+
+    assert result.status == "Success"
+    assert seen_identifiers == ["https://doi.org/10.1000/ABC", "10.1000/abc"]
+
+
 def test_process_doi_unknown_response(tmp_path: Path):
     conv = _FakeConversation([_FakeMessage(text="Working on it")])
 
@@ -279,6 +368,131 @@ def test_process_doi_searching_then_timeout_then_success(tmp_path: Path):
             conversation_factory=_factory(conv),
             doi_original="10.1000/abc",
             doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+
+
+def test_process_doi_uploaded_to_telegram_then_timeout_then_success(tmp_path: Path):
+    conv = _FakeConversation(
+        [
+            _FakeMessage(text="⬇️ sample.pdf\n|███ 25% uploaded to Telegram..."),
+            asyncio.TimeoutError(),
+            _FakeMessage(has_file=True),
+        ]
+    )
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+
+
+def test_process_doi_zero_point_confirm_then_success(tmp_path: Path):
+    file_msg = _FakeMessage(has_file=True)
+    conv = _FakeConversation([])
+
+    def _on_confirm(_index: int) -> None:
+        conv._responses.append(file_msg)
+
+    confirm_msg = _FakeMessage(
+        text="Ready to send",
+        buttons=[[_FakeButton("⚡ 0 pts"), _FakeButton("✅ Confirm"), _FakeButton("✖️ Cancel")]],
+        on_click=_on_confirm,
+    )
+    conv._responses.append(confirm_msg)
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+    assert confirm_msg.clicked == [1]
+
+
+def test_process_doi_nonzero_point_confirm_stays_unknown(tmp_path: Path):
+    confirm_msg = _FakeMessage(
+        text="Ready to send",
+        buttons=[[_FakeButton("⚡ 1 pts"), _FakeButton("✅ Confirm"), _FakeButton("✖️ Cancel")]],
+    )
+    conv = _FakeConversation([confirm_msg])
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1000/abc",
+            doi_normalized="10.1000/abc",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "UnknownResponse"
+    assert confirm_msg.clicked == []
+
+
+def test_process_doi_link_button_resolves_doi_and_requeries(tmp_path: Path):
+    card = _FakeMessage(
+        text="🔬 Result card",
+        buttons=[
+            [_FakeButton("🔗 6", url="https://doi.org/10.1208/PT0802032")],
+            [_FakeButton("✖️")],
+        ],
+    )
+    conv = _FakeConversation([card, _FakeMessage(has_file=True)])
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="https://example.org/landing/paper",
+            doi_normalized="https://example.org/landing/paper",
+            in_dir=tmp_path,
+            response_timeout=1,
+            search_timeout=10,
+        )
+    )
+
+    assert result.status == "Success"
+    assert conv.sent == [
+        "https://example.org/landing/paper",
+        "10.1208/pt0802032",
+    ]
+
+
+def test_process_doi_looking_at_marker_then_timeout_then_success(tmp_path: Path):
+    conv = _FakeConversation(
+        [
+            _FakeMessage(text="⬇️ ankur-j-shah.pdf\nlooking at Stargate LLC..."),
+            asyncio.TimeoutError(),
+            _FakeMessage(has_file=True),
+        ]
+    )
+
+    result = asyncio.run(
+        telegram_fetch.process_doi(
+            conversation_factory=_factory(conv),
+            doi_original="10.1208/pt0802032",
+            doi_normalized="10.1208/pt0802032",
             in_dir=tmp_path,
             response_timeout=1,
             search_timeout=10,

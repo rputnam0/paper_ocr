@@ -30,7 +30,7 @@ def test_data_audit_happy_path(tmp_path: Path):
 
 def test_data_audit_flags_unexpected_top_level(tmp_path: Path):
     data_dir = tmp_path / "data"
-    _mkdir(data_dir / "telegram_jobs")
+    _mkdir(data_dir / "unexpected_folder")
     _mkdir(data_dir / "corpora")
     _mkdir(data_dir / "jobs")
     _mkdir(data_dir / "cache")

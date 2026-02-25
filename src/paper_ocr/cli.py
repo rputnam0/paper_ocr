@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 from io import BytesIO
@@ -19,23 +20,17 @@ from openai import AsyncOpenAI
 
 from .anchoring import build_anchored_prompt, build_unanchored_prompt, extract_anchors
 from .bibliography import (
-    bibliography_prompt,
     citation_from_bibliography,
-    extract_json_object,
+    extract_bibliography_deterministic,
     normalize_bibliography,
 )
-from .client import call_olmocr, call_text_model
+from .client import call_olmocr
 from .data_audit import format_audit_report, run_data_audit
 from .discoverability import (
-    abstract_extraction_prompt,
-    discoverability_aggregate_prompt,
-    discoverability_chunk_prompt,
-    first_pages_excerpt,
-    is_useful_discovery,
-    normalize_discovery,
+    extract_discovery_deterministic,
     render_group_readme,
-    split_markdown_for_discovery,
 )
+from .doi_resolution import DoiResolutionConfig, resolve_dois
 from .facts import export_facts_for_doc
 from .ingest import discover_pdfs, doc_id_from_sha, file_sha256, output_group_name
 from .inspect import compute_text_heuristics, decide_route, is_text_only_candidate
@@ -53,14 +48,17 @@ from .structured_extract import (
     run_marker_doc,
     run_marker_page,
 )
+from .table_structure import build_table_structure_artifacts
 from .table_eval import evaluate_table_pipeline
+from .table_rectifier import RectifierConfig, RectifierResult, run_table_rectification_for_doc
+from .table_validation import GeminiValidationConfig, run_gemini_table_validation, summarize_gemini_failures
 from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
-METADATA_MODEL_DEFAULT = "nvidia/Nemotron-3-Nano-30B-A3B"
 MIN_DELAY_DEFAULT = "4"
 MAX_DELAY_DEFAULT = "8"
 RESPONSE_TIMEOUT_DEFAULT = 15
 SEARCH_TIMEOUT_DEFAULT = 40
+SCIHUB_TIMEOUT_DEFAULT = 6
 CSV_JOB_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 UNDERSCORE_RUN_RE = re.compile(r"_+")
 DIGITAL_STRUCTURED_DEFAULT = "auto"
@@ -71,8 +69,18 @@ GROBID_TIMEOUT_DEFAULT = "60"
 DEPLOT_TIMEOUT_DEFAULT = "90"
 TABLE_HEADER_OCR_MODEL_DEFAULT = "allenai/olmOCR-2-7B-1025"
 TABLE_HEADER_OCR_MAX_TOKENS_DEFAULT = 1400
+TABLE_OCR_ARTIFACT_VERSION = "full_table_v2"
+TABLE_LLM_RECTIFIER_MODEL_DEFAULT = "openai/gpt-oss-120b"
+TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT = 2000
+TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT = 0.45
+TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT = 12
+TABLE_LLM_RECTIFIER_TARGET_DEFAULT = "risk"
+TABLE_STRUCTURE_MODEL_DEFAULT = "tatr"
+TABLE_STRUCTURE_TIMEOUT_DEFAULT = 180
 DEFAULT_FETCH_OUTPUT_ROOT = Path("data/jobs")
-LEGACY_FETCH_OUTPUT_ROOT = Path("data/telegram_jobs")
+RESOURCE_GUARD_MIN_MEM_GB_DEFAULT = 24.0
+RESOURCE_GUARD_MIN_CPUS_DEFAULT = 8
+GEMINI_TABLE_VALIDATION_MODEL_DEFAULT = "gemini-2.5-flash"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -96,7 +104,6 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="Enable text-only extraction for high-quality text layers (default: enabled)",
     )
-    run.add_argument("--metadata-model", type=str, default=METADATA_MODEL_DEFAULT)
     run.add_argument(
         "--digital-structured",
         choices=["off", "auto", "on"],
@@ -191,6 +198,68 @@ def _parse_args() -> argparse.Namespace:
         help="Merge OCR data into table headers only (default) or full table grid.",
     )
     run.add_argument(
+        "--table-llm-rectify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run risk-gated LLM table rectification after deterministic extraction (default: enabled).",
+    )
+    run.add_argument(
+        "--table-llm-model",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_LLM_MODEL", TABLE_LLM_RECTIFIER_MODEL_DEFAULT),
+    )
+    run.add_argument(
+        "--table-llm-max-tokens",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_LLM_MAX_TOKENS", str(TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT))),
+    )
+    run.add_argument(
+        "--table-llm-risk-threshold",
+        type=float,
+        default=float(os.getenv("PAPER_OCR_TABLE_LLM_RISK_THRESHOLD", str(TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT))),
+    )
+    run.add_argument(
+        "--table-llm-max-tables-per-doc",
+        type=int,
+        default=int(
+            os.getenv(
+                "PAPER_OCR_TABLE_LLM_MAX_TABLES_PER_DOC",
+                str(TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT),
+            )
+        ),
+    )
+    run.add_argument(
+        "--table-llm-target",
+        choices=["risk", "all", "nonaccept", "reject"],
+        default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
+    )
+    run.add_argument(
+        "--table-llm-rerectify",
+        action=argparse.BooleanOptionalAction,
+        default=bool(int(os.getenv("PAPER_OCR_TABLE_LLM_RERECTIFY", "1"))),
+        help="Re-run LLM rectification on tables already marked as rectified (default: enabled).",
+    )
+    run.add_argument(
+        "--table-structure-model",
+        choices=["off", "tatr"],
+        default=os.getenv("PAPER_OCR_TABLE_STRUCTURE_MODEL", TABLE_STRUCTURE_MODEL_DEFAULT),
+        help="Table structure recognizer used to lock row/column topology during LLM rectification.",
+    )
+    run.add_argument(
+        "--table-structure-command",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_STRUCTURE_COMMAND", ""),
+        help=(
+            "External table-structure command template. Use {image} and {output} placeholders; "
+            "command should write JSON structure payload to {output}."
+        ),
+    )
+    run.add_argument(
+        "--table-structure-timeout",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_STRUCTURE_TIMEOUT", str(TABLE_STRUCTURE_TIMEOUT_DEFAULT))),
+    )
+    run.add_argument(
         "--table-header-ocr-auto",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -240,6 +309,14 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional directory containing OCR HTML tables (default: metadata/assets/structured/qa/bbox_ocr_outputs).",
     )
+    run.add_argument(
+        "--allow-local-heavy",
+        action="store_true",
+        help=(
+            "Allow local structured extraction even when resource guard recommends remote WSL services "
+            "(not recommended on low-resource machines)."
+        ),
+    )
 
     fetch = sub.add_parser("fetch-telegram", help="Fetch PDFs from Telegram bot using DOI CSV")
     fetch.add_argument("doi_csv", type=Path)
@@ -252,8 +329,67 @@ def _parse_args() -> argparse.Namespace:
     fetch.add_argument("--response-timeout", type=int, default=RESPONSE_TIMEOUT_DEFAULT)
     fetch.add_argument("--search-timeout", type=int, default=SEARCH_TIMEOUT_DEFAULT)
     fetch.add_argument("--debug", action="store_true")
+    fetch.add_argument(
+        "--resolve-dois",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resolve/canonicalize DOI rows before Telegram fetch (default: enabled).",
+    )
+    fetch.add_argument("--url-column", type=str, default=None)
+    fetch.add_argument("--title-column", type=str, default=None)
+    fetch.add_argument("--author-column", type=str, default=None)
+    fetch.add_argument("--year-column", type=str, default=None)
+    fetch.add_argument("--container-column", type=str, default=None)
+    fetch.add_argument("--crossref-mailto", type=str, default=os.getenv("CROSSREF_MAILTO", ""))
+    fetch.add_argument("--resolve-rows", type=int, default=5)
+    fetch.add_argument("--resolve-timeout", type=int, default=20)
+    fetch.add_argument("--resolve-max-retries", type=int, default=3)
+    fetch.add_argument(
+        "--resolve-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    fetch.add_argument(
+        "--resolve-refresh-cache",
+        action="store_true",
+        default=False,
+    )
+    fetch.add_argument(
+        "--scihub-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Try Sci-Hub mirror download when Telegram lookup fails (default: enabled).",
+    )
+    fetch.add_argument(
+        "--scihub-timeout",
+        type=int,
+        default=SCIHUB_TIMEOUT_DEFAULT,
+        help="Timeout in seconds per Sci-Hub request.",
+    )
+    fetch.add_argument(
+        "--scihub-base-urls",
+        type=str,
+        default=os.getenv("PAPER_OCR_SCIHUB_BASE_URLS", os.getenv("SCIHUB_BASE_URLS", "")),
+        help="Optional comma-separated Sci-Hub mirrors; auto-discovered if omitted.",
+    )
     fetch.add_argument("--report-file", type=Path, default=None)
     fetch.add_argument("--failed-file", type=Path, default=None)
+
+    resolve = sub.add_parser("resolve-dois", help="Resolve/canonicalize DOI rows from mixed bibliographic CSV")
+    resolve.add_argument("input_csv", type=Path)
+    resolve.add_argument("output_root", type=Path, nargs="?", default=Path("data/jobs"))
+    resolve.add_argument("--doi-column", type=str, default=None)
+    resolve.add_argument("--url-column", type=str, default=None)
+    resolve.add_argument("--title-column", type=str, default=None)
+    resolve.add_argument("--author-column", type=str, default=None)
+    resolve.add_argument("--year-column", type=str, default=None)
+    resolve.add_argument("--container-column", type=str, default=None)
+    resolve.add_argument("--crossref-mailto", type=str, default=os.getenv("CROSSREF_MAILTO", ""))
+    resolve.add_argument("--rows", type=int, default=5)
+    resolve.add_argument("--timeout", type=int, default=20)
+    resolve.add_argument("--max-retries", type=int, default=3)
+    resolve.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
+    resolve.add_argument("--refresh-cache", action="store_true", default=False)
 
     export = sub.add_parser(
         "export-structured-data",
@@ -287,6 +423,68 @@ def _parse_args() -> argparse.Namespace:
         choices=["header", "full"],
         default="header",
         help="Merge OCR data into table headers only (default) or full table grid.",
+    )
+    export.add_argument(
+        "--table-llm-rectify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run risk-gated LLM table rectification after deterministic extraction (default: enabled).",
+    )
+    export.add_argument(
+        "--table-llm-model",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_LLM_MODEL", TABLE_LLM_RECTIFIER_MODEL_DEFAULT),
+    )
+    export.add_argument(
+        "--table-llm-max-tokens",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_LLM_MAX_TOKENS", str(TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT))),
+    )
+    export.add_argument(
+        "--table-llm-risk-threshold",
+        type=float,
+        default=float(os.getenv("PAPER_OCR_TABLE_LLM_RISK_THRESHOLD", str(TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT))),
+    )
+    export.add_argument(
+        "--table-llm-max-tables-per-doc",
+        type=int,
+        default=int(
+            os.getenv(
+                "PAPER_OCR_TABLE_LLM_MAX_TABLES_PER_DOC",
+                str(TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT),
+            )
+        ),
+    )
+    export.add_argument(
+        "--table-llm-target",
+        choices=["risk", "all", "nonaccept", "reject"],
+        default=os.getenv("PAPER_OCR_TABLE_LLM_TARGET", TABLE_LLM_RECTIFIER_TARGET_DEFAULT),
+    )
+    export.add_argument(
+        "--table-llm-rerectify",
+        action=argparse.BooleanOptionalAction,
+        default=bool(int(os.getenv("PAPER_OCR_TABLE_LLM_RERECTIFY", "1"))),
+        help="Re-run LLM rectification on tables already marked as rectified (default: enabled).",
+    )
+    export.add_argument(
+        "--table-structure-model",
+        choices=["off", "tatr"],
+        default=os.getenv("PAPER_OCR_TABLE_STRUCTURE_MODEL", TABLE_STRUCTURE_MODEL_DEFAULT),
+        help="Table structure recognizer used to lock row/column topology during LLM rectification.",
+    )
+    export.add_argument(
+        "--table-structure-command",
+        type=str,
+        default=os.getenv("PAPER_OCR_TABLE_STRUCTURE_COMMAND", ""),
+        help=(
+            "External table-structure command template. Use {image} and {output} placeholders; "
+            "command should write JSON structure payload to {output}."
+        ),
+    )
+    export.add_argument(
+        "--table-structure-timeout",
+        type=int,
+        default=int(os.getenv("PAPER_OCR_TABLE_STRUCTURE_TIMEOUT", str(TABLE_STRUCTURE_TIMEOUT_DEFAULT))),
     )
     export.add_argument(
         "--table-header-ocr-auto",
@@ -367,6 +565,81 @@ def _parse_args() -> argparse.Namespace:
     eval_tables.add_argument("--max-recall-drop", type=float, default=0.03)
     eval_tables.add_argument("--min-numeric-parse", type=float, default=0.8)
 
+    validate_tables = sub.add_parser(
+        "validate-tables-gemini",
+        help="Use Gemini vision review to validate extracted tables against source PDF pages.",
+    )
+    validate_tables.add_argument("ocr_out_dir", type=Path)
+    validate_tables.add_argument(
+        "--model",
+        type=str,
+        default=os.getenv("PAPER_OCR_GEMINI_MODEL", GEMINI_TABLE_VALIDATION_MODEL_DEFAULT),
+    )
+    validate_tables.add_argument(
+        "--api-key-env",
+        type=str,
+        default="GEMINI_API_KEY",
+        help="Environment variable name used to load Gemini API key.",
+    )
+    validate_tables.add_argument(
+        "--api-key",
+        type=str,
+        default="",
+        help="Optional Gemini API key override.",
+    )
+    validate_tables.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=2000,
+    )
+    validate_tables.add_argument(
+        "--render-dpi",
+        type=int,
+        default=220,
+    )
+    validate_tables.add_argument(
+        "--only-problem-docs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Review only docs with non-ok structured pipeline status (default: enabled).",
+    )
+    validate_tables.add_argument(
+        "--max-docs",
+        type=int,
+        default=0,
+        help="Maximum docs to review (0 means no limit).",
+    )
+    validate_tables.add_argument(
+        "--max-tables-per-doc",
+        type=int,
+        default=0,
+        help="Maximum tables reviewed per document (0 means no limit).",
+    )
+
+    summarize_failures = sub.add_parser(
+        "summarize-gemini-failures",
+        help="Aggregate Gemini validation findings into deterministic backlog metrics.",
+    )
+    summarize_failures.add_argument("ocr_out_dir", type=Path)
+    summarize_failures.add_argument(
+        "--report-out",
+        type=Path,
+        default=None,
+        help="Optional output path for metrics JSON (default: inferred data/jobs/<slug>/reports).",
+    )
+    summarize_failures.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help="Optional baseline metrics JSON for gate comparisons.",
+    )
+    summarize_failures.add_argument(
+        "--gates",
+        type=Path,
+        default=Path("docs/table_fix_backlog_gates.json"),
+        help="Gate configuration JSON path.",
+    )
+
     audit = sub.add_parser("data-audit", help="Validate data/ folder organization contract")
     audit.add_argument("data_dir", type=Path, nargs="?", default=Path("data"))
     audit.add_argument("--strict", action="store_true", help="Exit non-zero on contract violations.")
@@ -394,6 +667,62 @@ def _require_telegram_credentials() -> tuple[int, str]:
     except ValueError as exc:
         raise SystemExit("Invalid TG_API_ID. Must be an integer.") from exc
     return api_id, api_hash
+
+
+def _system_memory_gib() -> float:
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        total = float(page_size * pages)
+        return total / (1024.0**3)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _resource_guard_violation(
+    args: argparse.Namespace,
+    *,
+    cpu_count: int | None = None,
+    mem_gib: float | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    env_map = env or dict(os.environ)
+    if bool(getattr(args, "allow_local_heavy", False)):
+        return ""
+    if str(env_map.get("PAPER_OCR_ALLOW_LOCAL_HEAVY", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return ""
+
+    digital_structured = str(getattr(args, "digital_structured", "off")).strip().lower()
+    marker_url = str(getattr(args, "marker_url", "") or "").strip()
+    if digital_structured not in {"auto", "on"}:
+        return ""
+    if marker_url:
+        return ""
+
+    require_wsl = str(env_map.get("PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    cpus = int(cpu_count if cpu_count is not None else (os.cpu_count() or 0))
+    memory_gib = float(mem_gib if mem_gib is not None else _system_memory_gib())
+    min_mem_gib = float(env_map.get("PAPER_OCR_RESOURCE_GUARD_MIN_MEM_GB", str(RESOURCE_GUARD_MIN_MEM_GB_DEFAULT)))
+    min_cpus = int(env_map.get("PAPER_OCR_RESOURCE_GUARD_MIN_CPUS", str(RESOURCE_GUARD_MIN_CPUS_DEFAULT)))
+    low_resource = (memory_gib > 0 and memory_gib < min_mem_gib) or (cpus > 0 and cpus < min_cpus)
+
+    # On low-resource hosts (or explicit policy), prevent accidental local Marker CLI execution.
+    if not (require_wsl or low_resource):
+        return ""
+
+    host = f"{platform.system()} cpus={cpus} mem_gib={memory_gib:.1f}"
+    return (
+        "Resource guard blocked local structured run: digital-structured requires remote Marker service on this host "
+        f"({host}). Configure WSL service URLs and retry:\n"
+        "  ssh -N -L 8008:127.0.0.1:8008 -L 8070:127.0.0.1:8070 wsl\n"
+        "  uv run paper-ocr run <in_dir> <out_dir> --marker-url http://127.0.0.1:8008 --grobid-url http://127.0.0.1:8070\n"
+        "If you intentionally want local heavy execution, pass --allow-local-heavy or set PAPER_OCR_ALLOW_LOCAL_HEAVY=1."
+    )
 
 
 def _page_out_path(pages_dir: Path, page_index: int) -> Path:
@@ -436,6 +765,30 @@ def _load_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
         if isinstance(parsed, dict):
             rows.append(parsed)
     return rows
+
+
+def _disabled_table_rectifier_summary(
+    *,
+    model: str,
+    target: str,
+) -> dict[str, Any]:
+    return asdict(
+        RectifierResult(
+            enabled=False,
+            model=model,
+            target=target,
+        )
+    )
+
+
+def _is_current_ocr_artifact(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text()
+    except Exception:
+        return False
+    return f"ocr_mode:{TABLE_OCR_ARTIFACT_VERSION}" in text[:500]
 
 
 async def _ensure_header_ocr_artifacts(
@@ -482,6 +835,7 @@ async def _ensure_header_ocr_artifacts(
     expected = 0
     generated = 0
     skipped_existing = 0
+    regenerated_legacy = 0
     failed = 0
     with fitz.open(source_path) as pdf:
         by_page_counter: dict[int, int] = {}
@@ -500,16 +854,17 @@ async def _ensure_header_ocr_artifacts(
             ordinal = by_page_counter[page]
             expected += 1
             out_md = ocr_out / f"table_{ordinal:02d}_page_{page:04d}.md"
-            if out_md.exists():
+            if _is_current_ocr_artifact(out_md):
                 skipped_existing += 1
                 continue
+            if out_md.exists():
+                regenerated_legacy += 1
 
             x0, y0, x1, y1 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
             if x1 <= x0 or y1 <= y0:
                 failed += 1
                 continue
-            header_h = max(72.0, min(180.0, (y1 - y0) * 0.33))
-            clip = fitz.Rect(x0, y0, x1, min(y1, y0 + header_h))
+            clip = fitz.Rect(x0, y0, x1, y1)
             page_obj = pdf.load_page(page - 1)
             pix = page_obj.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72), clip=clip, alpha=False)
             image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -519,9 +874,9 @@ async def _ensure_header_ocr_artifacts(
             (ocr_crops / f"table_{ordinal:02d}_page_{page:04d}.png").write_bytes(image_bytes)
 
             prompt = (
-                "Extract only table header rows from this image crop as HTML table markup. "
-                "Preserve Greek letters, superscripts/subscripts, symbols, and column grouping. "
-                "Return only <table>...</table> with <th> cells."
+                "Extract the full table from this image crop as HTML table markup. "
+                "Preserve all rows and columns, merged headers, symbols, superscripts/subscripts, and units. "
+                "Return only one <table>...</table> using <th> and <td> as needed."
             )
             try:
                 response = await call_olmocr(
@@ -536,7 +891,9 @@ async def _ensure_header_ocr_artifacts(
                 out_md.write_text(f"<!-- header_ocr_error: {exc} -->")
                 failed += 1
                 continue
-            out_md.write_text(str(response.content or "").strip())
+            out_md.write_text(
+                f"<!-- ocr_mode:{TABLE_OCR_ARTIFACT_VERSION} -->\n{str(response.content or '').strip()}\n"
+            )
             generated += 1
 
     status = "ok" if failed == 0 else "partial"
@@ -544,14 +901,13 @@ async def _ensure_header_ocr_artifacts(
         "expected": expected,
         "generated": generated,
         "skipped_existing": skipped_existing,
+        "regenerated_legacy": regenerated_legacy,
         "failed": failed,
         "status": status,
     }
 
 
-async def _extract_bibliography(
-    client: AsyncOpenAI,
-    metadata_model: str,
+def _extract_bibliography(
     first_page_markdown: str,
 ) -> dict[str, Any]:
     if not first_page_markdown.strip():
@@ -563,19 +919,7 @@ async def _extract_bibliography(
             "doi": "",
             "citation": "",
         }
-
-    try:
-        prompt = bibliography_prompt(first_page_markdown)
-        response = await call_text_model(
-            client=client,
-            model=metadata_model,
-            prompt=prompt,
-            max_tokens=800,
-        )
-        raw = extract_json_object(response.content)
-        parsed = normalize_bibliography(raw)
-    except Exception:
-        parsed = normalize_bibliography({})
+    parsed = extract_bibliography_deterministic(first_page_markdown)
 
     return {
         "title": parsed.title,
@@ -587,131 +931,14 @@ async def _extract_bibliography(
     }
 
 
-def _final_doc_dir(args: argparse.Namespace, pdf_path: Path, bibliography: dict[str, Any]) -> Path:
-    group_dir = args.out_dir / output_group_name(pdf_path)
-    doc_id = doc_id_from_sha(file_sha256(pdf_path))
-    return group_dir / f"doc_{doc_id}"
-
-
-async def _extract_discovery(
-    client: AsyncOpenAI,
-    metadata_model: str,
-    bibliography: dict[str, Any],
+def _extract_discovery(
     page_count: int,
     consolidated_markdown: str,
 ) -> dict[str, Any]:
-    if not consolidated_markdown.strip():
-        return {"paper_summary": "", "key_topics": [], "sections": []}
-
-    async def _json_call(
-        prompt: str,
-        max_tokens: int,
-        schema: str,
-        attempts: int = 4,
-    ) -> dict[str, Any]:
-        for _ in range(attempts):
-            try:
-                response = await call_text_model(
-                    client=client,
-                    model=metadata_model,
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                )
-                candidates = [response.content or "", response.reasoning_content or ""]
-                for c in candidates:
-                    raw = extract_json_object(c)
-                    if isinstance(raw, dict) and raw:
-                        return raw
-                reasoning = (response.reasoning_content or "").strip()
-                if reasoning:
-                    repair_prompt = (
-                        "Convert these draft notes into one strict JSON object.\n"
-                        "Output JSON only, no prose.\n"
-                        f"Schema:\n{schema}\n\n"
-                        f"Notes:\n{reasoning[:7000]}"
-                    )
-                    repaired = await call_text_model(
-                        client=client,
-                        model=metadata_model,
-                        prompt=repair_prompt,
-                        max_tokens=max_tokens,
-                    )
-                    for c in [repaired.content or "", repaired.reasoning_content or ""]:
-                        raw = extract_json_object(c)
-                        if isinstance(raw, dict) and raw:
-                            return raw
-            except Exception:
-                continue
-        return {}
-
-    abstract_schema = '{' '"abstract":"...",' '"key_topics":["..."],' '}'
-    excerpt = first_pages_excerpt(consolidated_markdown, max_pages=5)
-    abstract_prompt = abstract_extraction_prompt(
-        title=str(bibliography.get("title", "")),
-        citation=str(bibliography.get("citation", "")),
+    return extract_discovery_deterministic(
+        consolidated_markdown=consolidated_markdown,
         page_count=page_count,
-        first_pages_markdown=excerpt,
     )
-    abstract_raw = await _json_call(abstract_prompt, max_tokens=700, schema=abstract_schema)
-    base_discovery = {"paper_summary": "", "key_topics": [], "sections": []}
-    if abstract_raw:
-        base_discovery = normalize_discovery(
-            {
-                "paper_summary": str(abstract_raw.get("abstract", "")).strip(),
-                "key_topics": abstract_raw.get("key_topics", []),
-                "sections": [],
-            },
-            page_count=page_count,
-        )
-    chunks = split_markdown_for_discovery(consolidated_markdown, max_chars=32000)
-    chunk_payloads: list[dict[str, Any]] = []
-    if chunks:
-        chunk_schema = (
-            '{'
-            '"chunk_summary":"...",'
-            '"key_topics":["..."],'
-            '"sections":[{"title":"...","start_page":1,"end_page":1,"summary":"..."}]'
-            '}'
-        )
-        for idx, chunk in enumerate(chunks, start=1):
-            prompt = discoverability_chunk_prompt(
-                title=str(bibliography.get("title", "")),
-                citation=str(bibliography.get("citation", "")),
-                page_count=page_count,
-                chunk_index=idx,
-                chunk_count=len(chunks),
-                markdown_chunk=chunk,
-            )
-            raw = await _json_call(prompt, max_tokens=1000, schema=chunk_schema)
-            if isinstance(raw, dict) and raw:
-                chunk_payloads.append(raw)
-
-    if chunk_payloads:
-        agg_schema = (
-            '{'
-            '"paper_summary":"...",'
-            '"key_topics":["..."],'
-            '"sections":[{"title":"...","start_page":1,"end_page":1,"summary":"..."}]'
-            '}'
-        )
-        agg_prompt = discoverability_aggregate_prompt(
-            title=str(bibliography.get("title", "")),
-            citation=str(bibliography.get("citation", "")),
-            page_count=page_count,
-            chunk_outputs=chunk_payloads,
-        )
-        agg_raw = await _json_call(agg_prompt, max_tokens=1200, schema=agg_schema)
-        agg_discovery = normalize_discovery(agg_raw, page_count=page_count) if agg_raw else {"paper_summary": "", "key_topics": [], "sections": []}
-        if agg_discovery.get("sections"):
-            if not agg_discovery.get("paper_summary"):
-                agg_discovery["paper_summary"] = str(base_discovery.get("paper_summary", ""))
-            if not agg_discovery.get("key_topics"):
-                agg_discovery["key_topics"] = list(base_discovery.get("key_topics", []))
-            return agg_discovery
-
-    if is_useful_discovery(base_discovery):
-        return base_discovery
-    return {"paper_summary": "", "key_topics": [], "sections": []}
 
 
 def _move_first_page_artifacts(
@@ -796,11 +1023,21 @@ def _job_slug_from_csv_stem(stem: str) -> str:
     return slug or "job"
 
 
-def _is_same_path(a: Path, b: Path) -> bool:
+def _infer_fetch_job_slug(doi_csv: Path, output_root: Path) -> str:
+    """Resolve job slug from CSV location when the CSV is already inside a job reports tree."""
+    fallback = _job_slug_from_csv_stem(doi_csv.stem)
     try:
-        return a.resolve() == b.resolve()
+        rel = doi_csv.resolve().relative_to(output_root.resolve())
     except Exception:  # noqa: BLE001
-        return str(a) == str(b)
+        return fallback
+
+    # Expected job-scoped patterns:
+    # - <job_slug>/reports/<file>.csv
+    # - <job_slug>/reports/<subdir>/<file>.csv
+    parts = rel.parts
+    if len(parts) >= 3 and parts[1] == "reports":
+        return _job_slug_from_csv_stem(parts[0])
+    return fallback
 
 
 def _is_path_within(path: Path, parent: Path) -> bool:
@@ -812,17 +1049,7 @@ def _is_path_within(path: Path, parent: Path) -> bool:
 
 
 def _resolve_fetch_job_dir(output_root: Path, csv_slug: str) -> Path:
-    job_dir = output_root / csv_slug
-    if _is_same_path(output_root, DEFAULT_FETCH_OUTPUT_ROOT):
-        legacy_job_dir = LEGACY_FETCH_OUTPUT_ROOT / csv_slug
-        if legacy_job_dir.exists() and not job_dir.exists():
-            job_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(legacy_job_dir), str(job_dir))
-            print(
-                "[fetch-telegram] migrated legacy job folder "
-                f"{legacy_job_dir} -> {job_dir}"
-            )
-    return job_dir
+    return output_root / csv_slug
 
 
 async def _process_page_structured(
@@ -1201,7 +1428,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             first_page = await _process_one_page(0, dirs)
             first_page_md = Path(first_page["output_files"].get("markdown", ""))
             first_page_text = first_page_md.read_text() if first_page_md.exists() else ""
-            bibliography = await _extract_bibliography(client, args.metadata_model, first_page_text)
+            bibliography = _extract_bibliography(first_page_text)
             if structured_enabled and structured_backend == "hybrid" and grobid_url.strip():
                 grobid_result = await asyncio.to_thread(
                     run_grobid_doc,
@@ -1356,13 +1583,7 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
         consolidated_text = "".join(md_out).strip() + "\n"
         write_text(doc_dir / consolidated_name, consolidated_text)
         write_text(final_dirs["metadata"] / "document.jsonl", "\n".join(jsonl_out) + "\n")
-        discovery = await _extract_discovery(
-            client=client,
-            metadata_model=args.metadata_model,
-            bibliography=bibliography,
-            page_count=page_count,
-            consolidated_markdown=consolidated_text,
-        )
+        discovery = _extract_discovery(page_count=page_count, consolidated_markdown=consolidated_text)
         if grobid_sections:
             discovered_sections = discovery.get("sections", []) or []
             grobid_high_conf = (
@@ -1388,8 +1609,13 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
             "unresolved_figure_count": 0,
             "errors": [],
             "header_ocr": {},
+            "table_structure": {},
             "ocr_merge": {},
             "ocr_html_comparison": {},
+            "table_llm_rectification": _disabled_table_rectifier_summary(
+                model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+            ),
         }
         strict_failure = False
         doc_errors: list[str] = []
@@ -1428,6 +1654,15 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                         "ocr_merge": summary.ocr_merge,
                     }
                 )
+                table_structure_summary: dict[str, Any] = {}
+                if str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)).strip().lower() != "off":
+                    table_structure_summary = build_table_structure_artifacts(
+                        doc_dir=doc_dir,
+                        model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
+                        command=str(getattr(args, "table_structure_command", "") or ""),
+                        timeout=int(getattr(args, "table_structure_timeout", TABLE_STRUCTURE_TIMEOUT_DEFAULT)),
+                    )
+                structured_data_manifest["table_structure"] = table_structure_summary
                 if bool(getattr(args, "compare_ocr_html", False)):
                     ocr_html_dir = getattr(args, "ocr_html_dir", None)
                     compare_summary = compare_marker_tables_with_ocr_html(
@@ -1435,9 +1670,30 @@ async def _process_pdf(args: argparse.Namespace, pdf_path: Path) -> dict[str, An
                         ocr_html_dir=ocr_html_dir,
                     )
                     structured_data_manifest["ocr_html_comparison"] = compare_summary
+                if bool(getattr(args, "table_llm_rectify", True)):
+                    rectifier_result = await run_table_rectification_for_doc(
+                        doc_dir=doc_dir,
+                        client=client,
+                        config=RectifierConfig(
+                            model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                            max_tokens=int(getattr(args, "table_llm_max_tokens", TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT)),
+                            risk_threshold=float(
+                                getattr(args, "table_llm_risk_threshold", TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT)
+                            ),
+                            max_tables_per_doc=int(
+                                getattr(args, "table_llm_max_tables_per_doc", TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT)
+                            ),
+                            target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                            structure_model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
+                            structure_lock=True,
+                            skip_already_rectified=not bool(getattr(args, "table_llm_rerectify", False)),
+                        ),
+                    )
+                    structured_data_manifest["table_llm_rectification"] = asdict(rectifier_result)
             except Exception as exc:  # noqa: BLE001
                 structured_data_manifest["errors"] = [str(exc)]
                 structured_data_manifest["ocr_merge"] = {}
+                structured_data_manifest["table_structure"] = {}
                 if "Strict table artifact mode failed" in str(exc):
                     strict_failure = True
                 doc_errors.append(str(exc))
@@ -1502,6 +1758,9 @@ async def _run(args: argparse.Namespace) -> None:
             "Refusing to write final OCR outputs under data/jobs. "
             "Use a canonical output folder such as out/<job_slug>."
         )
+    violation = _resource_guard_violation(args)
+    if violation:
+        raise SystemExit(violation)
     pdfs = discover_pdfs(args.in_dir)
     if not pdfs:
         raise SystemExit(f"No PDFs found in {args.in_dir}")
@@ -1540,19 +1799,60 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         raise SystemExit("Missing target bot. Set TARGET_BOT in .env or pass --target-bot.")
 
     api_id, api_hash = _require_telegram_credentials()
-    csv_name = _job_slug_from_csv_stem(args.doi_csv.stem)
+    csv_name = _infer_fetch_job_slug(args.doi_csv, args.output_root)
     job_dir = _resolve_fetch_job_dir(args.output_root, csv_name)
     pdf_dir = job_dir / "pdfs"
     reports_dir = job_dir / "reports"
+    doi_resolution_dir = reports_dir / "doi_resolution"
     pdf_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
+    doi_resolution_dir.mkdir(parents=True, exist_ok=True)
+
+    doi_csv = args.doi_csv
+    doi_column = args.doi_column
+    if bool(getattr(args, "resolve_dois", True)):
+        resolve_paths = resolve_dois(
+            DoiResolutionConfig(
+                input_csv=args.doi_csv,
+                output_dir=doi_resolution_dir,
+                doi_column=getattr(args, "doi_column", None),
+                url_column=getattr(args, "url_column", None),
+                title_column=getattr(args, "title_column", None),
+                author_column=getattr(args, "author_column", None),
+                year_column=getattr(args, "year_column", None),
+                container_column=getattr(args, "container_column", None),
+                crossref_mailto=str(getattr(args, "crossref_mailto", "") or ""),
+                rows=int(getattr(args, "resolve_rows", 5)),
+                timeout=int(getattr(args, "resolve_timeout", 20)),
+                max_retries=int(getattr(args, "resolve_max_retries", 3)),
+                use_cache=bool(getattr(args, "resolve_cache", True)),
+                refresh_cache=bool(getattr(args, "resolve_refresh_cache", False)),
+            )
+        )
+        doi_csv = Path(str(resolve_paths["fetch_ready_csv"]))
+        doi_column = "DOI"
+        try:
+            summary_payload = json.loads(Path(str(resolve_paths["summary_json"])).read_text())
+        except Exception:
+            summary_payload = {}
+        skipped = {
+            key: value
+            for key, value in dict(summary_payload.get("status_counts", {})).items()
+            if key not in {"canonicalized_crossref", "canonicalized_non_crossref", "inferred_crossref"}
+        }
+        print(
+            "[fetch-telegram] doi preflight complete "
+            f"fetch_ready_csv={doi_csv} "
+            f"skipped_status_counts={skipped} "
+            f"report_dir={doi_resolution_dir}"
+        )
 
     config = FetchTelegramConfig(
         api_id=api_id,
         api_hash=api_hash,
-        doi_csv=args.doi_csv,
+        doi_csv=doi_csv,
         in_dir=pdf_dir,
-        doi_column=args.doi_column,
+        doi_column=doi_column,
         target_bot=args.target_bot,
         session_name=args.session_name,
         min_delay=args.min_delay,
@@ -1562,8 +1862,41 @@ async def _run_fetch_telegram(args: argparse.Namespace) -> None:
         report_file=args.report_file or (reports_dir / "telegram_download_report.csv"),
         failed_file=args.failed_file or (reports_dir / "telegram_failed_papers.csv"),
         debug=args.debug,
+        scihub_fallback=bool(getattr(args, "scihub_fallback", True)),
+        scihub_timeout=int(getattr(args, "scihub_timeout", SCIHUB_TIMEOUT_DEFAULT)),
+        scihub_base_urls=str(getattr(args, "scihub_base_urls", "") or ""),
     )
     await fetch_from_telegram(config)
+
+
+def _run_resolve_dois(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.input_csv.exists():
+        raise SystemExit(f"Input CSV does not exist: {args.input_csv}")
+    csv_name = _job_slug_from_csv_stem(args.input_csv.stem)
+    job_dir = _resolve_fetch_job_dir(args.output_root, csv_name)
+    out_dir = job_dir / "reports" / "doi_resolution"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = resolve_dois(
+        DoiResolutionConfig(
+            input_csv=args.input_csv,
+            output_dir=out_dir,
+            doi_column=getattr(args, "doi_column", None),
+            url_column=getattr(args, "url_column", None),
+            title_column=getattr(args, "title_column", None),
+            author_column=getattr(args, "author_column", None),
+            year_column=getattr(args, "year_column", None),
+            container_column=getattr(args, "container_column", None),
+            crossref_mailto=str(getattr(args, "crossref_mailto", "") or ""),
+            rows=int(getattr(args, "rows", 5)),
+            timeout=int(getattr(args, "timeout", 20)),
+            max_retries=int(getattr(args, "max_retries", 3)),
+            use_cache=bool(getattr(args, "cache", True)),
+            refresh_cache=bool(getattr(args, "refresh_cache", False)),
+        )
+    )
+    print(f"[resolve-dois] wrote artifacts to {out_dir}")
+    return paths
 
 
 def _discover_ocr_doc_dirs(ocr_out_dir: Path) -> list[Path]:
@@ -1658,6 +1991,59 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 table_qa_mode=str(getattr(args, "table_qa_mode", "warn")),
                 grobid_status=grobid_status,
             )
+            table_llm_rectification = _disabled_table_rectifier_summary(
+                model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+            )
+            table_structure_summary: dict[str, Any] = {}
+            if str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)).strip().lower() != "off":
+                table_structure_summary = build_table_structure_artifacts(
+                    doc_dir=doc_dir,
+                    model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
+                    command=str(getattr(args, "table_structure_command", "") or ""),
+                    timeout=int(getattr(args, "table_structure_timeout", TABLE_STRUCTURE_TIMEOUT_DEFAULT)),
+                )
+            if bool(getattr(args, "table_llm_rectify", True)):
+                api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
+                if api_key:
+                    base_url = str(manifest.get("base_url", "") or "https://api.deepinfra.com/v1/openai")
+                    llm_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+                    llm_result = asyncio.run(
+                        run_table_rectification_for_doc(
+                            doc_dir=doc_dir,
+                            client=llm_client,
+                            config=RectifierConfig(
+                                model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                                max_tokens=int(
+                                    getattr(args, "table_llm_max_tokens", TABLE_LLM_RECTIFIER_MAX_TOKENS_DEFAULT)
+                                ),
+                                risk_threshold=float(
+                                    getattr(args, "table_llm_risk_threshold", TABLE_LLM_RECTIFIER_RISK_THRESHOLD_DEFAULT)
+                                ),
+                                max_tables_per_doc=int(
+                                    getattr(
+                                        args,
+                                        "table_llm_max_tables_per_doc",
+                                        TABLE_LLM_RECTIFIER_MAX_TABLES_PER_DOC_DEFAULT,
+                                    )
+                                ),
+                                target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                                structure_model=str(getattr(args, "table_structure_model", TABLE_STRUCTURE_MODEL_DEFAULT)),
+                                structure_lock=True,
+                                skip_already_rectified=not bool(getattr(args, "table_llm_rerectify", False)),
+                            ),
+                        )
+                    )
+                    table_llm_rectification = asdict(llm_result)
+                else:
+                    table_llm_rectification = asdict(
+                        RectifierResult(
+                            enabled=True,
+                            model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                            target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                            errors=1,
+                        )
+                    )
             structured_data_manifest: dict[str, Any] = {
                 "enabled": True,
                 "table_count": summary.table_count,
@@ -1666,8 +2052,10 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "unresolved_figure_count": summary.unresolved_figure_count,
                 "errors": summary.errors,
                 "header_ocr": header_ocr_summary,
+                "table_structure": table_structure_summary,
                 "ocr_merge": summary.ocr_merge,
                 "ocr_html_comparison": {},
+                "table_llm_rectification": table_llm_rectification,
             }
             if bool(getattr(args, "compare_ocr_html", False)):
                 compare_summary = compare_marker_tables_with_ocr_html(
@@ -1684,8 +2072,13 @@ def _run_export_structured_data(args: argparse.Namespace) -> dict[str, int]:
                 "unresolved_figure_count": 0,
                 "errors": [str(exc)],
                 "header_ocr": {},
+                "table_structure": {},
                 "ocr_merge": {},
                 "ocr_html_comparison": {},
+                "table_llm_rectification": _disabled_table_rectifier_summary(
+                    model=str(getattr(args, "table_llm_model", TABLE_LLM_RECTIFIER_MODEL_DEFAULT)),
+                    target=str(getattr(args, "table_llm_target", TABLE_LLM_RECTIFIER_TARGET_DEFAULT)),
+                ),
             }
             if "Strict table artifact mode failed" in str(exc):
                 failed_docs += 1
@@ -1786,6 +2179,50 @@ def _run_eval_table_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     return metrics
 
 
+def _run_validate_tables_gemini(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.ocr_out_dir.exists():
+        raise SystemExit(f"OCR output directory does not exist: {args.ocr_out_dir}")
+
+    api_key = str(getattr(args, "api_key", "") or "").strip()
+    if not api_key:
+        env_name = str(getattr(args, "api_key_env", "GEMINI_API_KEY") or "GEMINI_API_KEY")
+        api_key = os.getenv(env_name, "").strip()
+    if not api_key:
+        env_name = str(getattr(args, "api_key_env", "GEMINI_API_KEY") or "GEMINI_API_KEY")
+        raise SystemExit(f"Missing Gemini API key. Set {env_name} or pass --api-key.")
+
+    config = GeminiValidationConfig(
+        model=str(getattr(args, "model", GEMINI_TABLE_VALIDATION_MODEL_DEFAULT)),
+        api_key=api_key,
+        max_output_tokens=int(getattr(args, "max_output_tokens", 2000)),
+        render_dpi=int(getattr(args, "render_dpi", 220)),
+    )
+    summary = asyncio.run(
+        run_gemini_table_validation(
+            ocr_out_dir=args.ocr_out_dir,
+            config=config,
+            only_problem_docs=bool(getattr(args, "only_problem_docs", True)),
+            max_docs=int(getattr(args, "max_docs", 0)),
+            max_tables_per_doc=int(getattr(args, "max_tables_per_doc", 0)),
+        )
+    )
+    print(json.dumps(summary, indent=2))
+    return summary
+
+
+def _run_summarize_gemini_failures(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.ocr_out_dir.exists():
+        raise SystemExit(f"OCR output directory does not exist: {args.ocr_out_dir}")
+    payload = summarize_gemini_failures(
+        ocr_out_dir=args.ocr_out_dir,
+        report_out=getattr(args, "report_out", None),
+        baseline_path=getattr(args, "baseline", None),
+        gates_path=getattr(args, "gates", None),
+    )
+    print(json.dumps(payload, indent=2))
+    return payload
+
+
 def _run_data_audit(args: argparse.Namespace) -> dict[str, Any]:
     report = run_data_audit(args.data_dir)
     payload = report.to_dict()
@@ -1805,6 +2242,8 @@ def main() -> None:
         asyncio.run(_run(args))
     elif args.command == "fetch-telegram":
         asyncio.run(_run_fetch_telegram(args))
+    elif args.command == "resolve-dois":
+        _run_resolve_dois(args)
     elif args.command == "export-structured-data":
         _run_export_structured_data(args)
     elif args.command == "export-facts":
@@ -1813,6 +2252,10 @@ def main() -> None:
         _run_data_audit(args)
     elif args.command == "eval-table-pipeline":
         _run_eval_table_pipeline(args)
+    elif args.command == "validate-tables-gemini":
+        _run_validate_tables_gemini(args)
+    elif args.command == "summarize-gemini-failures":
+        _run_summarize_gemini_failures(args)
 
 
 if __name__ == "__main__":

@@ -70,6 +70,7 @@ Optional fetch defaults:
 ```ini
 MIN_DELAY=4
 MAX_DELAY=8
+CROSSREF_MAILTO=
 ```
 
 Optional born-digital structured defaults:
@@ -81,6 +82,15 @@ PAPER_OCR_MARKER_URL=
 PAPER_OCR_GROBID_URL=
 PAPER_OCR_MARKER_TIMEOUT=120
 PAPER_OCR_GROBID_TIMEOUT=60
+```
+
+Resource guard defaults (to avoid accidental local heavy runs on low-resource hosts):
+
+```ini
+PAPER_OCR_RESOURCE_GUARD_MIN_MEM_GB=24
+PAPER_OCR_RESOURCE_GUARD_MIN_CPUS=8
+PAPER_OCR_REQUIRE_WSL_FOR_STRUCTURED=0
+PAPER_OCR_ALLOW_LOCAL_HEAVY=0
 ```
 
 ## Repository Organization
@@ -124,7 +134,6 @@ Core options:
 - `--debug`
 - `--scan-preprocess`
 - `--text-only` / `--no-text-only` (default: `--text-only`)
-- `--metadata-model` default `nvidia/Nemotron-3-Nano-30B-A3B`
 - `--digital-structured off|auto|on` default `auto`
 - `--structured-backend marker|hybrid` default `hybrid`
 - `--marker-command` default `marker_single`
@@ -147,6 +156,12 @@ Core options:
 - `--table-escalation off|auto|always` default `auto`
 - `--table-escalation-max` default `20`
 - `--table-qa-mode off|warn|strict` default `warn`
+- `--allow-local-heavy` bypass resource guard and allow local structured execution
+
+Resource guard behavior:
+- If `--digital-structured` is `auto|on` and no `--marker-url` is set, `paper-ocr run` checks host resources.
+- On low-resource hosts, run fails fast with instructions to use WSL Marker/GROBID services through SSH tunneling.
+- Override only when intentional: `--allow-local-heavy` or `PAPER_OCR_ALLOW_LOCAL_HEAVY=1`.
 
 ### 2) Fetch PDFs from DOI CSV via Telegram bot
 
@@ -166,14 +181,45 @@ Fetch options:
 - `--max-delay` default `8`
 - `--response-timeout` default `15` (seconds per poll)
 - `--search-timeout` default `40` (seconds total after `searching...`)
+- `--resolve-dois` / `--no-resolve-dois` default enabled
+- `--url-column` / `--title-column` / `--author-column` / `--year-column` / `--container-column` (optional input overrides)
+- `--crossref-mailto` optional contact for Crossref polite pool
+- `--resolve-rows` default `5`
+- `--resolve-timeout` default `20`
+- `--resolve-max-retries` default `3`
+- `--resolve-cache` / `--no-resolve-cache` default enabled
+- `--resolve-refresh-cache` default disabled
+- `--scihub-fallback` / `--no-scihub-fallback` default enabled (backup when Telegram fails)
+- `--scihub-timeout` default `6`
+- `--scihub-base-urls` optional comma-separated mirrors (otherwise auto-discover)
 - `--debug`
 - `--report-file` override report path
 - `--failed-file` override failed-report path
 
-Compatibility note:
-- Legacy jobs under `data/telegram_jobs/<job_slug>/` are auto-migrated to `data/jobs/<job_slug>/` when using the default `output_root`.
+### 3) Resolve and canonicalize DOIs (standalone preflight)
 
-### 3) Export structured data from existing OCR outputs
+```bash
+uv run paper-ocr resolve-dois <input_csv> [output_root] [options]
+```
+
+Key options:
+- `--doi-column` / `--url-column` / `--title-column` / `--author-column` / `--year-column` / `--container-column`
+- `--crossref-mailto`
+- `--rows` default `5`
+- `--timeout` default `20`
+- `--max-retries` default `3`
+- `--cache` / `--no-cache` default enabled
+- `--refresh-cache` default disabled
+
+Artifacts written per job in:
+- `reports/doi_resolution/resolved.csv`
+- `reports/doi_resolution/fetch_ready_dois.csv`
+- `reports/doi_resolution/candidates.jsonl`
+- `reports/doi_resolution/crossref_raw.jsonl`
+- `reports/doi_resolution/summary.json`
+- `reports/doi_resolution/cache.json`
+
+### 4) Export structured data from existing OCR outputs
 
 ```bash
 uv run paper-ocr export-structured-data <ocr_out_dir> [options]
@@ -196,7 +242,7 @@ This command scans existing OCR document folders, regenerates:
 
 and updates each document manifest with `structured_data_extraction`.
 
-### 4) Export dataset-grade fact records
+### 5) Export dataset-grade fact records
 
 ```bash
 uv run paper-ocr export-facts <ocr_out_dir>
@@ -213,7 +259,7 @@ Default table stack:
 - OCR-assisted header merge (`--table-ocr-merge --table-ocr-merge-scope header`)
 - This recovers missing symbols in headers (for example `δ`, `η`, `γ`) while avoiding OCR body-row corruption.
 
-### 5) Audit data layout contract
+### 6) Audit data layout contract
 
 ```bash
 uv run paper-ocr data-audit [data_dir] [--strict] [--json]
@@ -225,7 +271,7 @@ Behavior:
 - flags misplaced PDFs
 - `--strict` returns non-zero on errors
 
-### 6) Evaluate table pipeline against gold set
+### 7) Evaluate table pipeline against gold set
 
 ```bash
 uv run paper-ocr eval-table-pipeline <gold_dir> <pred_dir>
@@ -352,13 +398,19 @@ This keeps `paper-ocr` orchestration separate from service hosting and allows he
 input/papers.csv
 ```
 
-2. Fetch PDFs:
+2. Optional standalone preflight (Telegram fetch runs this automatically by default):
+
+```bash
+uv run paper-ocr resolve-dois input/papers.csv
+```
+
+3. Fetch PDFs:
 
 ```bash
 uv run paper-ocr fetch-telegram input/papers.csv
 ```
 
-3. OCR fetched PDFs:
+4. OCR fetched PDFs:
 
 ```bash
 uv run paper-ocr run data/jobs/papers/pdfs out/papers
@@ -373,6 +425,13 @@ data/jobs/papers/
   pdfs/
     <bot_paper_title>.pdf
   reports/
+    doi_resolution/
+      resolved.csv
+      fetch_ready_dois.csv
+      candidates.jsonl
+      crossref_raw.jsonl
+      summary.json
+      cache.json
     telegram_download_report.csv
     telegram_failed_papers.csv
     download_index.json
@@ -441,10 +500,42 @@ Behavior notes:
 
 ## Development
 
-Run tests:
+The test suite uses **test lanes** so local iteration stays fast on low-resource machines.
+
+Fast lane (default local run):
 
 ```bash
 uv run pytest
+```
+
+This excludes tests marked `integration`, `slow`, `network`, `service`, and `gpu`.
+
+Full lane (pre-push / CI / release checks):
+
+```bash
+uv run pytest --run-integration --run-slow --run-network --run-service --run-gpu
+```
+
+Equivalent env-based full run:
+
+```bash
+PAPER_OCR_TEST_FULL=1 uv run pytest
+```
+
+Useful developer commands:
+
+```bash
+# run only last failed tests
+uv run pytest --lf
+
+# run failures first, then the rest
+uv run pytest --ff
+
+# run a subset by expression
+uv run pytest -k "doi and not telegram"
+
+# run one module in full lane
+uv run pytest tests/test_cli.py --run-integration
 ```
 
 Project layout:
@@ -482,7 +573,10 @@ Project layout:
 
 ## Contributing
 
-- Use `uv` commands (`uv sync`, `uv run ...`, `uv run pytest`).
+- Use `uv` commands (`uv sync`, `uv run ...`).
+- Use test lanes:
+  - local fast lane: `uv run pytest`
+  - full lane before merge: `uv run pytest --run-integration --run-slow --run-network --run-service --run-gpu`
 - Add/adjust tests with behavior changes.
 - Keep output structure deterministic and idempotent.
 - Prefer small, reviewable commits.

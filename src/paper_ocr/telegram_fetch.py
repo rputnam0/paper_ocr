@@ -9,6 +9,9 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import parse_qs, unquote, urlparse
+
+from .scihub import download_pdf_via_scihub, parse_scihub_base_urls
 
 try:
     from telethon import TelegramClient
@@ -22,13 +25,15 @@ except Exception:  # pragma: no cover - exercised only when dependency missing
 try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover - exercised only when dependency missing
-    def tqdm(iterable, **kwargs):  # type: ignore[no-redef]
+    def tqdm(iterable, **_kwargs):  # type: ignore[no-redef]
         return iterable
 
 
 DOI_PREFIX_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", re.IGNORECASE)
+DOI_MATCH_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>]+", re.IGNORECASE)
 SAFE_CHAR_RE = re.compile(r"[^A-Za-z0-9._-]+")
 LEADING_SYMBOLS_RE = re.compile(r"^[^A-Za-z0-9]+")
+DOI_TRAILING_CHARS = ".,;:)]}>\"'"
 
 FAILURE_MARKERS = (
     "not found",
@@ -37,7 +42,9 @@ FAILURE_MARKERS = (
     "points exhausted",
     "no points",
 )
-SEARCHING_MARKERS = ("searching", "processing", "queued")
+SEARCHING_MARKERS = ("searching", "processing", "queued", "looking at")
+UPLOAD_PROGRESS_MARKERS = ("uploaded to telegram", "uploading to telegram")
+POINTS_LABEL_RE = re.compile(r"(\d+)\s*pts?", re.IGNORECASE)
 
 REPORT_COLUMNS = [
     "doi_original",
@@ -51,6 +58,7 @@ REPORT_COLUMNS = [
     "elapsed_s",
 ]
 MAX_FILENAME_STEM = 180
+MAX_DOI_REQUERY_ATTEMPTS = 3
 
 
 @dataclass
@@ -82,11 +90,63 @@ class FetchTelegramConfig:
     report_file: Path | None = None
     failed_file: Path | None = None
     debug: bool = False
+    scihub_fallback: bool = True
+    scihub_timeout: int = 6
+    scihub_base_urls: str = ""
 
 
 def normalize_doi(raw: str) -> str:
+    resolved = resolve_doi_from_raw(raw)
+    if resolved:
+        return resolved
     doi = DOI_PREFIX_RE.sub("", (raw or "").strip())
     return doi.lower()
+
+
+def _clean_doi_candidate(raw: str) -> str:
+    candidate = DOI_PREFIX_RE.sub("", (raw or "").strip())
+    candidate = candidate.strip().strip("<>{}[]()")
+    while candidate and candidate[-1] in DOI_TRAILING_CHARS:
+        candidate = candidate[:-1]
+    return candidate.strip().lower()
+
+
+def _looks_like_doi(value: str) -> bool:
+    return bool(DOI_MATCH_RE.fullmatch(value))
+
+
+def _extract_dois_from_text(raw: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _record(value: str) -> None:
+        cleaned = _clean_doi_candidate(value)
+        if cleaned and _looks_like_doi(cleaned) and cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+
+    text = (raw or "").strip()
+    if not text:
+        return out
+
+    _record(text)
+
+    decoded = unquote(text)
+    for source in {text, decoded}:
+        for match in DOI_MATCH_RE.findall(source):
+            _record(match)
+        parsed = urlparse(source)
+        if parsed.scheme and parsed.netloc:
+            for value in parse_qs(parsed.query).get("doi", []):
+                _record(value)
+            if "doi.org" in parsed.netloc.lower() and parsed.path:
+                _record(parsed.path.lstrip("/"))
+    return out
+
+
+def resolve_doi_from_raw(raw: str) -> str:
+    candidates = _extract_dois_from_text(raw)
+    return candidates[0] if candidates else ""
 
 
 def doi_filename(doi: str) -> str:
@@ -221,6 +281,49 @@ def _button_labels(message: Any) -> list[str]:
     return labels
 
 
+def _button_urls(message: Any) -> list[str]:
+    buttons = getattr(message, "buttons", None)
+    if not buttons:
+        return []
+    urls: list[str] = []
+    for row in buttons:
+        for button in row:
+            url = getattr(button, "url", None)
+            if isinstance(url, str) and url.strip():
+                urls.append(url.strip())
+    return urls
+
+
+def _link_button_index(message: Any) -> int | None:
+    buttons = getattr(message, "buttons", None)
+    if not buttons:
+        return None
+    idx = 0
+    for row in buttons:
+        for button in row:
+            label = str(getattr(button, "text", "") or "")
+            url = getattr(button, "url", None)
+            label_low = label.lower()
+            if isinstance(url, str) and url.strip():
+                return idx
+            if "🔗" in label or "link" in label_low:
+                return idx
+            idx += 1
+    return None
+
+
+def _message_doi_candidates(message: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    raw_values = [_message_text(message), *_button_urls(message)]
+    for raw in raw_values:
+        for doi in _extract_dois_from_text(raw):
+            if doi not in seen:
+                seen.add(doi)
+                out.append(doi)
+    return out
+
+
 def _request_button_index(message: Any) -> int | None:
     labels = _button_labels(message)
     for idx, label in enumerate(labels):
@@ -237,6 +340,27 @@ def _pdf_button_index(message: Any) -> int | None:
     return None
 
 
+def _confirm_button_index(message: Any) -> int | None:
+    labels = _button_labels(message)
+    for idx, label in enumerate(labels):
+        low = label.lower()
+        if "confirm" in low or "✅" in label:
+            return idx
+    return None
+
+
+def _required_points(message: Any) -> int | None:
+    labels = _button_labels(message)
+    for label in labels:
+        match = POINTS_LABEL_RE.search(label)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+    return None
+
+
 def _is_hard_failure(text: str) -> bool:
     low = text.lower()
     return any(marker in low for marker in FAILURE_MARKERS)
@@ -244,7 +368,9 @@ def _is_hard_failure(text: str) -> bool:
 
 def _is_searching(text: str) -> bool:
     low = text.lower()
-    return any(marker in low for marker in SEARCHING_MARKERS)
+    return any(marker in low for marker in SEARCHING_MARKERS) or any(
+        marker in low for marker in UPLOAD_PROGRESS_MARKERS
+    )
 
 
 async def _with_floodwait(call: Callable[[], Awaitable[Any]]) -> Any:
@@ -265,6 +391,9 @@ async def process_doi(
     search_timeout: int = 40,
     existing_file_path: Path | None = None,
     debug: bool = False,
+    scihub_fallback: bool = False,
+    scihub_timeout: int = 6,
+    scihub_base_urls: list[str] | None = None,
 ) -> FetchResult:
     started = _utc_now()
     fallback_path = in_dir / doi_filename(doi_normalized)
@@ -302,47 +431,19 @@ async def process_doi(
     excerpt = ""
     saw_searching = False
     search_deadline: float | None = None
+    attempted_queries: set[str] = {doi_normalized}
+    requery_attempts = 0
+    clicked_link_buttons: set[tuple[int, int]] = set()
 
     async def _next_response(conv: Any, *, edit_from: Any | None = None) -> Any:
         while True:
             try:
-                if edit_from is not None and hasattr(conv, "get_edit"):
-                    response_task = asyncio.create_task(_with_floodwait(conv.get_response))
-                    edit_task = asyncio.create_task(
-                        _with_floodwait(lambda: conv.get_edit(message=edit_from))
-                    )
-                    done, pending = await asyncio.wait(
-                        {response_task, edit_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    response_timed_out = False
-                    if response_task in done:
-                        exc = response_task.exception()
-                        if exc is None:
-                            return response_task.result()
-                        if isinstance(exc, asyncio.TimeoutError):
-                            response_timed_out = True
-                        else:
-                            raise exc
-
-                    edit_timed_out = False
-                    if edit_task in done:
-                        exc = edit_task.exception()
-                        if exc is None:
-                            return edit_task.result()
-                        if isinstance(exc, asyncio.TimeoutError):
-                            edit_timed_out = True
-                        else:
-                            raise exc
-
-                    if response_timed_out or edit_timed_out:
-                        raise asyncio.TimeoutError()
-                    raise RuntimeError("No completed task result while waiting for bot response")
-
-                return await _with_floodwait(conv.get_response)
+                try:
+                    return await _with_floodwait(conv.get_response)
+                except asyncio.TimeoutError:
+                    if edit_from is not None and hasattr(conv, "get_edit"):
+                        return await _with_floodwait(lambda: conv.get_edit(message=edit_from))
+                    raise
             except asyncio.TimeoutError:
                 if saw_searching and search_deadline is not None and time.monotonic() < search_deadline:
                     continue
@@ -386,6 +487,17 @@ async def process_doi(
                     response = await _next_response(conv)
                     continue
 
+                confirm_idx = _confirm_button_index(response)
+                if confirm_idx is not None:
+                    required_points = _required_points(response)
+                    if required_points is not None and required_points <= 0:
+                        await _with_floodwait(lambda: response.click(confirm_idx))
+                        saw_searching = True
+                        if search_deadline is None:
+                            search_deadline = time.monotonic() + max(search_timeout, response_timeout)
+                        response = await _next_response(conv, edit_from=sent_message)
+                        continue
+
                 if _is_hard_failure(text):
                     status = "Failed"
                     error = text or "Not found"
@@ -395,6 +507,27 @@ async def process_doi(
                     saw_searching = True
                     if search_deadline is None:
                         search_deadline = time.monotonic() + max(search_timeout, response_timeout)
+                    response = await _next_response(conv, edit_from=sent_message)
+                    continue
+
+                doi_candidates = _message_doi_candidates(response)
+                if requery_attempts < MAX_DOI_REQUERY_ATTEMPTS:
+                    next_doi = next((doi for doi in doi_candidates if doi not in attempted_queries), "")
+                    if next_doi:
+                        attempted_queries.add(next_doi)
+                        requery_attempts += 1
+                        sent_message = await _with_floodwait(lambda: conv.send_message(next_doi))
+                        response = await _next_response(conv)
+                        continue
+
+                link_button_idx = _link_button_index(response)
+                response_key = int(getattr(response, "id", 0) or id(response))
+                if (
+                    link_button_idx is not None
+                    and (response_key, link_button_idx) not in clicked_link_buttons
+                ):
+                    clicked_link_buttons.add((response_key, link_button_idx))
+                    await _with_floodwait(lambda: response.click(link_button_idx))
                     response = await _next_response(conv, edit_from=sent_message)
                     continue
 
@@ -412,6 +545,38 @@ async def process_doi(
     except Exception as exc:  # pragma: no cover - defensive guard
         status = "Error"
         error = str(exc)
+
+    if scihub_fallback and status not in {"Success", "Exists"}:
+        original_status = status
+        fallback_note = "SciHub fallback did not find a PDF"
+        fallback_identifiers: list[str] = []
+        for candidate in [doi_original.strip(), doi_normalized.strip()]:
+            if candidate and candidate not in fallback_identifiers:
+                fallback_identifiers.append(candidate)
+        try:
+            fallback_download: Path | None = None
+            for identifier in fallback_identifiers:
+                candidate_path = await asyncio.to_thread(
+                    download_pdf_via_scihub,
+                    identifier=identifier,
+                    output_path=fallback_path,
+                    timeout=int(scihub_timeout),
+                    base_urls=scihub_base_urls or None,
+                )
+                if candidate_path is not None and Path(candidate_path).exists():
+                    fallback_download = Path(candidate_path)
+                    break
+            if fallback_download is not None:
+                status = "Success"
+                fallback_path = fallback_download
+                error = ""
+                marker = f"fallback=scihub after={original_status}"
+                excerpt = _excerpt(f"{excerpt} | {marker}" if excerpt else marker)
+            else:
+                error = f"{error} | {fallback_note}" if error else fallback_note
+        except Exception as exc:
+            fallback_err = f"SciHub fallback error: {exc}"
+            error = f"{error} | {fallback_err}" if error else fallback_err
 
     finished = _utc_now()
     return FetchResult(
@@ -444,6 +609,7 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
     rows: list[FetchResult] = []
     index = load_download_index(index_file)
     index.update(load_index_from_report(report_file, config.in_dir))
+    scihub_base_urls = parse_scihub_base_urls(config.scihub_base_urls)
 
     client = TelegramClient(config.session_name, config.api_id, config.api_hash)
     await client.start()
@@ -464,6 +630,9 @@ async def fetch_from_telegram(config: FetchTelegramConfig) -> list[FetchResult]:
                 search_timeout=config.search_timeout,
                 existing_file_path=(config.in_dir / index[doi_normalized]) if doi_normalized in index else None,
                 debug=config.debug,
+                scihub_fallback=config.scihub_fallback,
+                scihub_timeout=config.scihub_timeout,
+                scihub_base_urls=scihub_base_urls,
             )
             rows.append(result)
             if result.status in {"Success", "Exists"} and result.file_path:
