@@ -1,5 +1,6 @@
 from paper_ocr.bibliography import (
     citation_from_bibliography,
+    extract_bibliography_deterministic,
     extract_json_object,
     folder_name_from_bibliography,
     markdown_filename_from_title,
@@ -49,3 +50,16 @@ def test_citation_from_bibliography_uses_journal_ref_and_doi():
         citation_from_bibliography(info)
         == "Transactions of the Society of Rheology 16(1), 99-127. doi:10.1122/1.549276"
     )
+
+
+def test_extract_bibliography_keeps_year_and_journal_when_doi_shares_line():
+    parsed = extract_bibliography_deterministic(
+        (
+            "Rheology of Structured Fluids\n\n"
+            "Jane Doe, John Smith\n\n"
+            "Journal of Rheology 54(2), 255-279 (2010) doi:10.1000/xyz\n"
+        )
+    )
+    assert parsed.year == "2010"
+    assert parsed.journal_ref == "Journal of Rheology 54(2), 255-279 (2010)"
+    assert parsed.doi == "10.1000/xyz"

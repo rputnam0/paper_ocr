@@ -230,11 +230,23 @@ def _extract_doi(text: str) -> str:
     return match.group(0).rstrip(".,;)")
 
 
+def _strip_doi_tokens(line: str) -> str:
+    text = str(line or "")
+    if not text:
+        return ""
+    # Remove DOI URL forms first, then inline DOI labels, then bare DOI tokens.
+    text = re.sub(r"https?://(?:dx\.)?doi\.org/\S+", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bdoi\s*:\s*", " ", text, flags=re.IGNORECASE)
+    text = DOI_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip(" ;,")
+
+
 def _extract_year(lines: list[str]) -> str:
     for line in lines:
-        if "doi" in line.lower():
+        scrubbed = _strip_doi_tokens(line)
+        if not scrubbed:
             continue
-        match = YEAR_RE.search(line)
+        match = YEAR_RE.search(scrubbed)
         if match:
             return match.group(0)
     return ""
@@ -245,15 +257,14 @@ def _extract_journal_ref(lines: list[str], title: str, authors: list[str]) -> st
     author_lows = {a.lower().strip() for a in authors}
     hints = ("journal", "proceedings", "conference", "vol.", "volume", "issue", "arxiv", "pp.", "pages")
     for line in lines:
-        low = line.lower().strip()
+        cleaned = _strip_doi_tokens(line)
+        low = cleaned.lower().strip()
         if not low:
             continue
         if low == title_low or low in author_lows:
             continue
-        if "doi" in low:
-            continue
-        if any(h in low for h in hints) or YEAR_RE.search(line):
-            return line
+        if any(h in low for h in hints) or YEAR_RE.search(cleaned):
+            return cleaned
     return ""
 
 

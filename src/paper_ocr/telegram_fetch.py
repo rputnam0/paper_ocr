@@ -85,8 +85,8 @@ class FetchTelegramConfig:
     session_name: str = "nexus_session"
     min_delay: float = 10.0
     max_delay: float = 20.0
-    response_timeout: int = 4
-    search_timeout: int = 6
+    response_timeout: int = 15
+    search_timeout: int = 40
     report_file: Path | None = None
     failed_file: Path | None = None
     debug: bool = False
@@ -387,8 +387,8 @@ async def process_doi(
     doi_original: str,
     doi_normalized: str,
     in_dir: Path,
-    response_timeout: int = 4,
-    search_timeout: int = 6,
+    response_timeout: int = 15,
+    search_timeout: int = 40,
     existing_file_path: Path | None = None,
     debug: bool = False,
     scihub_fallback: bool = False,

@@ -56,8 +56,8 @@ from .telegram_fetch import FetchTelegramConfig, fetch_from_telegram
 
 MIN_DELAY_DEFAULT = "4"
 MAX_DELAY_DEFAULT = "8"
-RESPONSE_TIMEOUT_DEFAULT = 4
-SEARCH_TIMEOUT_DEFAULT = 6
+RESPONSE_TIMEOUT_DEFAULT = 15
+SEARCH_TIMEOUT_DEFAULT = 40
 SCIHUB_TIMEOUT_DEFAULT = 6
 CSV_JOB_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 UNDERSCORE_RUN_RE = re.compile(r"_+")
