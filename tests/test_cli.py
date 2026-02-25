@@ -38,6 +38,29 @@ class _FakeOpen:
         self._doc._closed = True
 
 
+class _FakePage:
+    def __init__(self, page_dict: dict, text: str, width: float = 612.0, height: float = 792.0) -> None:
+        self._page_dict = page_dict
+        self._text = text
+        self.rect = type("_Rect", (), {"width": width, "height": height})()
+
+    def get_text(self, mode: str):  # noqa: ANN001
+        if mode == "dict":
+            return self._page_dict
+        if mode == "text":
+            return self._text
+        raise ValueError(mode)
+
+
+class _FakeDocForPageProcessing:
+    def __init__(self, page: _FakePage) -> None:
+        self._page = page
+
+    def load_page(self, index: int) -> _FakePage:
+        assert index == 0
+        return self._page
+
+
 def _fake_extract_discovery(page_count: int, consolidated_markdown: str):
     _ = page_count
     _ = consolidated_markdown
@@ -1449,6 +1472,107 @@ def test_run_export_structured_data_raises_when_strict_doc_fails(monkeypatch, tm
     )
     with pytest.raises(SystemExit, match="failed_docs"):
         cli._run_export_structured_data(args)
+
+
+def test_process_page_prefers_text_layer_for_reliable_medium_density_page(monkeypatch, tmp_path: Path):
+    dirs = cli.ensure_dirs(tmp_path / "doc")
+    page = _FakePage(page_dict={"blocks": []}, text="Deterministic born-digital page text.\n")
+    doc = _FakeDocForPageProcessing(page)
+    ocr_calls = {"count": 0}
+
+    async def _fake_ocr(**kwargs):  # noqa: ANN001
+        _ = kwargs
+        ocr_calls["count"] += 1
+        raise AssertionError("OCR should not run for reliable text-layer pages")
+
+    monkeypatch.setattr(cli, "call_olmocr", _fake_ocr)
+
+    result = asyncio.run(
+        cli._process_page(
+            semaphore=asyncio.Semaphore(1),
+            client=object(),  # type: ignore[arg-type]
+            doc=doc,  # type: ignore[arg-type]
+            page_index=0,
+            mode="auto",
+            max_tokens=64,
+            model="m",
+            scan_preprocess=False,
+            debug=False,
+            dirs=dirs,
+            force=False,
+            text_only_enabled=True,
+            heuristics_override=TextHeuristics(
+                char_count=180,
+                printable_ratio=0.995,
+                cid_ratio=0.0,
+                replacement_char_ratio=0.0,
+                avg_token_length=5.2,
+            ),
+        )
+    )
+
+    assert result["status"] == "text_only"
+    assert ocr_calls["count"] == 0
+
+
+def test_process_page_uses_ocr_for_low_quality_text_layer(monkeypatch, tmp_path: Path):
+    dirs = cli.ensure_dirs(tmp_path / "doc")
+    page = _FakePage(page_dict={"blocks": []}, text="")
+    doc = _FakeDocForPageProcessing(page)
+    ocr_calls = {"count": 0}
+
+    class _Render:
+        format = "png"
+        image_bytes = b"img"
+        mime_type = "image/png"
+
+    class _Response:
+        content = "ignored"
+        usage = {"total_tokens": 12}
+        raw = {"ok": True}
+
+    class _Parsed:
+        markdown = "OCR output"
+        metadata = {"is_rotation_valid": True}
+
+    async def _fake_ocr(**kwargs):  # noqa: ANN001
+        _ = kwargs
+        ocr_calls["count"] += 1
+        return _Response()
+
+    monkeypatch.setattr(cli, "render_page", lambda *args, **kwargs: _Render())
+    monkeypatch.setattr(cli, "extract_anchors", lambda *args, **kwargs: {"anchors": []})
+    monkeypatch.setattr(cli, "build_anchored_prompt", lambda *args, **kwargs: ("prompt", "builder"))
+    monkeypatch.setattr(cli, "parse_yaml_front_matter", lambda *args, **kwargs: _Parsed())
+    monkeypatch.setattr(cli, "call_olmocr", _fake_ocr)
+
+    result = asyncio.run(
+        cli._process_page(
+            semaphore=asyncio.Semaphore(1),
+            client=object(),  # type: ignore[arg-type]
+            doc=doc,  # type: ignore[arg-type]
+            page_index=0,
+            mode="auto",
+            max_tokens=64,
+            model="m",
+            scan_preprocess=False,
+            debug=False,
+            dirs=dirs,
+            force=False,
+            text_only_enabled=True,
+            heuristics_override=TextHeuristics(
+                char_count=180,
+                printable_ratio=0.88,
+                cid_ratio=0.03,
+                replacement_char_ratio=0.003,
+                avg_token_length=15.0,
+            ),
+            route_override="anchored",
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert ocr_calls["count"] == 1
 
 
 def test_ensure_header_ocr_artifacts_generates_only_missing(monkeypatch, tmp_path: Path):
